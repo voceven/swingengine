@@ -106,13 +106,13 @@ SECTOR_MAP = {
 }
 
 # --- PHASE 9 CONFIGURATION ---
-# Pattern Detection Thresholds (CALIBRATED after v9.0 run)
+# Pattern Detection Thresholds (CALIBRATED v9.5 - further relaxed)
 BULL_FLAG_CONFIG = {
-    'pole_min_gain': 0.08,        # Lowered from 12% to 8% - more realistic for swing trades
-    'pole_days': 10,              # Days to measure pole
-    'flag_max_range': 0.08,       # Increased from 6% to 8% - allow slightly wider consolidation
-    'flag_days': 12,              # Reduced from 15 to 12 - tighter flag window
-    'volume_decline_ratio': 0.85  # Relaxed from 0.75 to 0.85 - less strict volume requirement
+    'pole_min_gain': 0.06,        # Lowered to 6% - captures smaller moves
+    'pole_days': 12,              # Extended to 12 days for pole measurement
+    'flag_max_range': 0.12,       # Increased to 12% - allow wider consolidation (was failing CVU)
+    'flag_days': 10,              # 10 days of consolidation
+    'volume_decline_ratio': 0.90  # Very relaxed - 90% of pole volume still counts
 }
 
 GEX_WALL_CONFIG = {
@@ -571,6 +571,61 @@ class SwingTradingEngine:
             print(f"  [!] Dataset optimization error: {e}")
             return pd.DataFrame()
 
+    def extract_strike_gamma(self, big_filepath):
+        """
+        Lightweight extraction of strike-level gamma data for GEX wall analysis.
+        Called separately when cached aggregated data is used.
+        """
+        print(f"  [GEX] Extracting strike-level gamma from raw file...")
+        chunk_size = 200000
+        strike_chunks = []
+
+        try:
+            for chunk in pd.read_csv(big_filepath, chunksize=chunk_size, low_memory=False):
+                chunk.columns = chunk.columns.str.strip().str.lower().str.replace(' ', '_')
+
+                # Quick filter for significant options
+                if 'gamma' not in chunk.columns or 'strike' not in chunk.columns:
+                    continue
+
+                mask = chunk['gamma'].abs() > 0.001
+                chunk = chunk[mask].copy()
+                if chunk.empty:
+                    continue
+
+                if 'underlying_symbol' in chunk.columns:
+                    chunk['ticker'] = chunk['underlying_symbol'].apply(self.normalize_ticker)
+
+                # Calculate net gamma
+                chunk['weight'] = 0.0
+                if 'side' in chunk.columns:
+                    chunk.loc[chunk['side'].str.upper().isin(['ASK', 'A', 'BUY']), 'weight'] = 1.0
+                    chunk.loc[chunk['side'].str.upper().isin(['BID', 'B', 'SELL']), 'weight'] = -0.5
+
+                mult = chunk['size'] if 'size' in chunk.columns else 100
+                chunk['net_gamma'] = chunk['gamma'] * mult * chunk['weight']
+
+                # Keep only significant gamma entries
+                strike_data = chunk[['ticker', 'strike', 'net_gamma']].copy()
+                strike_data = strike_data[strike_data['net_gamma'].abs() > 50]  # Lower threshold
+                if not strike_data.empty:
+                    strike_chunks.append(strike_data)
+
+            if strike_chunks:
+                strike_df = pd.concat(strike_chunks, ignore_index=True)
+                # Aggregate by ticker+strike
+                strike_agg = strike_df.groupby(['ticker', 'strike'])['net_gamma'].sum().reset_index()
+                # Store as dict: ticker -> {strike: gamma}
+                for ticker in strike_agg['ticker'].unique():
+                    ticker_strikes = strike_agg[strike_agg['ticker'] == ticker]
+                    self.strike_gamma_data[ticker] = dict(zip(ticker_strikes['strike'], ticker_strikes['net_gamma']))
+                print(f"  [GEX] Extracted strike-level gamma for {len(self.strike_gamma_data)} tickers")
+            else:
+                print(f"  [GEX] No strike data found in file (check if 'strike' column exists)")
+
+        except Exception as e:
+            print(f"  [!] Strike extraction error: {e}")
+
     def generate_temporal_features(self, current_flow_df):
         print("\n[2.5/4] Calculating Temporal Features (Velocity)...")
         hist_df = self.history_mgr.db.get_history_df()
@@ -810,14 +865,14 @@ class SwingTradingEngine:
 
     # --- PHASE 9: PATTERN DETECTION METHODS ---
 
-    def detect_bull_flag(self, ticker, history_df):
+    def detect_bull_flag(self, ticker, history_df, debug=False):
         """
         Detect bull flag pattern: strong upward move (pole) followed by consolidation (flag).
 
         Bull flag criteria:
-        1. Strong upward move (pole): 12%+ gain in first ~10 days
-        2. Consolidation (flag): <6% range in next 10-20 days
-        3. Volume declining during flag phase
+        1. Strong upward move (pole): gain in first N days
+        2. Consolidation (flag): tight range in recent days
+        3. Volume declining during flag phase (optional)
 
         Returns dict with pattern detection results and explanation.
         """
@@ -863,35 +918,44 @@ class SwingTradingEngine:
             flag_low = flag_segment.min()
             flag_range = (flag_high - flag_low) / flag_segment.mean() if flag_segment.mean() > 0 else 1
 
-            # Volume analysis (optional but improves accuracy)
-            volume_declining = True
+            # Volume analysis (optional - don't require it)
+            volume_declining = True  # Default to True if no volume data
+            volume_ratio = 1.0
             if volume is not None and len(volume) >= lookback:
                 pole_volume = volume.iloc[:pole_days].mean()
                 flag_volume = volume.iloc[-flag_days:].mean()
-                volume_declining = flag_volume < pole_volume * BULL_FLAG_CONFIG['volume_decline_ratio']
+                if pole_volume > 0:
+                    volume_ratio = flag_volume / pole_volume
+                    volume_declining = volume_ratio < BULL_FLAG_CONFIG['volume_decline_ratio']
 
-            # Check if pattern matches
-            is_flag = (
-                pole_gain >= BULL_FLAG_CONFIG['pole_min_gain'] and
-                flag_range <= BULL_FLAG_CONFIG['flag_max_range'] and
-                volume_declining
-            )
+            # Check if pattern matches (volume declining is BONUS, not required)
+            pole_ok = pole_gain >= BULL_FLAG_CONFIG['pole_min_gain']
+            flag_ok = flag_range <= BULL_FLAG_CONFIG['flag_max_range']
+            is_flag = pole_ok and flag_ok  # Don't require volume declining
 
             result['pole_gain'] = pole_gain
             result['flag_range'] = flag_range
             result['is_flag'] = is_flag
 
             if is_flag:
-                result['flag_score'] = min(1.0, (pole_gain / 0.15) * 0.5 + (1 - flag_range / 0.06) * 0.5)
-                result['explanation'] = f"BULL FLAG: {pole_gain*100:.1f}% pole gain, {flag_range*100:.1f}% consolidation"
+                # Score calculation: higher pole gain and tighter flag = better
+                base_score = min(1.0, (pole_gain / 0.15) * 0.4 + (1 - flag_range / BULL_FLAG_CONFIG['flag_max_range']) * 0.4)
                 if volume_declining:
-                    result['explanation'] += ", declining volume"
-            elif pole_gain > 0.08:
-                # Partial pattern - might be forming
-                result['flag_score'] = 0.3
-                result['explanation'] = f"Potential flag forming: {pole_gain*100:.1f}% move, watching consolidation"
+                    base_score += 0.2  # Bonus for volume confirmation
+                result['flag_score'] = base_score
+                result['explanation'] = f"BULL FLAG: {pole_gain*100:.1f}% pole, {flag_range*100:.1f}% range"
+                if volume_declining:
+                    result['explanation'] += " +vol"
+            elif pole_ok and not flag_ok:
+                # Pole qualified but consolidation too wide
+                result['flag_score'] = 0.25
+                result['explanation'] = f"Flag forming: {pole_gain*100:.1f}% pole, range {flag_range*100:.1f}% (need <{BULL_FLAG_CONFIG['flag_max_range']*100:.0f}%)"
+            elif pole_gain > 0.04:
+                # Weak pole but showing momentum
+                result['flag_score'] = 0.15
+                result['explanation'] = f"Weak momentum: {pole_gain*100:.1f}% move"
             else:
-                result['explanation'] = 'No bull flag pattern detected'
+                result['explanation'] = 'No bull flag pattern'
 
         except Exception as e:
             result['explanation'] = f'Pattern detection error: {str(e)[:50]}'
@@ -1315,6 +1379,9 @@ class SwingTradingEngine:
         if os.path.exists(self.optimized_bot_file):
             print(f"  [+] Found Optimized Dataset: {os.path.basename(self.optimized_bot_file)}")
             df_bot = self.safe_read(self.optimized_bot_file, "Optimized Gamma Data")
+            # ALSO extract strike-level data from raw file for GEX analysis
+            if file_map.get('bot_big') and os.path.exists(file_map.get('bot_big')):
+                self.extract_strike_gamma(file_map.get('bot_big'))
         elif file_map.get('bot_big') and os.path.exists(file_map.get('bot_big')):
             df_bot = self.optimize_large_dataset(file_map.get('bot_big'), date_stamp=None)
         elif not df_screener.empty:
