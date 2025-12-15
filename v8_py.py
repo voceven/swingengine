@@ -106,25 +106,25 @@ SECTOR_MAP = {
 }
 
 # --- PHASE 9 CONFIGURATION ---
-# Pattern Detection Thresholds
+# Pattern Detection Thresholds (CALIBRATED after v9.0 run)
 BULL_FLAG_CONFIG = {
-    'pole_min_gain': 0.12,        # Minimum 12% gain for pole phase
+    'pole_min_gain': 0.08,        # Lowered from 12% to 8% - more realistic for swing trades
     'pole_days': 10,              # Days to measure pole
-    'flag_max_range': 0.06,       # Maximum 6% range during consolidation
-    'flag_days': 15,              # Days of consolidation
-    'volume_decline_ratio': 0.75  # Volume should decline to 75% during flag
+    'flag_max_range': 0.08,       # Increased from 6% to 8% - allow slightly wider consolidation
+    'flag_days': 12,              # Reduced from 15 to 12 - tighter flag window
+    'volume_decline_ratio': 0.85  # Relaxed from 0.75 to 0.85 - less strict volume requirement
 }
 
 GEX_WALL_CONFIG = {
-    'min_support_gamma': 500_000,    # Minimum gamma for support wall
-    'min_resist_gamma': -300_000,    # Maximum (negative) gamma for resistance
-    'proximity_pct': 0.05            # Wall must be within 5% of current price to count
+    'min_support_gamma': 100_000,    # Lowered from 500K - more walls will qualify
+    'min_resist_gamma': -100_000,    # Raised from -300K - more walls will qualify
+    'proximity_pct': 0.08            # Increased from 5% to 8% - walls further away still count
 }
 
 REVERSAL_CONFIG = {
-    'lookback_days': 60,          # Days to analyze for downtrend
-    'min_days_below_sma': 35,     # Minimum days below SMA50 to qualify as downtrend
-    'dp_proximity_pct': 0.05      # DP support must be within 5% of current price
+    'lookback_days': 45,          # Reduced from 60 to 45 - shorter downtrend window
+    'min_days_below_sma': 20,     # Reduced from 35 to 20 - more realistic in bull market
+    'dp_proximity_pct': 0.08      # Increased from 5% to 8% - more DP levels will trigger
 }
 
 # Sector Capping (Risk Management)
@@ -408,6 +408,7 @@ class SwingTradingEngine:
         self.cap_map = {}
         self.dp_support_levels = {}
         self.price_history_cache = {}  # Cache for pattern detection
+        self.strike_gamma_data = {}    # Strike-level gamma for GEX wall detection
 
         self.history_mgr = HistoryManager(self.base_dir)
 
@@ -496,6 +497,7 @@ class SwingTradingEngine:
     def optimize_large_dataset(self, big_filepath, date_stamp=None):
         chunk_size = 200000
         chunks = []
+        strike_chunks = []  # Preserve strike-level data for GEX analysis
         iv_factor = None
         try:
             for chunk in pd.read_csv(big_filepath, chunksize=chunk_size, low_memory=False):
@@ -539,14 +541,35 @@ class SwingTradingEngine:
                     if c not in chunk.columns: chunk[c] = 0 if c != 'equity_type' else 'Unknown'
                 chunks.append(chunk[cols])
 
+                # PRESERVE STRIKE-LEVEL DATA for GEX wall detection
+                if 'strike' in chunk.columns and 'ticker' in chunk.columns:
+                    strike_data = chunk[['ticker', 'strike', 'net_gamma']].copy()
+                    strike_data = strike_data[strike_data['net_gamma'].abs() > 100]  # Filter significant gamma
+                    if not strike_data.empty:
+                        strike_chunks.append(strike_data)
+
             full_optimized = pd.concat(chunks, ignore_index=True)
             agg_rules = {'net_gamma': 'sum', 'authentic_gamma': 'sum', 'net_delta': 'sum', 'open_interest': 'sum', 'adj_iv': 'mean', 'equity_type': 'first'}
             if 'sector' in full_optimized.columns: agg_rules['sector'] = 'first'
             final_df = full_optimized.groupby('ticker').agg(agg_rules).reset_index()
+
+            # Store strike-level gamma data for GEX analysis
+            if strike_chunks and date_stamp is None:  # Only for today's data
+                strike_df = pd.concat(strike_chunks, ignore_index=True)
+                # Aggregate by ticker+strike
+                strike_agg = strike_df.groupby(['ticker', 'strike'])['net_gamma'].sum().reset_index()
+                # Store as dict: ticker -> {strike: gamma}
+                for ticker in strike_agg['ticker'].unique():
+                    ticker_strikes = strike_agg[strike_agg['ticker'] == ticker]
+                    self.strike_gamma_data[ticker] = dict(zip(ticker_strikes['strike'], ticker_strikes['net_gamma']))
+                print(f"  [GEX] Preserved strike-level gamma for {len(self.strike_gamma_data)} tickers")
+
             if date_stamp: final_df['date'] = date_stamp
             elif not date_stamp: final_df.to_csv(self.optimized_bot_file, index=False)
             return final_df
-        except: return pd.DataFrame()
+        except Exception as e:
+            print(f"  [!] Dataset optimization error: {e}")
+            return pd.DataFrame()
 
     def generate_temporal_features(self, current_flow_df):
         print("\n[2.5/4] Calculating Temporal Features (Velocity)...")
@@ -895,7 +918,49 @@ class SwingTradingEngine:
             result['explanation'] = 'Invalid price data'
             return result
 
-        # Check if we have strike-level data
+        # PRIORITY 1: Use cached strike-level gamma data
+        if ticker in self.strike_gamma_data and self.strike_gamma_data[ticker]:
+            try:
+                strike_gamma = self.strike_gamma_data[ticker]  # dict: {strike: gamma}
+
+                # Support walls: strikes below price with large positive gamma
+                support_candidates = {k: v for k, v in strike_gamma.items()
+                                     if k < current_price and v > GEX_WALL_CONFIG['min_support_gamma']}
+
+                if support_candidates:
+                    best_strike = max(support_candidates.keys(), key=lambda x: support_candidates[x])
+                    result['support_wall'] = float(best_strike)
+                    support_gamma = support_candidates[best_strike]
+                    proximity = (current_price - best_strike) / current_price
+
+                    if proximity <= GEX_WALL_CONFIG['proximity_pct']:
+                        result['wall_protection_score'] = min(1.0, support_gamma / 500_000)
+
+                # Resistance walls: strikes above price with large negative gamma
+                resist_candidates = {k: v for k, v in strike_gamma.items()
+                                    if k > current_price and v < GEX_WALL_CONFIG['min_resist_gamma']}
+
+                if resist_candidates:
+                    best_resist = min(resist_candidates.keys(), key=lambda x: resist_candidates[x])
+                    result['resistance_wall'] = float(best_resist)
+
+                # Build explanation
+                explanations = []
+                if result['support_wall']:
+                    support_dist = (current_price - result['support_wall']) / current_price * 100
+                    gamma_val = support_candidates.get(result['support_wall'], 0)
+                    explanations.append(f"GEX support ${result['support_wall']:.0f} ({support_dist:.1f}% below, {gamma_val/1000:.0f}K gamma)")
+                if result['resistance_wall']:
+                    resist_dist = (result['resistance_wall'] - current_price) / current_price * 100
+                    explanations.append(f"GEX resist ${result['resistance_wall']:.0f} ({resist_dist:.1f}% above)")
+
+                result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
+                return result
+
+            except Exception as e:
+                result['explanation'] = f'GEX cache error: {str(e)[:30]}'
+
+        # PRIORITY 2: Check if we have strike-level data in bot_df
         if bot_df is not None and not bot_df.empty and 'strike' in bot_df.columns:
             try:
                 ticker_data = bot_df[bot_df['ticker'] == ticker] if 'ticker' in bot_df.columns else bot_df
@@ -917,7 +982,7 @@ class SwingTradingEngine:
                     proximity = (current_price - result['support_wall']) / current_price
 
                     if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                        result['wall_protection_score'] = min(1.0, support_gamma / 1_000_000)
+                        result['wall_protection_score'] = min(1.0, support_gamma / 500_000)
 
                 # Resistance walls: strikes above price with large negative gamma
                 resist_mask = (strike_gamma.index > current_price) & (strike_gamma < GEX_WALL_CONFIG['min_resist_gamma'])
@@ -936,27 +1001,28 @@ class SwingTradingEngine:
                     explanations.append(f"GEX resistance at ${result['resistance_wall']:.2f} ({resist_dist:.1f}% above)")
 
                 result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
+                return result
 
             except Exception as e:
                 result['explanation'] = f'GEX analysis error: {str(e)[:50]}'
-        else:
-            # Fallback: use dark pool support levels if available
-            if ticker in self.dp_support_levels:
-                dp_levels = self.dp_support_levels[ticker]
-                support_levels = [p for p in dp_levels if p < current_price]
-                if support_levels:
-                    best_support = max(support_levels)
-                    proximity = (current_price - best_support) / current_price
-                    if proximity <= 0.05:
-                        result['support_wall'] = best_support
-                        result['wall_protection_score'] = 0.6  # DP support is less reliable than GEX
-                        result['explanation'] = f"Dark pool support at ${best_support:.2f}"
-                    else:
-                        result['explanation'] = f"DP support at ${best_support:.2f} (too far: {proximity*100:.1f}%)"
+
+        # PRIORITY 3: Fallback to dark pool support levels
+        if ticker in self.dp_support_levels:
+            dp_levels = self.dp_support_levels[ticker]
+            support_levels = [p for p in dp_levels if p < current_price]
+            if support_levels:
+                best_support = max(support_levels)
+                proximity = (current_price - best_support) / current_price
+                if proximity <= GEX_WALL_CONFIG['proximity_pct']:
+                    result['support_wall'] = best_support
+                    result['wall_protection_score'] = 0.5  # DP support is less reliable than GEX
+                    result['explanation'] = f"DP support at ${best_support:.2f} ({proximity*100:.1f}% below)"
                 else:
-                    result['explanation'] = 'No support levels detected'
+                    result['explanation'] = f"DP support at ${best_support:.2f} (too far: {proximity*100:.1f}%)"
             else:
-                result['explanation'] = 'No strike-level data available'
+                result['explanation'] = 'No support levels detected'
+        else:
+            result['explanation'] = 'No strike-level or DP data available'
 
         return result
 
@@ -1207,7 +1273,7 @@ class SwingTradingEngine:
             if 'ext_hour_sold_codes' in df_dp.columns:
                 ghost_codes = ['extended_hours_trade_late_or_out_of_sequence', 'sold_out_of_sequence']
                 is_ghost = df_dp['ext_hour_sold_codes'].isin(ghost_codes)
-                ghost_prints = df_dp[is_ghost & (df_dp['premium'] > 1_000_000)]
+                ghost_prints = df_dp[is_ghost & (df_dp['premium'] > 500_000)]  # Lowered from 1M to 500K
                 if not ghost_prints.empty:
                     print(f"  [SHIELD] Detected {len(ghost_prints)} Signature Prints.")
                     for t, group in ghost_prints.groupby('ticker'): self.dp_support_levels[t] = group['price'].unique().tolist()
