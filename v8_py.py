@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v9_Grandmaster.py
 
-Swing Trading Engine - Version 9.0 (Grandmaster)
-Phase 9: Pattern Intelligence + Interpretability
+Swing Trading Engine - Version 9.5 (Grandmaster) - Calibrated
+Phase 9: Pattern Intelligence + Interpretability + Performance Tuning
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -12,6 +12,7 @@ Architecture:
 5. PATTERNS: Bull Flag Detection, GEX Wall Scanner, Downtrend Reversal.
 6. INTERPRETABILITY: Human-readable explanation generator for each signal.
 7. RISK: Sector capping to prevent over-concentration.
+8. PERFORMANCE: Configurable training epochs, batch sizes, ticker limits.
 
 Changelog from v8.4:
 - Added bull flag pattern detection (consolidation after strong moves)
@@ -21,6 +22,14 @@ Changelog from v8.4:
 - Added sector capping (max 3 picks per sector per strategy)
 - Enhanced macro weighting (DXY/TNX/VIX influence individual scores)
 - Removed hard Colab dependency (works locally or in Colab)
+
+Changelog v9.5 (Calibration):
+- Relaxed bull flag thresholds (5% pole min, 15% max range) for more detections
+- Fixed GEX wall protection score (250K divisor for proper 75K+ = protected)
+- Added GEX debug output showing candidate/strike data overlap
+- Performance config: reduced transformer epochs (50->30), CatBoost trials (30->15)
+- Configurable batch sizes and ticker download limits
+- TPU/GPU/CPU auto-detection with torch_xla support
 """
 
 import pandas as pd
@@ -132,29 +141,38 @@ SECTOR_MAP = {
 }
 
 # --- PHASE 9 CONFIGURATION ---
-# Pattern Detection Thresholds (CALIBRATED v9.5 - further relaxed)
+# Pattern Detection Thresholds (CALIBRATED v9.5+ - production ready)
 BULL_FLAG_CONFIG = {
-    'pole_min_gain': 0.06,        # Lowered to 6% - captures smaller moves
-    'pole_days': 12,              # Extended to 12 days for pole measurement
-    'flag_max_range': 0.12,       # Increased to 12% - allow wider consolidation (was failing CVU)
-    'flag_days': 10,              # 10 days of consolidation
-    'volume_decline_ratio': 0.90  # Very relaxed - 90% of pole volume still counts
+    'pole_min_gain': 0.05,        # 5% minimum pole gain
+    'pole_days': 12,              # Days to measure pole
+    'flag_max_range': 0.15,       # 15% max consolidation (was 12%, catches BFLY now)
+    'flag_days': 10,              # Days of consolidation
+    'volume_decline_ratio': 0.95  # Very relaxed - 95% still counts
 }
 
 GEX_WALL_CONFIG = {
-    'min_support_gamma': 100_000,    # Lowered from 500K - more walls will qualify
-    'min_resist_gamma': -100_000,    # Raised from -300K - more walls will qualify
-    'proximity_pct': 0.08            # Increased from 5% to 8% - walls further away still count
+    'min_support_gamma': 50_000,     # Lowered to 50K for more wall detection
+    'min_resist_gamma': -50_000,     # Raised to -50K for more resistance walls
+    'proximity_pct': 0.10            # 10% proximity - walls up to 10% away count
 }
 
 REVERSAL_CONFIG = {
-    'lookback_days': 45,          # Reduced from 60 to 45 - shorter downtrend window
-    'min_days_below_sma': 20,     # Reduced from 35 to 20 - more realistic in bull market
-    'dp_proximity_pct': 0.08      # Increased from 5% to 8% - more DP levels will trigger
+    'lookback_days': 45,          # 45 day lookback for downtrend
+    'min_days_below_sma': 15,     # Lowered to 15 days - even more lenient
+    'dp_proximity_pct': 0.10      # 10% proximity for DP support
 }
 
 # Sector Capping (Risk Management)
 MAX_PICKS_PER_SECTOR = 3
+
+# Performance Tuning
+PERFORMANCE_CONFIG = {
+    'catboost_trials': 15,        # Reduced from 30 for faster training
+    'transformer_epochs': 30,     # Reduced from 50 for faster training
+    'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
+    'price_cache_days': 7,        # Refresh price cache weekly
+    'batch_size': 75              # Batch size for yfinance downloads
+}
 
 # Macro Score Weights (how much macro conditions affect individual scores)
 MACRO_WEIGHTS = {
@@ -364,7 +382,7 @@ class HistoryManager:
         print(f"  [ORACLE] Downloading history for {len(to_fetch)} tickers...")
 
         new_data = []
-        batch_size = 100
+        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
         for i in range(0, len(to_fetch), batch_size):
             batch = to_fetch[i:i+batch_size]
             try:
@@ -795,7 +813,8 @@ class SwingTradingEngine:
                 model.train()
                 optimizer = optim.Adam(model.parameters(), lr=0.0005)
                 criterion = nn.BCELoss()
-                for epoch in range(50):
+                epochs = PERFORMANCE_CONFIG.get('transformer_epochs', 30)
+                for epoch in range(epochs):
                     optimizer.zero_grad()
                     outputs = model(X_tensor)
                     loss = criterion(outputs, y_tensor)
@@ -1024,7 +1043,8 @@ class SwingTradingEngine:
                     proximity = (current_price - best_strike) / current_price
 
                     if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                        result['wall_protection_score'] = min(1.0, support_gamma / 500_000)
+                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
+                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
 
                 # Resistance walls: strikes above price with large negative gamma
                 resist_candidates = {k: v for k, v in strike_gamma.items()
@@ -1072,7 +1092,8 @@ class SwingTradingEngine:
                     proximity = (current_price - result['support_wall']) / current_price
 
                     if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                        result['wall_protection_score'] = min(1.0, support_gamma / 500_000)
+                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
+                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
 
                 # Resistance walls: strikes above price with large negative gamma
                 resist_mask = (strike_gamma.index > current_price) & (strike_gamma < GEX_WALL_CONFIG['min_resist_gamma'])
@@ -1485,9 +1506,15 @@ class SwingTradingEngine:
         tickers = flow_df['ticker'].unique().tolist()
         to_fetch = [t for t in tickers if t not in cached_data and len(str(t)) < 8 and str(t) != 'nan']
 
+        # Limit downloads for performance (prioritize tickers already in flow data)
+        max_fetch = PERFORMANCE_CONFIG.get('max_tickers_to_fetch', 3000)
+        if len(to_fetch) > max_fetch:
+            print(f"  [FETCH] Limiting from {len(to_fetch)} to {max_fetch} tickers for performance")
+            to_fetch = to_fetch[:max_fetch]
+
         if to_fetch:
             print(f"  [FETCH] Downloading {len(to_fetch)} tickers...")
-            batch_size = 50
+            batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
             for i in range(0, len(to_fetch), batch_size):
                 batch = to_fetch[i:i+batch_size]
                 try:
@@ -1535,13 +1562,14 @@ class SwingTradingEngine:
         X_clean = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_clean)
 
-        print("  [CATBOOST] Tuning Hyperparameters...")
+        n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 15)
+        print(f"  [CATBOOST] Tuning Hyperparameters ({n_trials} trials)...")
         def objective(trial):
             param = {
-                'iterations': trial.suggest_int('iterations', 100, 500),
-                'depth': trial.suggest_int('depth', 4, 10),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+                'iterations': trial.suggest_int('iterations', 100, 300),  # Reduced max
+                'depth': trial.suggest_int('depth', 4, 8),  # Reduced max depth
+                'learning_rate': trial.suggest_float('learning_rate', 0.02, 0.1),
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 8),
                 'logging_level': 'Silent',
                 'thread_count': -1
             }
@@ -1550,12 +1578,12 @@ class SwingTradingEngine:
 
         try:
             study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=30)
+            study.optimize(objective, n_trials=n_trials)
             cb = CatBoostClassifier(**study.best_params, logging_level='Silent')
-            self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=5)
+            self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=3)  # Reduced CV folds
             self.model.fit(X_scaled, y)
             self.model_trained = True
-            print("  [SAVE] Saving CatBoost model to disk...")
+            print(f"  [CATBOOST] Best AUC: {study.best_value:.4f}")
         except Exception as e:
             print(f"  [!] Training failed: {e}")
             self.model_trained = False
@@ -1635,7 +1663,7 @@ class SwingTradingEngine:
         # Batch fetch price history for pattern detection
         print(f"  [PATTERNS] Fetching price history for pattern analysis...")
         price_data = {}
-        batch_size = 50
+        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
         for i in range(0, len(tickers_to_analyze), batch_size):
             batch = tickers_to_analyze[i:i+batch_size]
             try:
@@ -1652,6 +1680,15 @@ class SwingTradingEngine:
 
         # Run pattern detection on each candidate
         print(f"  [PATTERNS] Analyzing {len(tickers_to_analyze)} tickers for bull flags, GEX walls, and reversals...")
+
+        # GEX Debug: Show overlap between candidates and strike gamma data
+        gex_overlap = [t for t in tickers_to_analyze if t in self.strike_gamma_data]
+        print(f"  [GEX DEBUG] {len(gex_overlap)}/{len(tickers_to_analyze)} candidates have strike gamma data")
+        if gex_overlap and len(gex_overlap) <= 10:
+            for t in gex_overlap[:5]:
+                gamma_vals = list(self.strike_gamma_data[t].values())
+                max_gamma = max(gamma_vals) if gamma_vals else 0
+                print(f"    {t}: {len(gamma_vals)} strikes, max gamma {max_gamma/1000:.0f}K")
         for idx, row in top_candidates.iterrows():
             ticker = row['ticker']
             current_price = row.get('current_price', 0)
