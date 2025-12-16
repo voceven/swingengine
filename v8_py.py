@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.0 (Grandmaster) - Position Sizing
-Phase 10: Kelly Criterion Position Sizing + Risk Tiers
+Swing Trading Engine - Version 10.1 (Grandmaster) - Phoenix + AUC Enhancement
+Phase 10.1: Phoenix Reversal Strategy + Reliability Improvements
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
 2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Tuned CatBoost (Left Brain).
 3. CONTEXT: Enhanced Macro-Regime Awareness (VIX, TNX, DXY) with score weighting.
 4. EXECUTION: ATR-based Stop Loss & Take Profit.
-5. PATTERNS: Bull Flag Detection, GEX Wall Scanner, Downtrend Reversal.
+5. PATTERNS: Bull Flag, GEX Wall Scanner, Downtrend Reversal, Phoenix Reversal.
 6. INTERPRETABILITY: Human-readable explanation generator for each signal.
 7. RISK: Sector capping to prevent over-concentration.
 8. PERFORMANCE: Configurable training epochs, batch sizes, ticker limits.
@@ -38,6 +38,14 @@ Changelog v10.0 (Position Sizing):
 - Added volatility buckets (<5%, 5-6%, >6% ATR/Price)
 - Position sizing integrated into all strategy outputs
 - Displays position_pct, shares, and risk_tier for each pick
+
+Changelog v10.1 (Phoenix + Reliability):
+- ADDED: Phoenix Reversal Strategy (6-12 month base breakouts with volume surge)
+- ENHANCED: CatBoost AUC improvement (25 trials, max_iter=500, depth=10, CV=5)
+- FIXED: VIX/TNX/DXY reliability with NaN checking and retry logic (3 retries)
+- IMPROVED: Fetch success tracking with detailed error handling and logging
+- OPTIMIZED: Border count tuning in CatBoost for better model performance
+- Updated output filename to v10_grandmaster.csv
 """
 
 import pandas as pd
@@ -164,6 +172,18 @@ GEX_WALL_CONFIG = {
     'proximity_pct': 0.10            # 10% proximity - walls up to 10% away count
 }
 
+# Phoenix Reversal Configuration (6-12 month base breakouts)
+PHOENIX_CONFIG = {
+    'min_base_days': 60,           # Minimum consolidation period (2 months)
+    'max_base_days': 250,          # Maximum consolidation period (8-10 months)
+    'volume_surge_threshold': 1.5, # Volume must exceed 1.5x average
+    'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
+    'rsi_max': 70,
+    'max_drawdown_pct': 0.35,      # Max 35% drawdown during base
+    'min_consolidation_pct': 0.10, # Price must stay within 10% range for extended period
+    'breakout_threshold': 0.03     # Breakout must be at least 3% move
+}
+
 REVERSAL_CONFIG = {
     'lookback_days': 45,          # 45 day lookback for downtrend
     'min_days_below_sma': 15,     # Lowered to 15 days - even more lenient
@@ -175,7 +195,10 @@ MAX_PICKS_PER_SECTOR = 3
 
 # Performance Tuning
 PERFORMANCE_CONFIG = {
-    'catboost_trials': 15,        # Reduced from 30 for faster training
+    'catboost_trials': 25,        # Increased from 15 for better AUC (v10.1.1)
+    'catboost_max_iterations': 500,  # Increased from 300 for better AUC (v10.1.1)
+    'catboost_max_depth': 10,     # Increased from 8 for better AUC (v10.1.1)
+    'catboost_cv_folds': 5,       # Increased from 3 for better AUC (v10.1.1)
     'transformer_epochs': 30,     # Reduced from 50 for faster training
     'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
     'price_cache_days': 7,        # Refresh price cache weekly
@@ -397,7 +420,9 @@ class HistoryManager:
             hist_df = self.db.get_history_df()
             if hist_df.empty: return
             all_tickers = hist_df['ticker'].unique().tolist()
-        except: return
+        except Exception as e:
+            print(f"  [ORACLE] Failed to load history: {e}")
+            return
 
         price_df = self.db.get_price_df()
         existing_tickers = set(price_df['ticker'].unique()) if not price_df.empty else set()
@@ -416,7 +441,10 @@ class HistoryManager:
         print(f"  [ORACLE] Downloading history for {len(to_fetch)} tickers...")
 
         new_data = []
+        successful_fetches = 0
+        failed_fetches = 0
         batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
+
         for i in range(0, len(to_fetch), batch_size):
             batch = to_fetch[i:i+batch_size]
             try:
@@ -424,7 +452,12 @@ class HistoryManager:
                 for t in batch:
                     try:
                         hist = data[t] if len(batch) > 1 else data
-                        if not hist.empty:
+                        if not hist.empty and len(hist) > 0:
+                            # Check if we have required columns
+                            if not all(col in hist.columns for col in ['High', 'Low', 'Close']):
+                                failed_fetches += 1
+                                continue
+
                             high = hist['High']
                             low = hist['Low']
                             close = hist['Close']
@@ -450,13 +483,24 @@ class HistoryManager:
 
                                 d_str = str(d_val).split()[0]
                                 new_data.append({'ticker': t, 'date': d_str, 'close': float(close_val), 'atr': float(atr_val)})
-                    except: pass
-            except: pass
+
+                            successful_fetches += 1
+                        else:
+                            failed_fetches += 1
+                    except Exception as ticker_error:
+                        failed_fetches += 1
+                        # Uncomment for debugging: print(f"    [!] Failed to process {t}: {ticker_error}")
+            except Exception as batch_error:
+                failed_fetches += len(batch)
+                print(f"    [!] Batch download failed: {batch_error}")
 
         if new_data:
             new_df = pd.DataFrame(new_data)
             self.db.upsert_prices(new_df)
+            total_attempts = successful_fetches + failed_fetches
+            success_rate = (successful_fetches / total_attempts * 100) if total_attempts > 0 else 0
             print(f"  [ORACLE] Price DB updated with {len(new_data)} records.")
+            print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
 
 class SwingTradingEngine:
     def __init__(self, base_dir=None):
@@ -513,26 +557,57 @@ class SwingTradingEngine:
 
     def get_market_regime(self):
         print("\n[TITAN] Assessing Macro Regime...")
+
         try:
-            tickers = ['^VIX', '^TNX', 'DX-Y.NYB', 'SPY']
-            data = yf.download(tickers, period="5d", progress=False)['Close']
-            vix = data['^VIX'].iloc[-1]
-            tnx = data['^TNX'].iloc[-1]
-            dxy = data['DX-Y.NYB'].iloc[-1]
-            spy_current = data['SPY'].iloc[-1]
-            spy_start = data['SPY'].iloc[0]
-            spy_trend = spy_current > spy_start
-            spy_return = (spy_current - spy_start) / spy_start
+            # Retry logic for yfinance reliability
+            max_retries = 3
+            vix = tnx = dxy = spy_trend = spy_return = None
 
-            # Store raw macro values for score weighting
-            self.macro_data = {
-                'vix': float(vix),
-                'tnx': float(tnx),
-                'dxy': float(dxy),
-                'spy_trend': spy_trend,
-                'spy_return': float(spy_return)
-            }
+            for attempt in range(max_retries):
+                try:
+                    tickers = ['^VIX', '^TNX', 'DX-Y.NYB', 'SPY']
+                    data = yf.download(tickers, period="5d", progress=False)['Close']
 
+                    # Extract values with NaN checking
+                    vix = data['^VIX'].iloc[-1] if '^VIX' in data.columns else None
+                    tnx = data['^TNX'].iloc[-1] if '^TNX' in data.columns else None
+                    dxy = data['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in data.columns else None
+                    spy_current = data['SPY'].iloc[-1] if 'SPY' in data.columns else None
+                    spy_start = data['SPY'].iloc[0] if 'SPY' in data.columns else None
+
+                    # Check for NaN values and retry if needed
+                    if pd.isna(vix) or pd.isna(tnx) or pd.isna(dxy) or pd.isna(spy_current) or pd.isna(spy_start):
+                        if attempt < max_retries - 1:
+                            print(f"  [MACRO] NaN values detected, retrying ({attempt + 1}/{max_retries})...")
+                            import time
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                            continue
+                        else:
+                            raise ValueError("Macro data contains NaN after all retries")
+
+                    spy_trend = spy_current > spy_start
+                    spy_return = (spy_current - spy_start) / spy_start
+
+                    # Store raw macro values for score weighting
+                    self.macro_data = {
+                        'vix': float(vix),
+                        'tnx': float(tnx),
+                        'dxy': float(dxy),
+                        'spy_trend': spy_trend,
+                        'spy_return': float(spy_return)
+                    }
+                    break  # Success, exit retry loop
+
+                except Exception as retry_error:
+                    if attempt < max_retries - 1:
+                        print(f"  [MACRO] Fetch attempt {attempt + 1} failed, retrying...")
+                        import time
+                        time.sleep(2 ** attempt)
+                        continue
+                    else:
+                        raise retry_error
+
+            # Calculate regime based on successfully fetched data
             regime = "Neutral"
             regime_details = []
 
@@ -567,9 +642,11 @@ class SwingTradingEngine:
             print(f"  [MACRO] Score Adjustment: {macro_adjustment:+.1f} points")
             self.market_regime = regime
             return regime
+
         except Exception as e:
-            print(f"  [MACRO] Data fetch failed ({e}). Defaulting to Neutral.")
+            print(f"  [MACRO] Data fetch failed after {max_retries} retries ({e}). Defaulting to Neutral.")
             self.macro_data = {'vix': 20, 'tnx': 4.0, 'dxy': 100, 'spy_trend': True, 'spy_return': 0, 'adjustment': 0, 'regime_details': ['Data unavailable']}
+            self.market_regime = "Neutral"
             return "Neutral"
 
     def optimize_large_dataset(self, big_filepath, date_stamp=None):
@@ -1269,6 +1346,158 @@ class SwingTradingEngine:
 
         return result
 
+    def detect_phoenix_reversal(self, ticker, history_df):
+        """
+        Detect Phoenix reversal pattern: 6-12 month base with volume surge breakout.
+
+        Criteria:
+        1. Extended consolidation period (60-250 days)
+        2. Price staying within tight range (max 35% drawdown)
+        3. Volume surge on breakout (1.5x average)
+        4. RSI between 50-70 (healthy, not oversold)
+        5. Recent breakout above consolidation range
+
+        Returns dict with phoenix detection results and explanation.
+        """
+        result = {
+            'is_phoenix': False,
+            'phoenix_score': 0.0,
+            'base_duration': 0,
+            'volume_ratio': 0.0,
+            'rsi': 0.0,
+            'explanation': ''
+        }
+
+        min_days = PHOENIX_CONFIG['min_base_days']
+        max_days = PHOENIX_CONFIG['max_base_days']
+
+        if history_df is None or len(history_df) < min_days:
+            result['explanation'] = 'Insufficient history for phoenix analysis'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            current_price = float(close.iloc[-1])
+
+            # Look for consolidation base in the past 60-250 days
+            lookback_days = min(len(close), max_days)
+            base_period = close.iloc[-lookback_days:]
+            base_high = base_period.max()
+            base_low = base_period.min()
+            base_range = (base_high - base_low) / base_low
+
+            # Calculate how long price has been consolidating
+            sma50 = close.rolling(50).mean()
+            recent_sma = sma50.iloc[-min_days:] if len(sma50) >= min_days else sma50
+            recent_close = close.iloc[-min_days:] if len(close) >= min_days else close
+
+            # Count days in consolidation (within 10% of SMA50)
+            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']
+            days_in_base = ((abs(recent_close - recent_sma) / recent_sma) < consolidation_threshold).sum()
+            result['base_duration'] = int(days_in_base)
+
+            # Check for volume surge (recent 5-day average vs 50-day average)
+            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent = volume.iloc[-5:].mean()
+            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
+            result['volume_ratio'] = float(volume_ratio)
+
+            has_volume_surge = volume_ratio >= PHOENIX_CONFIG['volume_surge_threshold']
+
+            # Calculate RSI
+            delta = close.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / (loss + 1e-9)
+            rsi = 100 - (100 / (1 + rs))
+            current_rsi = float(rsi.iloc[-1])
+            result['rsi'] = current_rsi
+
+            rsi_in_range = PHOENIX_CONFIG['rsi_min'] <= current_rsi <= PHOENIX_CONFIG['rsi_max']
+
+            # Check for breakout (price near top of range)
+            breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
+            near_breakout = current_price >= base_low * (1 + base_range * 0.7)  # Near top 30% of range
+            recent_breakout = (current_price - base_low) / base_low >= breakout_threshold
+
+            # Check drawdown constraint
+            max_drawdown = (base_high - base_low) / base_high
+            acceptable_drawdown = max_drawdown <= PHOENIX_CONFIG['max_drawdown_pct']
+
+            # Dark pool support adds confidence
+            has_dp_support = False
+            if ticker in self.dp_support_levels:
+                dp_levels = self.dp_support_levels[ticker]
+                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < 0.15]
+                has_dp_support = len(nearby_support) > 0
+
+            # Phoenix pattern detected if all criteria met
+            is_phoenix = (
+                days_in_base >= min_days and
+                days_in_base <= max_days and
+                has_volume_surge and
+                rsi_in_range and
+                acceptable_drawdown and
+                (near_breakout or recent_breakout)
+            )
+
+            result['is_phoenix'] = is_phoenix
+
+            if is_phoenix:
+                score_components = []
+                base_score = 0.6
+
+                # Volume surge adds score
+                if volume_ratio >= 2.0:
+                    base_score += 0.2
+                    score_components.append(f"{volume_ratio:.1f}x volume surge")
+                else:
+                    score_components.append(f"{volume_ratio:.1f}x volume")
+
+                # Long base adds conviction
+                if days_in_base >= 120:
+                    base_score += 0.15
+                    score_components.append(f"{days_in_base}d base (extended)")
+                else:
+                    score_components.append(f"{days_in_base}d base")
+
+                # DP support adds score
+                if has_dp_support:
+                    base_score += 0.10
+                    score_components.append("DP accumulation")
+
+                # RSI in optimal range
+                score_components.append(f"RSI {current_rsi:.0f}")
+
+                result['phoenix_score'] = min(1.0, base_score)
+                result['explanation'] = f"PHOENIX REVERSAL: " + ", ".join(score_components)
+            else:
+                # Provide detailed reason why it's not a phoenix
+                missing = []
+                if days_in_base < min_days:
+                    missing.append(f"base too short ({days_in_base}d)")
+                if not has_volume_surge:
+                    missing.append(f"low volume ({volume_ratio:.1f}x)")
+                if not rsi_in_range:
+                    missing.append(f"RSI {current_rsi:.0f} out of range")
+                if not acceptable_drawdown:
+                    missing.append(f"drawdown too high ({max_drawdown*100:.0f}%)")
+                if not near_breakout and not recent_breakout:
+                    missing.append("no breakout signal")
+
+                result['explanation'] = 'Not phoenix: ' + ', '.join(missing) if missing else 'Near phoenix pattern'
+
+        except Exception as e:
+            result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
+
+        return result
+
     # --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
     def calculate_position_size(self, row, portfolio_value=100000):
         """
@@ -1446,6 +1675,10 @@ class SwingTradingEngine:
             # Reversal
             if patterns.get('reversal', {}).get('is_reversal'):
                 reasons.append(patterns['reversal']['explanation'])
+
+            # Phoenix
+            if patterns.get('phoenix', {}).get('is_phoenix'):
+                reasons.append(patterns['phoenix']['explanation'])
 
         # 4. AI Confidence
         nn_score = row.get('nn_score', 0)
@@ -1719,28 +1952,34 @@ class SwingTradingEngine:
         X_clean = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_clean)
 
-        n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 15)
-        print(f"  [CATBOOST] Tuning Hyperparameters ({n_trials} trials)...")
+        n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 25)
+        max_iterations = PERFORMANCE_CONFIG.get('catboost_max_iterations', 500)
+        max_depth = PERFORMANCE_CONFIG.get('catboost_max_depth', 10)
+        cv_folds = PERFORMANCE_CONFIG.get('catboost_cv_folds', 5)
+
+        print(f"  [CATBOOST] Tuning Hyperparameters ({n_trials} trials, max_iter={max_iterations}, max_depth={max_depth})...")
         def objective(trial):
             param = {
-                'iterations': trial.suggest_int('iterations', 100, 300),  # Reduced max
-                'depth': trial.suggest_int('depth', 4, 8),  # Reduced max depth
-                'learning_rate': trial.suggest_float('learning_rate', 0.02, 0.1),
-                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 8),
+                'iterations': trial.suggest_int('iterations', 150, max_iterations),
+                'depth': trial.suggest_int('depth', 5, max_depth),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+                'border_count': trial.suggest_int('border_count', 32, 255),
                 'logging_level': 'Silent',
                 'thread_count': -1
             }
             model = CatBoostClassifier(**param)
-            return cross_val_score(model, X_scaled, y, cv=3, scoring='roc_auc').mean()
+            return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
 
         try:
-            study = optuna.create_study(direction='maximize')
-            study.optimize(objective, n_trials=n_trials)
+            study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
             cb = CatBoostClassifier(**study.best_params, logging_level='Silent')
-            self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=3)  # Reduced CV folds
+            self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=cv_folds)
             self.model.fit(X_scaled, y)
             self.model_trained = True
             print(f"  [CATBOOST] Best AUC: {study.best_value:.4f}")
+            print(f"  [CATBOOST] Best params: iterations={study.best_params.get('iterations')}, depth={study.best_params.get('depth')}")
         except Exception as e:
             print(f"  [!] Training failed: {e}")
             self.model_trained = False
@@ -1858,7 +2097,8 @@ class SwingTradingEngine:
             patterns = {
                 'bull_flag': self.detect_bull_flag(ticker, hist_df),
                 'gex_wall': self.find_gex_walls(ticker, current_price),
-                'reversal': self.detect_downtrend_reversal(ticker, hist_df)
+                'reversal': self.detect_downtrend_reversal(ticker, hist_df),
+                'phoenix': self.detect_phoenix_reversal(ticker, hist_df)
             }
             pattern_results[ticker] = patterns
 
@@ -1883,10 +2123,18 @@ class SwingTradingEngine:
                 bonus = reversal_score * 12  # Up to 12 point bonus for ambush
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
 
+            # Phoenix reversal bonus (major pattern)
+            phoenix_score = patterns['phoenix'].get('phoenix_score', 0)
+            if phoenix_score > 0:
+                bonus = phoenix_score * 15  # Up to 15 point bonus for phoenix (rare, high conviction)
+                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
+                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.8
+
             # Store pattern flags
             top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
             top_candidates.at[idx, 'has_gex_support'] = wall_score > 0.3
             top_candidates.at[idx, 'is_reversal_setup'] = patterns['reversal'].get('is_reversal', False)
+            top_candidates.at[idx, 'is_phoenix'] = patterns['phoenix'].get('is_phoenix', False)
 
             # Fundamental & Sector Analysis
             ctx = self.analyze_fundamentals_and_sector(ticker, eq_type)
@@ -1952,11 +2200,13 @@ class SwingTradingEngine:
         bull_flags = stock_candidates['has_bull_flag'].sum() if 'has_bull_flag' in stock_candidates.columns else 0
         gex_protected = stock_candidates['has_gex_support'].sum() if 'has_gex_support' in stock_candidates.columns else 0
         reversal_setups = stock_candidates['is_reversal_setup'].sum() if 'is_reversal_setup' in stock_candidates.columns else 0
+        phoenix_reversals = stock_candidates['is_phoenix'].sum() if 'is_phoenix' in stock_candidates.columns else 0
 
         print(f"\n  [PATTERNS SUMMARY]")
         print(f"    Bull Flags Detected: {bull_flags}")
         print(f"    GEX Protected Positions: {gex_protected}")
         print(f"    Reversal Setups: {reversal_setups}")
+        print(f"    Phoenix Reversals: {phoenix_reversals}")
 
         return stock_candidates, etf_candidates
 
@@ -2115,14 +2365,38 @@ if __name__ == "__main__":
                 etf_display = [c for c in etf_display if c in etfs_df.columns]
                 print(etfs_df[etf_display].head(5).to_string(index=False))
 
+            # --- STRATEGY 5: PHOENIX REVERSAL ---
+            phoenix_df = stocks_df[stocks_df['is_phoenix'] == True].copy() if 'is_phoenix' in stocks_df.columns else pd.DataFrame()
+            if not phoenix_df.empty:
+                print("\n" + "="*80)
+                print(f"STRATEGY 5: PHOENIX REVERSAL (6-12 Month Base Breakouts)")
+                print("Logic: Extended consolidation + Volume surge + RSI 50-70 + Breakout")
+                print("="*80)
+                phoenix_display = ['ticker', 'trend_score_val', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
+                phoenix_display = [c for c in phoenix_display if c in phoenix_df.columns]
+                phoenix_sorted = phoenix_df.sort_values('trend_score_val', ascending=False).head(5)
+                print(phoenix_sorted[phoenix_display].to_string(index=False))
+
+                # Show explanations for phoenix candidates
+                print("\n  --- SIGNAL EXPLANATIONS ---")
+                for _, row in phoenix_sorted.iterrows():
+                    ticker = row['ticker']
+                    expl = row.get('signal_explanation', 'No explanation available')
+                    print(f"  {ticker}: {expl[:150]}...")
+            else:
+                print("\n" + "="*80)
+                print(f"STRATEGY 5: PHOENIX REVERSAL (6-12 Month Base Breakouts)")
+                print("="*80)
+                print("  [!] No phoenix reversal candidates found.")
+
             # --- SAVE OUTPUT ---
-            out_path = "/content/drive/My Drive/colab/swing_signals_v9_grandmaster.csv" if COLAB_ENV else os.path.join(engine.base_dir, "swing_signals_v9_grandmaster.csv")
+            out_path = "/content/drive/My Drive/colab/swing_signals_v10_grandmaster.csv" if COLAB_ENV else os.path.join(engine.base_dir, "swing_signals_v10_grandmaster.csv")
             try:
                 final_output = pd.concat([stocks_df, etfs_df])
                 final_output.to_csv(out_path, index=False)
                 print(f"\n[SUCCESS] Saved comprehensive report with explanations: {out_path}")
             except Exception as e:
-                out_path = os.path.join(engine.base_dir, "swing_signals_v9_grandmaster.csv")
+                out_path = os.path.join(engine.base_dir, "swing_signals_v10_grandmaster.csv")
                 try:
                     pd.concat([stocks_df, etfs_df]).to_csv(out_path, index=False)
                     print(f"\n[FALLBACK] Saved locally to {out_path}")
@@ -2142,8 +2416,10 @@ if __name__ == "__main__":
             print(f"  Momentum Leaders (>80): {len(trend_picks)}")
             print(f"  Ambush Setups: {len(ambush_picks)}")
             print(f"  Bull Flags: {len(flag_picks) if not flag_picks.empty else 0}")
+            phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
+            print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.0 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.1 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
