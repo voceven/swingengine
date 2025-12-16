@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""SwingEngine_v9_Grandmaster.py
+"""SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 9.5 (Grandmaster) - Calibrated
-Phase 9: Pattern Intelligence + Interpretability + Performance Tuning
+Swing Trading Engine - Version 10.0 (Grandmaster) - Position Sizing
+Phase 10: Kelly Criterion Position Sizing + Risk Tiers
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -13,6 +13,7 @@ Architecture:
 6. INTERPRETABILITY: Human-readable explanation generator for each signal.
 7. RISK: Sector capping to prevent over-concentration.
 8. PERFORMANCE: Configurable training epochs, batch sizes, ticker limits.
+9. SIZING: Kelly Criterion position sizing with volatility-based risk tiers.
 
 Changelog from v8.4:
 - Added bull flag pattern detection (consolidation after strong moves)
@@ -30,6 +31,13 @@ Changelog v9.5 (Calibration):
 - Performance config: reduced transformer epochs (50->30), CatBoost trials (30->15)
 - Configurable batch sizes and ticker download limits
 - TPU/GPU/CPU auto-detection with torch_xla support
+
+Changelog v10.0 (Position Sizing):
+- Added Kelly Criterion position sizing (quarter-Kelly for safety)
+- Added Risk Tier Matrix (HIGH/MEDIUM/LOW conviction based on nn_score + vol)
+- Added volatility buckets (<5%, 5-6%, >6% ATR/Price)
+- Position sizing integrated into all strategy outputs
+- Displays position_pct, shares, and risk_tier for each pick
 """
 
 import pandas as pd
@@ -182,6 +190,32 @@ MACRO_WEIGHTS = {
     'tnx_penalty_per_point': 2.0,     # Score penalty per yield point above threshold
     'dxy_strength_threshold': 104,    # DXY above this indicates strong dollar
     'dxy_penalty_per_point': 0.3      # Score penalty per DXY point above threshold
+}
+
+# --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
+# Kelly Formula: Position = (Edge * P(win) - P(loss)) / Vol_Risk
+# Capped at 0.25 * Kelly for safety (quarter-Kelly)
+POSITION_SIZING_CONFIG = {
+    'kelly_fraction': 0.25,           # Quarter-Kelly for safety
+    'max_position_pct': 0.10,         # Max 10% of portfolio per position
+    'min_position_pct': 0.01,         # Min 1% of portfolio per position
+    'default_win_rate': 0.55,         # Conservative default win rate
+    'default_edge': 0.10,             # Conservative default edge (10%)
+}
+
+# Risk Tier Matrix: Vol buckets determine position multipliers
+RISK_TIER_MATRIX = {
+    # nn_score ranges -> vol_bucket -> position multiplier
+    'score_tiers': {
+        (95, 100): {'<5%': 1.0, '5-6%': 0.75, '>6%': 0.50},   # Highest conviction
+        (85, 94):  {'<5%': 0.75, '5-6%': 0.50, '>6%': 0.35},  # High conviction
+        (70, 84):  {'<5%': 0.50, '5-6%': 0.35, '>6%': 0.20},  # Medium conviction
+    },
+    'vol_thresholds': {
+        'low': 0.05,    # <5% ATR/Price = low vol
+        'medium': 0.06, # 5-6% ATR/Price = medium vol
+        # >6% = high vol
+    }
 }
 
 # --- NEURAL NETWORK ARCHITECTURE (TRANSFORMER v2) ---
@@ -1235,6 +1269,129 @@ class SwingTradingEngine:
 
         return result
 
+    # --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
+    def calculate_position_size(self, row, portfolio_value=100000):
+        """
+        Calculate position size using Modified Kelly Criterion.
+
+        Kelly Formula: f* = (p*b - q) / b
+        Where: p = win probability, q = loss probability (1-p), b = win/loss ratio
+
+        Simplified as: Position = (Edge * P(win) - P(loss)) / Vol_Risk
+        Capped at quarter-Kelly for safety.
+
+        Args:
+            row: DataFrame row with ticker data (nn_score, atr, current_price, etc.)
+            portfolio_value: Total portfolio value for sizing
+
+        Returns:
+            dict with position_size, position_pct, risk_tier, kelly_raw, etc.
+        """
+        result = {
+            'position_size': 0,
+            'position_pct': 0.0,
+            'shares': 0,
+            'risk_tier': 'MEDIUM',
+            'vol_bucket': 'medium',
+            'kelly_raw': 0.0,
+            'kelly_capped': 0.0,
+            'sizing_explanation': ''
+        }
+
+        try:
+            # Extract key metrics
+            nn_score = row.get('nn_score', 50)
+            current_price = row.get('current_price', 0)
+            atr = row.get('atr', 0)
+
+            if current_price <= 0:
+                result['sizing_explanation'] = 'Invalid price'
+                return result
+
+            # Calculate volatility ratio (ATR/Price)
+            vol_ratio = atr / current_price if current_price > 0 else 0.10
+
+            # Determine vol bucket
+            if vol_ratio < RISK_TIER_MATRIX['vol_thresholds']['low']:
+                vol_bucket = '<5%'
+                result['vol_bucket'] = 'low'
+            elif vol_ratio < RISK_TIER_MATRIX['vol_thresholds']['medium']:
+                vol_bucket = '5-6%'
+                result['vol_bucket'] = 'medium'
+            else:
+                vol_bucket = '>6%'
+                result['vol_bucket'] = 'high'
+
+            # Determine score tier and get multiplier
+            multiplier = 0.20  # Default for low scores
+            for (low, high), vol_dict in RISK_TIER_MATRIX['score_tiers'].items():
+                if low <= nn_score <= high:
+                    multiplier = vol_dict.get(vol_bucket, 0.20)
+                    if nn_score >= 95:
+                        result['risk_tier'] = 'HIGH_CONVICTION'
+                    elif nn_score >= 85:
+                        result['risk_tier'] = 'MEDIUM_HIGH'
+                    else:
+                        result['risk_tier'] = 'MEDIUM'
+                    break
+
+            # Estimate edge based on model confidence
+            # nn_score of 90 = 0.15 edge, 80 = 0.10 edge, 70 = 0.05 edge
+            estimated_edge = max(0.02, (nn_score - 50) / 400)  # 0.02 to 0.125
+
+            # Estimate win rate from score (conservative)
+            win_rate = min(0.65, 0.50 + (nn_score - 50) / 200)  # 0.50 to 0.65
+
+            # Kelly calculation: f* = (p * b - q) / b, where b = edge / (1 - edge)
+            # Simplified: f* = (win_rate * (1 + edge) - (1 - win_rate)) / (1 + edge)
+            loss_rate = 1 - win_rate
+            if vol_ratio > 0:
+                kelly_raw = (estimated_edge * win_rate - loss_rate) / vol_ratio
+            else:
+                kelly_raw = 0
+
+            # Cap at quarter-Kelly for safety
+            kelly_fraction = POSITION_SIZING_CONFIG['kelly_fraction']
+            kelly_capped = max(0, kelly_raw * kelly_fraction)
+
+            # Apply tier multiplier
+            position_pct = kelly_capped * multiplier
+
+            # Enforce min/max bounds
+            min_pct = POSITION_SIZING_CONFIG['min_position_pct']
+            max_pct = POSITION_SIZING_CONFIG['max_position_pct']
+            position_pct = max(min_pct, min(max_pct, position_pct))
+
+            # Calculate dollar amount and shares
+            position_size = portfolio_value * position_pct
+            shares = int(position_size / current_price) if current_price > 0 else 0
+
+            # Populate result
+            result['position_size'] = round(position_size, 2)
+            result['position_pct'] = round(position_pct * 100, 2)  # As percentage
+            result['shares'] = shares
+            result['kelly_raw'] = round(kelly_raw, 4)
+            result['kelly_capped'] = round(kelly_capped, 4)
+            result['sizing_explanation'] = (
+                f"{result['risk_tier']} | Vol:{result['vol_bucket']} | "
+                f"Kelly:{kelly_raw:.1%}→{position_pct:.1%} | "
+                f"${position_size:,.0f} ({shares} shares)"
+            )
+
+        except Exception as e:
+            result['sizing_explanation'] = f'Sizing error: {str(e)[:30]}'
+
+        return result
+
+    def get_vol_bucket_label(self, vol_ratio):
+        """Helper to get human-readable vol bucket label."""
+        if vol_ratio < 0.05:
+            return 'LOW (<5%)'
+        elif vol_ratio < 0.06:
+            return 'MEDIUM (5-6%)'
+        else:
+            return 'HIGH (>6%)'
+
     def generate_signal_explanation(self, row, patterns):
         """
         Generate human-readable explanation for why this ticker is being recommended.
@@ -1851,9 +2008,19 @@ if __name__ == "__main__":
         if results is not None:
             stocks_df, etfs_df = results
 
+            # --- POSITION SIZING (Phase 10: Kelly Criterion) ---
+            print(f"\n  [SIZING] Calculating Kelly-based position sizes...")
+            portfolio_value = 100000  # Default portfolio size
+            for idx, row in stocks_df.iterrows():
+                sizing = engine.calculate_position_size(row.to_dict(), portfolio_value)
+                stocks_df.at[idx, 'position_pct'] = sizing['position_pct']
+                stocks_df.at[idx, 'position_size'] = sizing['position_size']
+                stocks_df.at[idx, 'shares'] = sizing['shares']
+                stocks_df.at[idx, 'risk_tier'] = sizing['risk_tier']
+
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v9.0 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.0 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -1868,11 +2035,20 @@ if __name__ == "__main__":
             print(f"Logic: CatBoost + Hive Mind + Bull Flag Detection + GEX Protection")
             print("="*80)
 
-            # Display table
-            display_cols = ['ticker', 'trend_score', 'quality', 'has_bull_flag', 'has_gex_support', 'nn_score', 'stop_loss', 'take_profit']
+            # Display table with position sizing
+            display_cols = ['ticker', 'trend_score', 'quality', 'has_bull_flag', 'nn_score', 'position_pct', 'shares', 'risk_tier']
             display_cols = [c for c in display_cols if c in stocks_df.columns]
             if not trend_picks.empty:
                 print(trend_picks[display_cols].head(8).to_string(index=False))
+
+                # Show position sizing summary
+                print("\n  --- POSITION SIZING (Kelly) ---")
+                for _, row in trend_picks.head(5).iterrows():
+                    pct = row.get('position_pct', 0)
+                    shares = int(row.get('shares', 0))
+                    tier = row.get('risk_tier', 'N/A')
+                    price = row.get('current_price', 0)
+                    print(f"  {row['ticker']}: {pct:.1f}% (${pct*1000:.0f} → {shares} shares @ ${price:.2f}) | {tier}")
 
                 # Show explanations for top picks
                 print("\n  --- SIGNAL EXPLANATIONS ---")
@@ -1897,7 +2073,7 @@ if __name__ == "__main__":
             print(f"Logic: Downtrend + DP Support + Divergence Detection")
             print("="*80)
 
-            display_cols = ['ticker', 'ambush_score', 'quality', 'is_reversal_setup', 'dp_support', 'gex_support', 'stop_loss', 'take_profit']
+            display_cols = ['ticker', 'ambush_score', 'quality', 'is_reversal_setup', 'dp_support', 'gex_support', 'position_pct', 'shares']
             display_cols = [c for c in display_cols if c in stocks_df.columns]
             if not ambush_picks.empty:
                 print(ambush_picks[display_cols].head(8).to_string(index=False))
@@ -1919,7 +2095,7 @@ if __name__ == "__main__":
                 print(f"STRATEGY 3: BULL FLAG BREAKOUTS")
                 print(f"Logic: Strong pole + Tight consolidation + Declining volume")
                 print("="*80)
-                display_cols = ['ticker', 'trend_score', 'quality', 'nn_score', 'gex_support', 'stop_loss', 'take_profit']
+                display_cols = ['ticker', 'trend_score', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
                 display_cols = [c for c in display_cols if c in stocks_df.columns]
                 print(flag_picks[display_cols].head(5).to_string(index=False))
 
@@ -1967,7 +2143,7 @@ if __name__ == "__main__":
             print(f"  Ambush Setups: {len(ambush_picks)}")
             print(f"  Bull Flags: {len(flag_picks) if not flag_picks.empty else 0}")
 
-            msg = f"v9.0 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.0 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
