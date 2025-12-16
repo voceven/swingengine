@@ -95,8 +95,34 @@ from torch.utils.data import DataLoader, TensorDataset
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-# Transformer uses GPU if available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- DEVICE DETECTION (GPU/TPU/CPU) ---
+def get_device():
+    """Detect and return the best available device: TPU > GPU > CPU"""
+    # Try TPU first (Google Colab TPU runtime)
+    try:
+        import torch_xla
+        import torch_xla.core.xla_model as xm
+        device = xm.xla_device()
+        print(f"  [DEVICE] TPU detected and enabled")
+        return device, 'TPU'
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [DEVICE] TPU detection failed: {e}")
+
+    # Try GPU (CUDA)
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"  [DEVICE] GPU detected: {gpu_name}")
+        return device, f'GPU ({gpu_name})'
+
+    # Fallback to CPU
+    print(f"  [DEVICE] Using CPU (no GPU/TPU detected)")
+    return torch.device('cpu'), 'CPU'
+
+device, device_name = get_device()
 
 SECTOR_MAP = {
     'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
@@ -1893,15 +1919,12 @@ if __name__ == "__main__":
             # --- SUMMARY ---
             elapsed = time.time() - start_time
             mins, secs = divmod(elapsed, 60)
-            device_name = "CPU"
-            if torch.cuda.is_available():
-                device_name = f"GPU ({torch.cuda.get_device_name(0)})"
 
             print("\n" + "="*80)
             print("RUN SUMMARY")
             print("="*80)
             print(f"  Duration: {int(mins)}m {int(secs)}s")
-            print(f"  Device: {device_name}")
+            print(f"  Device: {device_name}")  # Uses global device_name from get_device()
             print(f"  Total Candidates Analyzed: {len(stocks_df) + len(etfs_df)}")
             print(f"  Momentum Leaders (>80): {len(trend_picks)}")
             print(f"  Ambush Setups: {len(ambush_picks)}")
