@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.2 (Grandmaster) - Production Optimization
-Phase 10.2: Quick Wins - Model Caching + Advanced Pattern Detection
+Swing Trading Engine - Version 10.3 (Grandmaster) - Ensemble Stacking + GPU
+Phase 10.3: ML Powerhouse - 3-Model Ensemble + GPU Acceleration
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
-2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Tuned CatBoost (Left Brain) + Model Caching.
+2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Ensemble Stack (CatBoost + LightGBM + XGBoost + Meta) + GPU Acceleration.
 3. CONTEXT: Enhanced Macro-Regime Awareness (VIX, TNX, DXY) with score weighting.
 4. EXECUTION: ATR-based Stop Loss & Take Profit.
 5. PATTERNS: 6 Pattern Types - Bull Flag, GEX Wall, Downtrend Reversal, Phoenix, Cup-Handle, Double Bottom.
 6. INTERPRETABILITY: Human-readable explanation generator for each signal.
 7. RISK: Sector capping to prevent over-concentration.
-8. PERFORMANCE: Model caching, early stopping, configurable parameters.
+8. PERFORMANCE: Ensemble caching, GPU acceleration, early stopping, configurable parameters.
 9. SIZING: Kelly Criterion position sizing with volatility-based risk tiers.
 
 Changelog from v8.4:
@@ -57,6 +57,18 @@ Changelog v10.2 (Production Optimization - Quick Wins):
 - PATTERNS: Detailed point-based explanations showing strength/weakness breakdown
 - Expected runtime: 83min → 20-30min (first run trains, subsequent runs load cache)
 - Expected phoenix detections: 0 → 3-8 per run (with relaxed scoring)
+
+Changelog v10.3 (Ensemble Stacking + GPU Acceleration):
+- ML ARCHITECTURE: Replaced single CatBoost with ensemble stacking (3 models + meta-learner)
+- ML MODELS: CatBoost + LightGBM + XGBoost with LogisticRegression meta-learner
+- GPU ACCELERATION: All 3 base models use GPU when available (task_type='GPU', device='gpu', tree_method='gpu_hist')
+- PERFORMANCE: Ensemble caching system (4 model caches with regime-aware invalidation)
+- PERFORMANCE: Cross-validated stacking predictions for meta-learner training
+- QUALITY: Expected AUC improvement from 0.92-0.93 → 0.95+ with ensemble diversity
+- GPU DETECTION: Automatic CUDA detection with fallback to CPU
+- LOGGING: Detailed model weights and individual AUC scores for transparency
+- Expected runtime: 34min → 18-22min with GPU (first run trains all 3, subsequent runs load cache)
+- Expected AUC: 0.92 → 0.95+ with ensemble stacking
 """
 
 import pandas as pd
@@ -105,7 +117,7 @@ class Logger(object):
 
 # --- AUTO-INSTALLER ---
 def install_requirements():
-    required = ['optuna', 'catboost', 'scikit-learn', 'pandas', 'numpy', 'yfinance', 'torch', 'scipy', 'joblib']
+    required = ['optuna', 'catboost', 'lightgbm', 'xgboost', 'scikit-learn', 'pandas', 'numpy', 'yfinance', 'torch', 'scipy', 'joblib']
     for pkg in required:
         try:
             __import__(pkg)
@@ -120,8 +132,11 @@ from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from sklearn.feature_selection import SelectFromModel
+from sklearn.linear_model import LogisticRegression
 import optuna
 from catboost import CatBoostClassifier, Pool
+import lightgbm as lgb
+import xgboost as xgb
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -520,6 +535,12 @@ class SwingTradingEngine:
         self.model_path = os.path.join(self.base_dir, "grandmaster_cat_v8.pkl")
         self.transformer_path = os.path.join(self.base_dir, "grandmaster_transformer_v8.pth")
 
+        # Ensemble model paths (v10.3)
+        self.catboost_path = os.path.join(self.base_dir, "ensemble_catboost_v10.pkl")
+        self.lightgbm_path = os.path.join(self.base_dir, "ensemble_lightgbm_v10.pkl")
+        self.xgboost_path = os.path.join(self.base_dir, "ensemble_xgboost_v10.pkl")
+        self.meta_learner_path = os.path.join(self.base_dir, "ensemble_meta_v10.pkl")
+
         self.scaler = StandardScaler()
         self.nn_scaler = StandardScaler()
         self.imputer = SimpleImputer(strategy='constant', fill_value=0)
@@ -527,7 +548,12 @@ class SwingTradingEngine:
         self.full_df = pd.DataFrame()
         self.price_cache_file = os.path.join(self.base_dir, "price_cache_v79.csv")
 
-        self.model = None
+        # Ensemble models (v10.3)
+        self.catboost_model = None
+        self.lightgbm_model = None
+        self.xgboost_model = None
+        self.meta_learner = None
+        self.model = None  # Keep for backward compatibility
         self.nn_model = None
         self.model_trained = False
 
@@ -2218,58 +2244,82 @@ class SwingTradingEngine:
         return self.full_df
 
     def train_model(self, force_retrain=False):
+        """
+        v10.3: Ensemble Stacking with GPU Acceleration
+        Trains CatBoost + LightGBM + XGBoost with LogisticRegression meta-learner
+        """
         if self.full_df.empty: return
 
-        # --- MODEL CACHING WITH SAFEGUARDS ---
+        import joblib
+        import json
+
+        # --- ENSEMBLE CACHE CHECK ---
         cache_duration_days = PERFORMANCE_CONFIG.get('model_cache_days', 7)
-        cache_metadata_path = self.model_path.replace('.pkl', '_metadata.json')
+        meta_metadata_path = self.meta_learner_path.replace('.pkl', '_metadata.json')
+
+        # Check if ALL ensemble components are cached
+        all_cached = all([
+            os.path.exists(self.catboost_path),
+            os.path.exists(self.lightgbm_path),
+            os.path.exists(self.xgboost_path),
+            os.path.exists(self.meta_learner_path),
+            os.path.exists(meta_metadata_path)
+        ])
 
         should_use_cache = False
-        if not force_retrain and os.path.exists(self.model_path) and os.path.exists(cache_metadata_path):
+        if not force_retrain and all_cached:
             try:
-                # Check cache age
-                model_age_seconds = time.time() - os.path.getmtime(self.model_path)
+                # Check cache age and regime
+                model_age_seconds = time.time() - os.path.getmtime(self.meta_learner_path)
                 model_age_days = model_age_seconds / (24 * 3600)
 
-                # Load cache metadata
-                import json
-                with open(cache_metadata_path, 'r') as f:
+                with open(meta_metadata_path, 'r') as f:
                     metadata = json.load(f)
 
                 cached_regime = metadata.get('market_regime', 'Unknown')
                 current_regime = self.market_regime
 
-                # Decision logic
-                if model_age_days <= cache_duration_days:
-                    if cached_regime == current_regime:
-                        should_use_cache = True
-                        print(f"\n[3/4] Loading Cached CatBoost Model (Age: {model_age_days:.1f}d, Regime: {current_regime})...")
-                    else:
-                        print(f"\n[3/4] Regime Changed ({cached_regime} → {current_regime}), Retraining...")
+                if model_age_days <= cache_duration_days and cached_regime == current_regime:
+                    should_use_cache = True
+                    print(f"\n[3/4] Loading Cached Ensemble (Age: {model_age_days:.1f}d, Regime: {current_regime})...")
+                elif cached_regime != current_regime:
+                    print(f"\n[3/4] Regime Changed ({cached_regime} → {current_regime}), Retraining Ensemble...")
                 else:
-                    print(f"\n[3/4] Model Expired (Age: {model_age_days:.1f}d > {cache_duration_days}d), Retraining...")
-
+                    print(f"\n[3/4] Ensemble Expired (Age: {model_age_days:.1f}d > {cache_duration_days}d), Retraining...")
             except Exception as e:
                 print(f"\n[3/4] Cache validation failed ({e}), Retraining...")
                 should_use_cache = False
 
         if should_use_cache:
             try:
-                import joblib
-                cached_data = joblib.load(self.model_path)
-                self.model = cached_data['model']
-                self.imputer = cached_data['imputer']
-                self.scaler = cached_data['scaler']
-                self.features_list = cached_data['features_list']
+                # Load all ensemble components
+                catboost_cache = joblib.load(self.catboost_path)
+                lightgbm_cache = joblib.load(self.lightgbm_path)
+                xgboost_cache = joblib.load(self.xgboost_path)
+                meta_cache = joblib.load(self.meta_learner_path)
+
+                self.catboost_model = catboost_cache['model']
+                self.lightgbm_model = lightgbm_cache['model']
+                self.xgboost_model = xgboost_cache['model']
+                self.meta_learner = meta_cache['model']
+                self.imputer = catboost_cache['imputer']
+                self.scaler = catboost_cache['scaler']
+                self.features_list = catboost_cache['features_list']
                 self.model_trained = True
-                print(f"  [CATBOOST] Loaded cached model (AUC: {cached_data.get('auc', 'N/A'):.4f})")
+
+                ensemble_auc = metadata.get('ensemble_auc', 'N/A')
+                print(f"  [ENSEMBLE] Loaded cached models (AUC: {ensemble_auc})")
+                print(f"  [ENSEMBLE] CatBoost AUC: {catboost_cache.get('auc', 'N/A')}")
+                print(f"  [ENSEMBLE] LightGBM AUC: {lightgbm_cache.get('auc', 'N/A')}")
+                print(f"  [ENSEMBLE] XGBoost AUC: {xgboost_cache.get('auc', 'N/A')}")
                 return
             except Exception as e:
                 print(f"  [!] Cache load failed ({e}), Training from scratch...")
 
-        # --- TRAIN NEW MODEL ---
-        print("\n[3/4] Training CatBoost (Left Brain)...")
-        if 'lagged_return_5d' not in self.full_df.columns: self.full_df['lagged_return_5d'] = 0.0
+        # --- PREPARE DATA ---
+        print("\n[3/4] Training Ensemble Stack (CatBoost + LightGBM + XGBoost + Meta)...")
+        if 'lagged_return_5d' not in self.full_df.columns:
+            self.full_df['lagged_return_5d'] = 0.0
         self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
 
         if self.full_df['target'].nunique() < 2: return
@@ -2287,84 +2337,239 @@ class SwingTradingEngine:
         X_clean = self.imputer.fit_transform(X)
         X_scaled = self.scaler.fit_transform(X_clean)
 
+        # Configuration
         n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 25)
         max_iterations = PERFORMANCE_CONFIG.get('catboost_max_iterations', 500)
         max_depth = PERFORMANCE_CONFIG.get('catboost_max_depth', 10)
         cv_folds = PERFORMANCE_CONFIG.get('catboost_cv_folds', 5)
 
-        print(f"  [CATBOOST] Tuning Hyperparameters ({n_trials} trials, max_iter={max_iterations}, max_depth={max_depth})...")
-        def objective(trial):
+        # Detect GPU availability
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+            gpu_count = torch.cuda.device_count() if has_gpu else 0
+            if has_gpu:
+                print(f"  [GPU] Detected {gpu_count} GPU(s): {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"  [GPU] No GPU detected, using CPU")
+        except:
+            has_gpu = False
+            print(f"  [GPU] GPU detection failed, using CPU")
+
+        # --- LEVEL 1: TRAIN BASE MODELS WITH GPU ---
+        print(f"  [LEVEL-1] Training 3 base models ({n_trials} trials each)...")
+
+        # 1. CatBoost with GPU
+        print(f"  [CATBOOST] Tuning with {'GPU' if has_gpu else 'CPU'}...")
+        def catboost_objective(trial):
             param = {
                 'iterations': trial.suggest_int('iterations', 150, max_iterations),
                 'depth': trial.suggest_int('depth', 5, max_depth),
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
                 'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
                 'border_count': trial.suggest_int('border_count', 32, 255),
-                'early_stopping_rounds': 50,  # Stop if no improvement for 50 rounds
-                'logging_level': 'Silent',
-                'thread_count': -1
+                'task_type': 'GPU' if has_gpu else 'CPU',
+                'devices': '0' if has_gpu else None,
+                'early_stopping_rounds': 50,
+                'logging_level': 'Silent'
             }
+            if not has_gpu:
+                param['thread_count'] = -1
             model = CatBoostClassifier(**param)
             return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
 
         try:
-            study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+            study_cb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+            study_cb.optimize(catboost_objective, n_trials=n_trials, show_progress_bar=False)
 
-            # Add early stopping to final model
-            best_params = study.best_params.copy()
-            best_params['early_stopping_rounds'] = 50
+            best_cb_params = study_cb.best_params.copy()
+            best_cb_params['task_type'] = 'GPU' if has_gpu else 'CPU'
+            if has_gpu:
+                best_cb_params['devices'] = '0'
+            else:
+                best_cb_params['thread_count'] = -1
+            best_cb_params['early_stopping_rounds'] = 50
+            best_cb_params['logging_level'] = 'Silent'
 
-            cb = CatBoostClassifier(**best_params, logging_level='Silent')
-            self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=cv_folds)
-            self.model.fit(X_scaled, y)
-            self.model_trained = True
-
-            best_auc = study.best_value
-            print(f"  [CATBOOST] Best AUC: {best_auc:.4f}")
-            print(f"  [CATBOOST] Best params: iterations={study.best_params.get('iterations')}, depth={study.best_params.get('depth')}")
-
-            # Save model cache with metadata
-            try:
-                import joblib
-                import json
-                cache_data = {
-                    'model': self.model,
-                    'imputer': self.imputer,
-                    'scaler': self.scaler,
-                    'features_list': self.features_list,
-                    'auc': best_auc
-                }
-                joblib.dump(cache_data, self.model_path)
-
-                metadata = {
-                    'timestamp': time.time(),
-                    'market_regime': self.market_regime,
-                    'auc': float(best_auc),
-                    'best_params': best_params
-                }
-                with open(cache_metadata_path, 'w') as f:
-                    json.dump(metadata, f, indent=2)
-
-                print(f"  [CATBOOST] Model cached (expires in {cache_duration_days} days or on regime change)")
-            except Exception as e:
-                print(f"  [!] Model caching failed: {e}")
-
+            self.catboost_model = CatBoostClassifier(**best_cb_params)
+            self.catboost_model.fit(X_scaled, y, verbose=False)
+            catboost_auc = study_cb.best_value
+            print(f"  [CATBOOST] AUC: {catboost_auc:.4f} (iter={best_cb_params.get('iterations')}, depth={best_cb_params.get('depth')})")
         except Exception as e:
-            print(f"  [!] Training failed: {e}")
+            print(f"  [!] CatBoost training failed: {e}")
             self.model_trained = False
+            return
+
+        # 2. LightGBM with GPU
+        print(f"  [LIGHTGBM] Tuning with {'GPU' if has_gpu else 'CPU'}...")
+        def lightgbm_objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, max_iterations),
+                'max_depth': trial.suggest_int('max_depth', 5, max_depth),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 10.0),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+                'device': 'gpu' if has_gpu else 'cpu',
+                'verbose': -1
+            }
+            if has_gpu:
+                param['gpu_platform_id'] = 0
+                param['gpu_device_id'] = 0
+            model = lgb.LGBMClassifier(**param)
+            return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
+
+        try:
+            study_lgb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=43))
+            study_lgb.optimize(lightgbm_objective, n_trials=n_trials, show_progress_bar=False)
+
+            best_lgb_params = study_lgb.best_params.copy()
+            best_lgb_params['device'] = 'gpu' if has_gpu else 'cpu'
+            if has_gpu:
+                best_lgb_params['gpu_platform_id'] = 0
+                best_lgb_params['gpu_device_id'] = 0
+            best_lgb_params['verbose'] = -1
+
+            self.lightgbm_model = lgb.LGBMClassifier(**best_lgb_params)
+            self.lightgbm_model.fit(X_scaled, y)
+            lightgbm_auc = study_lgb.best_value
+            print(f"  [LIGHTGBM] AUC: {lightgbm_auc:.4f} (n_est={best_lgb_params.get('n_estimators')}, depth={best_lgb_params.get('max_depth')})")
+        except Exception as e:
+            print(f"  [!] LightGBM training failed: {e}")
+            self.model_trained = False
+            return
+
+        # 3. XGBoost with GPU
+        print(f"  [XGBOOST] Tuning with {'GPU' if has_gpu else 'CPU'}...")
+        def xgboost_objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, max_iterations),
+                'max_depth': trial.suggest_int('max_depth', 5, max_depth),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 10.0),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'tree_method': 'gpu_hist' if has_gpu else 'hist',
+                'verbosity': 0
+            }
+            if has_gpu:
+                param['gpu_id'] = 0
+            model = xgb.XGBClassifier(**param, eval_metric='logloss')
+            return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
+
+        try:
+            study_xgb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=44))
+            study_xgb.optimize(xgboost_objective, n_trials=n_trials, show_progress_bar=False)
+
+            best_xgb_params = study_xgb.best_params.copy()
+            best_xgb_params['tree_method'] = 'gpu_hist' if has_gpu else 'hist'
+            if has_gpu:
+                best_xgb_params['gpu_id'] = 0
+            best_xgb_params['verbosity'] = 0
+
+            self.xgboost_model = xgb.XGBClassifier(**best_xgb_params, eval_metric='logloss')
+            self.xgboost_model.fit(X_scaled, y)
+            xgboost_auc = study_xgb.best_value
+            print(f"  [XGBOOST] AUC: {xgboost_auc:.4f} (n_est={best_xgb_params.get('n_estimators')}, depth={best_xgb_params.get('max_depth')})")
+        except Exception as e:
+            print(f"  [!] XGBoost training failed: {e}")
+            self.model_trained = False
+            return
+
+        # --- LEVEL 2: TRAIN META-LEARNER ---
+        print(f"  [LEVEL-2] Training meta-learner with stacked predictions...")
+
+        # Generate cross-validated predictions from each base model
+        from sklearn.model_selection import cross_val_predict
+
+        catboost_preds = cross_val_predict(self.catboost_model, X_scaled, y, cv=cv_folds, method='predict_proba')[:, 1]
+        lightgbm_preds = cross_val_predict(self.lightgbm_model, X_scaled, y, cv=cv_folds, method='predict_proba')[:, 1]
+        xgboost_preds = cross_val_predict(self.xgboost_model, X_scaled, y, cv=cv_folds, method='predict_proba')[:, 1]
+
+        # Stack predictions as features for meta-learner
+        X_meta = np.column_stack([catboost_preds, lightgbm_preds, xgboost_preds])
+
+        # Train LogisticRegression meta-learner
+        self.meta_learner = LogisticRegression(max_iter=1000, random_state=42)
+        self.meta_learner.fit(X_meta, y)
+
+        # Calculate ensemble AUC
+        from sklearn.metrics import roc_auc_score
+        meta_preds = self.meta_learner.predict_proba(X_meta)[:, 1]
+        ensemble_auc = roc_auc_score(y, meta_preds)
+
+        print(f"  [META-LEARNER] Ensemble AUC: {ensemble_auc:.4f}")
+        print(f"  [META-LEARNER] Weights: CB={self.meta_learner.coef_[0][0]:.3f}, LGB={self.meta_learner.coef_[0][1]:.3f}, XGB={self.meta_learner.coef_[0][2]:.3f}")
+
+        self.model_trained = True
+
+        # --- SAVE ALL ENSEMBLE COMPONENTS ---
+        try:
+            # CatBoost cache
+            joblib.dump({
+                'model': self.catboost_model,
+                'imputer': self.imputer,
+                'scaler': self.scaler,
+                'features_list': self.features_list,
+                'auc': catboost_auc,
+                'params': best_cb_params
+            }, self.catboost_path)
+
+            # LightGBM cache
+            joblib.dump({
+                'model': self.lightgbm_model,
+                'auc': lightgbm_auc,
+                'params': best_lgb_params
+            }, self.lightgbm_path)
+
+            # XGBoost cache
+            joblib.dump({
+                'model': self.xgboost_model,
+                'auc': xgboost_auc,
+                'params': best_xgb_params
+            }, self.xgboost_path)
+
+            # Meta-learner cache
+            joblib.dump({
+                'model': self.meta_learner
+            }, self.meta_learner_path)
+
+            # Metadata
+            metadata = {
+                'timestamp': time.time(),
+                'market_regime': self.market_regime,
+                'ensemble_auc': float(ensemble_auc),
+                'catboost_auc': float(catboost_auc),
+                'lightgbm_auc': float(lightgbm_auc),
+                'xgboost_auc': float(xgboost_auc),
+                'gpu_used': has_gpu
+            }
+            with open(meta_metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            print(f"  [ENSEMBLE] All models cached (expires in {cache_duration_days} days or on regime change)")
+        except Exception as e:
+            print(f"  [!] Ensemble caching failed: {e}")
 
     def predict(self):
         if self.full_df.empty: return None
         print("\n[4/4] Generating Predictions with Pattern Intelligence...")
         df = self.full_df.copy()
 
-        # --- BASE SCORE FROM ML MODEL ---
+        # --- BASE SCORE FROM ENSEMBLE STACK ---
         if self.model_trained:
             X = self.full_df[self.features_list]
             X_clean = self.imputer.transform(X)
             X_scaled = self.scaler.transform(X_clean)
-            probs = self.model.predict_proba(X_scaled)[:, 1]
+
+            # Get predictions from all 3 base models
+            catboost_probs = self.catboost_model.predict_proba(X_scaled)[:, 1]
+            lightgbm_probs = self.lightgbm_model.predict_proba(X_scaled)[:, 1]
+            xgboost_probs = self.xgboost_model.predict_proba(X_scaled)[:, 1]
+
+            # Stack predictions for meta-learner
+            X_meta = np.column_stack([catboost_probs, lightgbm_probs, xgboost_probs])
+
+            # Get final ensemble prediction from meta-learner
+            probs = self.meta_learner.predict_proba(X_meta)[:, 1]
             df['raw_score'] = probs
         else:
             df['raw_score'] = 0.5
@@ -2661,7 +2866,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.2 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.3 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -2810,7 +3015,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.1 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.3 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
