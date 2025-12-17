@@ -2447,11 +2447,9 @@ class SwingTradingEngine:
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
                 'reg_lambda': trial.suggest_float('reg_lambda', 0.1, 10.0),
                 'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'tree_method': 'gpu_hist' if has_gpu else 'hist',
+                'device': 'cuda' if has_gpu else 'cpu',  # XGBoost 3.1+ unified device parameter
                 'verbosity': 0
             }
-            if has_gpu:
-                param['gpu_id'] = 0
             model = xgb.XGBClassifier(**param, eval_metric='logloss')
             return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
 
@@ -2460,9 +2458,7 @@ class SwingTradingEngine:
             study_xgb.optimize(xgboost_objective, n_trials=n_trials, show_progress_bar=False)
 
             best_xgb_params = study_xgb.best_params.copy()
-            best_xgb_params['tree_method'] = 'gpu_hist' if has_gpu else 'hist'
-            if has_gpu:
-                best_xgb_params['gpu_id'] = 0
+            best_xgb_params['device'] = 'cuda' if has_gpu else 'cpu'  # XGBoost 3.1+ unified device parameter
             best_xgb_params['verbosity'] = 0
 
             self.xgboost_model = xgb.XGBClassifier(**best_xgb_params, eval_metric='logloss')
