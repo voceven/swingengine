@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.1 (Grandmaster) - Phoenix + AUC Enhancement
-Phase 10.1: Phoenix Reversal Strategy + Reliability Improvements
+Swing Trading Engine - Version 10.2 (Grandmaster) - Production Optimization
+Phase 10.2: Quick Wins - Model Caching + Advanced Pattern Detection
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
-2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Tuned CatBoost (Left Brain).
+2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Tuned CatBoost (Left Brain) + Model Caching.
 3. CONTEXT: Enhanced Macro-Regime Awareness (VIX, TNX, DXY) with score weighting.
 4. EXECUTION: ATR-based Stop Loss & Take Profit.
-5. PATTERNS: Bull Flag, GEX Wall Scanner, Downtrend Reversal, Phoenix Reversal.
+5. PATTERNS: 6 Pattern Types - Bull Flag, GEX Wall, Downtrend Reversal, Phoenix, Cup-Handle, Double Bottom.
 6. INTERPRETABILITY: Human-readable explanation generator for each signal.
 7. RISK: Sector capping to prevent over-concentration.
-8. PERFORMANCE: Configurable training epochs, batch sizes, ticker limits.
+8. PERFORMANCE: Model caching, early stopping, configurable parameters.
 9. SIZING: Kelly Criterion position sizing with volatility-based risk tiers.
 
 Changelog from v8.4:
@@ -46,6 +46,17 @@ Changelog v10.1 (Phoenix + Reliability):
 - IMPROVED: Fetch success tracking with detailed error handling and logging
 - OPTIMIZED: Border count tuning in CatBoost for better model performance
 - Updated output filename to v10_grandmaster.csv
+
+Changelog v10.2 (Production Optimization - Quick Wins):
+- PERFORMANCE: Model caching with regime-aware invalidation (7-day default, 50-70min savings)
+- PERFORMANCE: Early stopping in CatBoost (early_stopping_rounds=50)
+- PATTERNS: Multi-layer phoenix scoring system (6 layers: duration, volume, RSI, breakout, drawdown, DP)
+- PATTERNS: Added Cup-and-Handle detection (U-shaped recovery + handle consolidation)
+- PATTERNS: Added Double Bottom detection (dual support test + resistance breakout)
+- PATTERNS: Enhanced phoenix threshold from boolean AND to weighted scoring (0.60 threshold)
+- PATTERNS: Detailed point-based explanations showing strength/weakness breakdown
+- Expected runtime: 83min → 20-30min (first run trains, subsequent runs load cache)
+- Expected phoenix detections: 0 → 3-8 per run (with relaxed scoring)
 """
 
 import pandas as pd
@@ -94,7 +105,7 @@ class Logger(object):
 
 # --- AUTO-INSTALLER ---
 def install_requirements():
-    required = ['optuna', 'catboost', 'scikit-learn', 'pandas', 'numpy', 'yfinance', 'torch']
+    required = ['optuna', 'catboost', 'scikit-learn', 'pandas', 'numpy', 'yfinance', 'torch', 'scipy', 'joblib']
     for pkg in required:
         try:
             __import__(pkg)
@@ -199,6 +210,7 @@ PERFORMANCE_CONFIG = {
     'catboost_max_iterations': 500,  # Increased from 300 for better AUC (v10.1.1)
     'catboost_max_depth': 10,     # Increased from 8 for better AUC (v10.1.1)
     'catboost_cv_folds': 5,       # Increased from 3 for better AUC (v10.1.1)
+    'model_cache_days': 7,        # Model cache duration (invalidated on regime change)
     'transformer_epochs': 30,     # Reduced from 50 for faster training
     'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
     'price_cache_days': 7,        # Refresh price cache weekly
@@ -1432,69 +1444,335 @@ class SwingTradingEngine:
 
             # Dark pool support adds confidence
             has_dp_support = False
+            dp_strength = 0.0
             if ticker in self.dp_support_levels:
                 dp_levels = self.dp_support_levels[ticker]
                 nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < 0.15]
                 has_dp_support = len(nearby_support) > 0
+                dp_strength = min(len(nearby_support) / 3.0, 1.0)  # More DP levels = stronger
 
-            # Phoenix pattern detected if all criteria met
-            is_phoenix = (
-                days_in_base >= min_days and
-                days_in_base <= max_days and
-                has_volume_surge and
-                rsi_in_range and
-                acceptable_drawdown and
-                (near_breakout or recent_breakout)
+            # --- MULTI-LAYER SCORING SYSTEM ---
+            # Layer 1: Base Duration Score (0-25 points)
+            base_duration_score = 0.0
+            if min_days <= days_in_base <= max_days:
+                # Optimal range: 90-180 days (Wyckoff accumulation timeframe)
+                if 90 <= days_in_base <= 180:
+                    base_duration_score = 0.25
+                elif 60 <= days_in_base < 90:
+                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10  # Linear ramp up
+                elif 180 < days_in_base <= 250:
+                    base_duration_score = 0.20  # Slightly lower for very long bases
+            else:
+                base_duration_score = 0.0
+
+            # Layer 2: Volume Confirmation Score (0-25 points)
+            volume_score = 0.0
+            if volume_ratio >= 1.5:
+                if volume_ratio >= 3.0:
+                    volume_score = 0.25  # Exceptional volume
+                elif volume_ratio >= 2.0:
+                    volume_score = 0.20  # Strong volume
+                else:
+                    volume_score = 0.10 + (volume_ratio - 1.5) / 0.5 * 0.10  # Gradual increase
+            else:
+                # Partial credit for moderate volume
+                if volume_ratio >= 1.2:
+                    volume_score = 0.05
+
+            # Layer 3: RSI Health Score (0-20 points)
+            rsi_score = 0.0
+            if 50 <= current_rsi <= 70:
+                # Optimal range - not oversold, not overbought
+                if 55 <= current_rsi <= 65:
+                    rsi_score = 0.20  # Sweet spot
+                else:
+                    rsi_score = 0.15  # Good but not perfect
+            elif 45 <= current_rsi < 50:
+                rsi_score = 0.10  # Slightly oversold (partial credit)
+            elif 70 < current_rsi <= 75:
+                rsi_score = 0.08  # Slightly overbought (lower credit)
+
+            # Layer 4: Breakout Confirmation Score (0-15 points)
+            breakout_score = 0.0
+            if near_breakout or recent_breakout:
+                if recent_breakout:
+                    # Already broken out
+                    breakout_pct = (current_price - base_low) / base_low
+                    if breakout_pct >= 0.10:
+                        breakout_score = 0.15  # Strong breakout (10%+)
+                    elif breakout_pct >= 0.05:
+                        breakout_score = 0.12
+                    else:
+                        breakout_score = 0.08
+                elif near_breakout:
+                    # Near breakout (anticipatory)
+                    breakout_score = 0.10
+
+            # Layer 5: Drawdown Quality Score (0-10 points)
+            drawdown_score = 0.0
+            if acceptable_drawdown:
+                # Lower drawdown = higher quality base
+                if max_drawdown <= 0.20:
+                    drawdown_score = 0.10  # Tight base (best)
+                elif max_drawdown <= 0.30:
+                    drawdown_score = 0.07
+                else:
+                    drawdown_score = 0.05
+            else:
+                # Excessive drawdown - penalize but don't eliminate
+                drawdown_score = -0.05
+
+            # Layer 6: Dark Pool Support Score (0-15 points)
+            dp_score = 0.0
+            if has_dp_support:
+                dp_score = 0.10 + (dp_strength * 0.05)  # Base 10 + up to 5 bonus
+
+            # --- COMPOSITE SCORE ---
+            composite_score = (
+                base_duration_score +
+                volume_score +
+                rsi_score +
+                breakout_score +
+                drawdown_score +
+                dp_score
             )
 
+            # Phoenix threshold: 0.60 (60% of max 1.0 score)
+            # This allows patterns that are strong in some dimensions but weaker in others
+            is_phoenix = composite_score >= 0.60
+
             result['is_phoenix'] = is_phoenix
+            result['phoenix_score'] = composite_score
+
+            # --- DETAILED EXPLANATION ---
+            score_components = []
 
             if is_phoenix:
-                score_components = []
-                base_score = 0.6
+                # Highlight strengths
+                if base_duration_score >= 0.20:
+                    score_components.append(f"{days_in_base}d base ({base_duration_score*100:.0f} pts)")
+                if volume_score >= 0.15:
+                    score_components.append(f"{volume_ratio:.1f}x volume ({volume_score*100:.0f} pts)")
+                if rsi_score >= 0.15:
+                    score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
+                if breakout_score >= 0.10:
+                    score_components.append(f"Breakout confirmed ({breakout_score*100:.0f} pts)")
+                if dp_score >= 0.10:
+                    score_components.append(f"DP support ({dp_score*100:.0f} pts)")
 
-                # Volume surge adds score
-                if volume_ratio >= 2.0:
-                    base_score += 0.2
-                    score_components.append(f"{volume_ratio:.1f}x volume surge")
-                else:
-                    score_components.append(f"{volume_ratio:.1f}x volume")
-
-                # Long base adds conviction
-                if days_in_base >= 120:
-                    base_score += 0.15
-                    score_components.append(f"{days_in_base}d base (extended)")
-                else:
-                    score_components.append(f"{days_in_base}d base")
-
-                # DP support adds score
-                if has_dp_support:
-                    base_score += 0.10
-                    score_components.append("DP accumulation")
-
-                # RSI in optimal range
-                score_components.append(f"RSI {current_rsi:.0f}")
-
-                result['phoenix_score'] = min(1.0, base_score)
-                result['explanation'] = f"PHOENIX REVERSAL: " + ", ".join(score_components)
+                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f} | " + ", ".join(score_components)
             else:
-                # Provide detailed reason why it's not a phoenix
-                missing = []
-                if days_in_base < min_days:
-                    missing.append(f"base too short ({days_in_base}d)")
-                if not has_volume_surge:
-                    missing.append(f"low volume ({volume_ratio:.1f}x)")
-                if not rsi_in_range:
-                    missing.append(f"RSI {current_rsi:.0f} out of range")
-                if not acceptable_drawdown:
-                    missing.append(f"drawdown too high ({max_drawdown*100:.0f}%)")
-                if not near_breakout and not recent_breakout:
-                    missing.append("no breakout signal")
+                # Show why it didn't qualify (scores too low)
+                weak_components = []
+                if base_duration_score < 0.15:
+                    weak_components.append(f"base {days_in_base}d ({base_duration_score*100:.0f} pts)")
+                if volume_score < 0.10:
+                    weak_components.append(f"volume {volume_ratio:.1f}x ({volume_score*100:.0f} pts)")
+                if rsi_score < 0.10:
+                    weak_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
+                if breakout_score < 0.08:
+                    weak_components.append(f"no breakout ({breakout_score*100:.0f} pts)")
 
-                result['explanation'] = 'Not phoenix: ' + ', '.join(missing) if missing else 'Near phoenix pattern'
+                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}/0.60): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
 
         except Exception as e:
             result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
+
+        return result
+
+    def detect_cup_and_handle(self, ticker, history_df):
+        """
+        Detect Cup-and-Handle pattern: U-shaped recovery + small consolidation (handle).
+
+        Pattern:
+        1. U-shaped recovery (30-60 days)
+        2. Price returns to 80-100% of prior high
+        3. Small handle consolidation (5-15 days, 5-15% pullback)
+        4. Volume decreasing during handle formation
+        5. Breakout above handle resistance
+
+        Returns dict with cup-and-handle detection results.
+        """
+        result = {
+            'is_cup_handle': False,
+            'cup_handle_score': 0.0,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < 60:
+            result['explanation'] = 'Insufficient history'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            # Look for cup formation in last 60 days
+            lookback = min(len(close), 60)
+            cup_period = close.iloc[-lookback:]
+
+            # Find the high before the cup (left rim)
+            left_rim_high = cup_period.iloc[:20].max()
+            left_rim_idx = cup_period.iloc[:20].idxmax()
+
+            # Find the low of the cup (bottom)
+            cup_low = cup_period.iloc[10:40].min()
+            cup_low_idx = cup_period.iloc[10:40].idxmin()
+
+            # Find the recent high (right rim / handle start)
+            right_rim_high = cup_period.iloc[-20:].max()
+
+            current_price = float(close.iloc[-1])
+
+            # Cup depth
+            cup_depth = (left_rim_high - cup_low) / left_rim_high
+
+            # Recovery ratio (how much of the drop was recovered)
+            recovery = (right_rim_high - cup_low) / (left_rim_high - cup_low) if left_rim_high > cup_low else 0
+
+            # Handle characteristics (last 15 days)
+            handle_period = close.iloc[-15:]
+            handle_high = handle_period.max()
+            handle_low = handle_period.min()
+            handle_depth = (handle_high - handle_low) / handle_high
+
+            # Volume trend during handle (should decline)
+            volume_handle = volume.iloc[-15:]
+            volume_pre_handle = volume.iloc[-30:-15]
+            volume_declining = volume_handle.mean() < volume_pre_handle.mean()
+
+            # Scoring
+            score = 0.0
+
+            # Cup quality (0-40 points)
+            if 0.15 <= cup_depth <= 0.50 and recovery >= 0.80:
+                score += 0.40
+            elif 0.10 <= cup_depth <= 0.55 and recovery >= 0.70:
+                score += 0.25
+
+            # Handle quality (0-30 points)
+            if 0.05 <= handle_depth <= 0.15 and volume_declining:
+                score += 0.30
+            elif 0.05 <= handle_depth <= 0.20:
+                score += 0.15
+
+            # Breakout confirmation (0-30 points)
+            if current_price >= handle_high * 1.02:  # 2% breakout
+                score += 0.30
+            elif current_price >= handle_high * 0.98:  # Near breakout
+                score += 0.15
+
+            result['is_cup_handle'] = score >= 0.60
+            result['cup_handle_score'] = score
+            result['explanation'] = f"Cup-Handle: {score:.2f} | Depth={cup_depth*100:.0f}%, Recovery={recovery*100:.0f}%, Handle={handle_depth*100:.0f}%" if score >= 0.60 else f"Not cup-handle (score={score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Cup-handle error: {str(e)[:50]}'
+
+        return result
+
+    def detect_double_bottom(self, ticker, history_df):
+        """
+        Detect Double Bottom pattern: Two distinct lows at similar price levels with a bounce between.
+
+        Pattern:
+        1. First low (support test)
+        2. Bounce of 10-20% from first low
+        3. Second low within 2-5% of first low (support confirmation)
+        4. Time between lows: 20-60 days
+        5. Breakout above resistance (high between the lows)
+
+        Returns dict with double bottom detection results.
+        """
+        result = {
+            'is_double_bottom': False,
+            'double_bottom_score': 0.0,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < 60:
+            result['explanation'] = 'Insufficient history'
+            return result
+
+        try:
+            close = history_df['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            # Look for pattern in last 60 days
+            lookback = min(len(close), 60)
+            pattern_period = close.iloc[-lookback:]
+
+            # Find local minima (potential lows)
+            from scipy.signal import argrelextrema
+            local_min_indices = argrelextrema(pattern_period.values, np.less, order=5)[0]
+
+            if len(local_min_indices) < 2:
+                result['explanation'] = 'Insufficient local minima'
+                return result
+
+            # Take the two most recent lows
+            recent_lows = local_min_indices[-2:]
+            first_low_idx = recent_lows[0]
+            second_low_idx = recent_lows[1]
+
+            first_low = pattern_period.iloc[first_low_idx]
+            second_low = pattern_period.iloc[second_low_idx]
+
+            # Time between lows
+            days_between = second_low_idx - first_low_idx
+
+            # Find the high between the lows (resistance)
+            between_period = pattern_period.iloc[first_low_idx:second_low_idx]
+            resistance_high = between_period.max()
+
+            # Bounce height from first low
+            bounce_height = (resistance_high - first_low) / first_low
+
+            # Similarity of lows (should be within 5%)
+            low_similarity = abs(second_low - first_low) / first_low
+
+            current_price = float(close.iloc[-1])
+
+            # Scoring
+            score = 0.0
+
+            # Low similarity (0-35 points)
+            if low_similarity <= 0.02:  # Within 2%
+                score += 0.35
+            elif low_similarity <= 0.05:  # Within 5%
+                score += 0.25
+            elif low_similarity <= 0.08:  # Within 8%
+                score += 0.15
+
+            # Time spacing (0-25 points)
+            if 20 <= days_between <= 60:
+                score += 0.25
+            elif 15 <= days_between < 20 or 60 < days_between <= 80:
+                score += 0.15
+
+            # Bounce quality (0-20 points)
+            if bounce_height >= 0.15:  # 15%+ bounce
+                score += 0.20
+            elif bounce_height >= 0.10:
+                score += 0.15
+
+            # Breakout confirmation (0-20 points)
+            if current_price >= resistance_high * 1.03:  # 3% above resistance
+                score += 0.20
+            elif current_price >= resistance_high:
+                score += 0.10
+
+            result['is_double_bottom'] = score >= 0.60
+            result['double_bottom_score'] = score
+            result['explanation'] = f"Double-Bottom: {score:.2f} | Lows={low_similarity*100:.1f}% apart, Bounce={bounce_height*100:.0f}%, Days={days_between}" if score >= 0.60 else f"Not double-bottom (score={score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Double-bottom error: {str(e)[:50]}'
 
         return result
 
@@ -1679,6 +1957,14 @@ class SwingTradingEngine:
             # Phoenix
             if patterns.get('phoenix', {}).get('is_phoenix'):
                 reasons.append(patterns['phoenix']['explanation'])
+
+            # Cup-and-Handle
+            if patterns.get('cup_handle', {}).get('is_cup_handle'):
+                reasons.append(patterns['cup_handle']['explanation'])
+
+            # Double Bottom
+            if patterns.get('double_bottom', {}).get('is_double_bottom'):
+                reasons.append(patterns['double_bottom']['explanation'])
 
         # 4. AI Confidence
         nn_score = row.get('nn_score', 0)
@@ -1933,6 +2219,55 @@ class SwingTradingEngine:
 
     def train_model(self, force_retrain=False):
         if self.full_df.empty: return
+
+        # --- MODEL CACHING WITH SAFEGUARDS ---
+        cache_duration_days = PERFORMANCE_CONFIG.get('model_cache_days', 7)
+        cache_metadata_path = self.model_path.replace('.pkl', '_metadata.json')
+
+        should_use_cache = False
+        if not force_retrain and os.path.exists(self.model_path) and os.path.exists(cache_metadata_path):
+            try:
+                # Check cache age
+                model_age_seconds = time.time() - os.path.getmtime(self.model_path)
+                model_age_days = model_age_seconds / (24 * 3600)
+
+                # Load cache metadata
+                import json
+                with open(cache_metadata_path, 'r') as f:
+                    metadata = json.load(f)
+
+                cached_regime = metadata.get('market_regime', 'Unknown')
+                current_regime = self.market_regime
+
+                # Decision logic
+                if model_age_days <= cache_duration_days:
+                    if cached_regime == current_regime:
+                        should_use_cache = True
+                        print(f"\n[3/4] Loading Cached CatBoost Model (Age: {model_age_days:.1f}d, Regime: {current_regime})...")
+                    else:
+                        print(f"\n[3/4] Regime Changed ({cached_regime} → {current_regime}), Retraining...")
+                else:
+                    print(f"\n[3/4] Model Expired (Age: {model_age_days:.1f}d > {cache_duration_days}d), Retraining...")
+
+            except Exception as e:
+                print(f"\n[3/4] Cache validation failed ({e}), Retraining...")
+                should_use_cache = False
+
+        if should_use_cache:
+            try:
+                import joblib
+                cached_data = joblib.load(self.model_path)
+                self.model = cached_data['model']
+                self.imputer = cached_data['imputer']
+                self.scaler = cached_data['scaler']
+                self.features_list = cached_data['features_list']
+                self.model_trained = True
+                print(f"  [CATBOOST] Loaded cached model (AUC: {cached_data.get('auc', 'N/A'):.4f})")
+                return
+            except Exception as e:
+                print(f"  [!] Cache load failed ({e}), Training from scratch...")
+
+        # --- TRAIN NEW MODEL ---
         print("\n[3/4] Training CatBoost (Left Brain)...")
         if 'lagged_return_5d' not in self.full_df.columns: self.full_df['lagged_return_5d'] = 0.0
         self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
@@ -1965,6 +2300,7 @@ class SwingTradingEngine:
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
                 'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
                 'border_count': trial.suggest_int('border_count', 32, 255),
+                'early_stopping_rounds': 50,  # Stop if no improvement for 50 rounds
                 'logging_level': 'Silent',
                 'thread_count': -1
             }
@@ -1974,12 +2310,46 @@ class SwingTradingEngine:
         try:
             study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
             study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-            cb = CatBoostClassifier(**study.best_params, logging_level='Silent')
+
+            # Add early stopping to final model
+            best_params = study.best_params.copy()
+            best_params['early_stopping_rounds'] = 50
+
+            cb = CatBoostClassifier(**best_params, logging_level='Silent')
             self.model = CalibratedClassifierCV(cb, method='sigmoid', cv=cv_folds)
             self.model.fit(X_scaled, y)
             self.model_trained = True
-            print(f"  [CATBOOST] Best AUC: {study.best_value:.4f}")
+
+            best_auc = study.best_value
+            print(f"  [CATBOOST] Best AUC: {best_auc:.4f}")
             print(f"  [CATBOOST] Best params: iterations={study.best_params.get('iterations')}, depth={study.best_params.get('depth')}")
+
+            # Save model cache with metadata
+            try:
+                import joblib
+                import json
+                cache_data = {
+                    'model': self.model,
+                    'imputer': self.imputer,
+                    'scaler': self.scaler,
+                    'features_list': self.features_list,
+                    'auc': best_auc
+                }
+                joblib.dump(cache_data, self.model_path)
+
+                metadata = {
+                    'timestamp': time.time(),
+                    'market_regime': self.market_regime,
+                    'auc': float(best_auc),
+                    'best_params': best_params
+                }
+                with open(cache_metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+
+                print(f"  [CATBOOST] Model cached (expires in {cache_duration_days} days or on regime change)")
+            except Exception as e:
+                print(f"  [!] Model caching failed: {e}")
+
         except Exception as e:
             print(f"  [!] Training failed: {e}")
             self.model_trained = False
@@ -2098,7 +2468,9 @@ class SwingTradingEngine:
                 'bull_flag': self.detect_bull_flag(ticker, hist_df),
                 'gex_wall': self.find_gex_walls(ticker, current_price),
                 'reversal': self.detect_downtrend_reversal(ticker, hist_df),
-                'phoenix': self.detect_phoenix_reversal(ticker, hist_df)
+                'phoenix': self.detect_phoenix_reversal(ticker, hist_df),
+                'cup_handle': self.detect_cup_and_handle(ticker, hist_df),
+                'double_bottom': self.detect_double_bottom(ticker, hist_df)
             }
             pattern_results[ticker] = patterns
 
@@ -2130,11 +2502,26 @@ class SwingTradingEngine:
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.8
 
+            # Cup-and-Handle bonus
+            cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
+            if cup_handle_score > 0:
+                bonus = cup_handle_score * 12  # Up to 12 point bonus
+                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
+                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.6
+
+            # Double Bottom bonus
+            double_bottom_score = patterns['double_bottom'].get('double_bottom_score', 0)
+            if double_bottom_score > 0:
+                bonus = double_bottom_score * 10  # Up to 10 point bonus
+                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+
             # Store pattern flags
             top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
             top_candidates.at[idx, 'has_gex_support'] = wall_score > 0.3
             top_candidates.at[idx, 'is_reversal_setup'] = patterns['reversal'].get('is_reversal', False)
             top_candidates.at[idx, 'is_phoenix'] = patterns['phoenix'].get('is_phoenix', False)
+            top_candidates.at[idx, 'is_cup_handle'] = patterns['cup_handle'].get('is_cup_handle', False)
+            top_candidates.at[idx, 'is_double_bottom'] = patterns['double_bottom'].get('is_double_bottom', False)
 
             # Fundamental & Sector Analysis
             ctx = self.analyze_fundamentals_and_sector(ticker, eq_type)
@@ -2201,12 +2588,16 @@ class SwingTradingEngine:
         gex_protected = stock_candidates['has_gex_support'].sum() if 'has_gex_support' in stock_candidates.columns else 0
         reversal_setups = stock_candidates['is_reversal_setup'].sum() if 'is_reversal_setup' in stock_candidates.columns else 0
         phoenix_reversals = stock_candidates['is_phoenix'].sum() if 'is_phoenix' in stock_candidates.columns else 0
+        cup_handles = stock_candidates['is_cup_handle'].sum() if 'is_cup_handle' in stock_candidates.columns else 0
+        double_bottoms = stock_candidates['is_double_bottom'].sum() if 'is_double_bottom' in stock_candidates.columns else 0
 
         print(f"\n  [PATTERNS SUMMARY]")
         print(f"    Bull Flags Detected: {bull_flags}")
         print(f"    GEX Protected Positions: {gex_protected}")
         print(f"    Reversal Setups: {reversal_setups}")
         print(f"    Phoenix Reversals: {phoenix_reversals}")
+        print(f"    Cup-and-Handle Patterns: {cup_handles}")
+        print(f"    Double Bottom Patterns: {double_bottoms}")
 
         return stock_candidates, etf_candidates
 
@@ -2270,7 +2661,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.0 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.2 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
