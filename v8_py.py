@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.4 (Grandmaster) - Institutional Phoenix Patterns
-Phase 10.4: Pattern Quality - Institutional Phoenix + Synergy Detection
+Swing Trading Engine - Version 10.6 (Grandmaster) - Validation Mode Fix
+Phase 10.6: Critical Fix - Force Validation Tickers into Pattern Analysis
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -84,6 +84,28 @@ Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
 - INSTITUTIONAL FOCUS: Catches large-cap ($5B+) activist plays with extended accumulation periods
 - Expected improvement: Catch LULU-like patterns that were previously missed
 - Rationale: Real-world validation showed BHR flagged but LULU (Elliott $1B stake) missed
+
+Changelog v10.5 (Oracle Reliability Fix - Data Integrity):
+- ROOT CAUSE: yfinance bulk downloads failing silently (63.5% success rate → 36.5% data loss)
+- ORACLE CHUNKING: Reduced batch size 75 → 50 tickers per chunk (API limit compliance)
+- RATE LIMITING: 1.5s delay between chunks with exponential backoff on errors (prevents bans)
+- INDIVIDUAL RETRY: Failed tickers get individual fetch retry (yfinance quirk workaround)
+- DATA INTEGRITY GATE: <90% fetch success → WARNING + user notification (no silent failures)
+- PROGRESS FEEDBACK: Chunk-by-chunk progress reporting for transparency
+- EXPECTED IMPROVEMENT: 63.5% → 95%+ Oracle fetch success rate
+- PHOENIX IMPACT: LULU-like patterns now detectable (data present → analysis works)
+- Rationale: Previous sessions found phoenix logic correct but no data to analyze
+
+Changelog v10.6 (Validation Mode Fix - CRITICAL):
+- ROOT CAUSE CORRECTED: Previous diagnosis missed the REAL blocker
+- THREE DATA STAGES: Oracle (781) → Fetch (3000) → Patterns (top 75 only)
+- FATAL FLAW: Validation mode added LULU with zeros → Low ML score → Never in top 75
+- FIX: Force validation tickers into top_candidates (bypass ML ranking filter)
+- VALIDATION_SUITE: Moved to module-level constant for cross-function access
+- DEBUG OUTPUT: Shows LULU's actual ML score, rank, data status, and phoenix result
+- PATTERN CHUNKING: Applied 50-ticker chunking to pattern downloads too (safety)
+- EXPECTED: LULU now reaches pattern analysis → Phoenix detection can run
+- Rationale: Validation mode adds ticker but NOT data → Pattern analysis never reached
 """
 
 import pandas as pd
@@ -247,6 +269,26 @@ PERFORMANCE_CONFIG = {
     'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
     'price_cache_days': 7,        # Refresh price cache weekly
     'batch_size': 75              # Batch size for yfinance downloads
+}
+
+# v10.6: Validation Suite Configuration (Module Level)
+# Force-include known institutional phoenix patterns to validate detection
+ENABLE_VALIDATION_MODE = True  # Change to False once validated
+
+VALIDATION_SUITE = {
+    # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
+    'institutional_phoenix': [
+        'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
+        # Add other confirmed institutional phoenix patterns here
+    ],
+    # Optional: Add other pattern types for comprehensive testing
+    'speculative_phoenix': [
+        # 'ABC',  # Example: 200-day base, moderate drawdown
+    ],
+    # Known false positives to test filtering
+    'negative_cases': [
+        # Tickers that look like phoenix but aren't (tests specificity)
+    ]
 }
 
 # Macro Score Weights (how much macro conditions affect individual scores)
@@ -459,7 +501,16 @@ class HistoryManager:
         self.sync_prices()
 
     def sync_prices(self):
-        print("\n[ORACLE] Syncing Price History & ATR...")
+        """
+        v10.5: Enhanced Oracle with chunking, rate limiting, retry logic, and data integrity gate.
+
+        Key improvements:
+        - Chunk size: 50 (down from 75) for API compliance
+        - Rate limiting: 1.5s between chunks, exponential backoff on errors
+        - Individual retry: Failed tickers get individual fetch (yfinance quirk workaround)
+        - Data integrity gate: <90% success rate triggers warning
+        """
+        print("\n[ORACLE v10.5] Syncing Price History & ATR...")
         try:
             hist_df = self.db.get_history_df()
             if hist_df.empty: return
@@ -486,20 +537,35 @@ class HistoryManager:
 
         new_data = []
         successful_fetches = 0
-        failed_fetches = 0
-        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
+        failed_tickers = []  # Track failed tickers for individual retry
 
-        for i in range(0, len(to_fetch), batch_size):
-            batch = to_fetch[i:i+batch_size]
+        # v10.5: Reduced chunk size for API compliance (was 75, now 50)
+        chunk_size = 50
+        base_delay = 1.5  # Rate limiting: 1.5s between chunks
+        total_chunks = (len(to_fetch) + chunk_size - 1) // chunk_size
+
+        print(f"  [ORACLE] Processing {total_chunks} chunks of {chunk_size} tickers each...")
+
+        for chunk_idx, i in enumerate(range(0, len(to_fetch), chunk_size)):
+            batch = to_fetch[i:i+chunk_size]
+            chunk_num = chunk_idx + 1
+
+            # Progress feedback
+            print(f"    [Chunk {chunk_num}/{total_chunks}] Fetching {len(batch)} tickers...", end=" ")
+
             try:
                 data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
+                chunk_success = 0
+                chunk_fail = 0
+
                 for t in batch:
                     try:
                         hist = data[t] if len(batch) > 1 else data
                         if not hist.empty and len(hist) > 0:
                             # Check if we have required columns
                             if not all(col in hist.columns for col in ['High', 'Low', 'Close']):
-                                failed_fetches += 1
+                                failed_tickers.append(t)
+                                chunk_fail += 1
                                 continue
 
                             high = hist['High']
@@ -529,22 +595,98 @@ class HistoryManager:
                                 new_data.append({'ticker': t, 'date': d_str, 'close': float(close_val), 'atr': float(atr_val)})
 
                             successful_fetches += 1
+                            chunk_success += 1
                         else:
-                            failed_fetches += 1
+                            failed_tickers.append(t)
+                            chunk_fail += 1
                     except Exception as ticker_error:
-                        failed_fetches += 1
-                        # Uncomment for debugging: print(f"    [!] Failed to process {t}: {ticker_error}")
+                        failed_tickers.append(t)
+                        chunk_fail += 1
+
+                print(f"✓ {chunk_success} OK, {chunk_fail} failed")
+
             except Exception as batch_error:
-                failed_fetches += len(batch)
-                print(f"    [!] Batch download failed: {batch_error}")
+                failed_tickers.extend(batch)
+                print(f"✗ Batch failed: {str(batch_error)[:50]}")
+
+            # v10.5: Rate limiting between chunks (prevents API throttling/bans)
+            if chunk_num < total_chunks:
+                time.sleep(base_delay)
+
+        # v10.5: Individual retry for failed tickers (yfinance quirk workaround)
+        if failed_tickers:
+            print(f"\n  [ORACLE] Retrying {len(failed_tickers)} failed tickers individually...")
+            retry_delay = 0.5  # Shorter delay for individual fetches
+            recovered = 0
+
+            for retry_idx, t in enumerate(failed_tickers[:50]):  # Limit retry to first 50 to avoid excessive time
+                try:
+                    data = yf.download(t, period="3mo", progress=False)
+                    if not data.empty and len(data) > 0 and all(col in data.columns for col in ['High', 'Low', 'Close']):
+                        high = data['High']
+                        low = data['Low']
+                        close = data['Close']
+                        tr1 = high - low
+                        tr2 = abs(high - close.shift(1))
+                        tr3 = abs(low - close.shift(1))
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        atr = tr.rolling(14).mean()
+
+                        data = data.reset_index()
+                        if 'Date' not in data.columns and 'index' in data.columns:
+                            data.rename(columns={'index': 'Date'}, inplace=True)
+
+                        atr_vals = atr.values
+
+                        for idx, row in data.iterrows():
+                            d_val = row.get('Date', row.name)
+                            close_val = row.get('Close', 0)
+                            if isinstance(close_val, pd.Series): close_val = close_val.iloc[0]
+
+                            atr_val = atr_vals[idx] if idx < len(atr_vals) else 0
+                            if np.isnan(atr_val): atr_val = 0
+
+                            d_str = str(d_val).split()[0]
+                            new_data.append({'ticker': t, 'date': d_str, 'close': float(close_val), 'atr': float(atr_val)})
+
+                        successful_fetches += 1
+                        recovered += 1
+                        failed_tickers.remove(t)
+                except Exception:
+                    pass  # Ticker truly unavailable
+
+                # Progressive delay for individual retries
+                if (retry_idx + 1) % 10 == 0:
+                    time.sleep(retry_delay)
+
+            if recovered > 0:
+                print(f"    [ORACLE] Recovered {recovered} tickers via individual retry")
+
+        # Calculate final statistics
+        total_attempts = len(to_fetch)
+        final_failed = len(failed_tickers)
+        success_rate = (successful_fetches / total_attempts * 100) if total_attempts > 0 else 0
 
         if new_data:
             new_df = pd.DataFrame(new_data)
             self.db.upsert_prices(new_df)
-            total_attempts = successful_fetches + failed_fetches
-            success_rate = (successful_fetches / total_attempts * 100) if total_attempts > 0 else 0
-            print(f"  [ORACLE] Price DB updated with {len(new_data)} records.")
-            print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
+            print(f"\n  [ORACLE] Price DB updated with {len(new_data)} records.")
+
+        print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
+
+        # v10.5: Data integrity gate - warn user if success rate is too low
+        if success_rate < 90.0:
+            print(f"\n  ⚠️  [ORACLE DATA INTEGRITY WARNING]")
+            print(f"      Success rate {success_rate:.1f}% is below 90% threshold.")
+            print(f"      {final_failed} tickers failed to fetch data.")
+            print(f"      Phoenix detection may miss patterns due to missing data.")
+            print(f"      Consider: 1) Retry later, 2) Check network, 3) Reduce ticker count")
+            if final_failed <= 20:
+                print(f"      Failed tickers: {', '.join(failed_tickers[:20])}")
+        elif success_rate >= 95.0:
+            print(f"  ✓ [ORACLE] Data integrity EXCELLENT ({success_rate:.1f}%)")
+        else:
+            print(f"  ✓ [ORACLE] Data integrity GOOD ({success_rate:.1f}%)")
 
 class SwingTradingEngine:
     def __init__(self, base_dir=None):
@@ -2208,52 +2350,30 @@ class SwingTradingEngine:
                 df_bot['screener_flow'] = df_bot['net_call_premium'] - df_bot['net_put_premium']
                 df_bot['net_gamma'] = df_bot['screener_flow'] / 100.0
 
-        # --- PATTERN VALIDATION SUITE (v10.4.1: Testing Mode) ---
+        # --- PATTERN VALIDATION SUITE (v10.6: Uses module-level VALIDATION_SUITE) ---
         # Force-include known institutional phoenix patterns to validate detection
-        # These tickers have confirmed patterns and should be detected by the algorithm
-
-        # Set to True to enable validation mode, False for production
-        ENABLE_VALIDATION_MODE = True  # Change to False once validated
-
-        validation_suite = {
-            # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
-            'institutional_phoenix': [
-                'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
-                # Add other confirmed institutional phoenix patterns here:
-                # 'XYZ',  # Example: Another confirmed pattern
-            ],
-
-            # Optional: Add other pattern types for comprehensive testing
-            'speculative_phoenix': [
-                # 'ABC',  # Example: 200-day base, moderate drawdown
-            ],
-
-            # Known false positives to test filtering
-            'negative_cases': [
-                # Tickers that look like phoenix but aren't (tests specificity)
-            ]
-        }
+        # v10.6 FIX: Now forces validation tickers into top 75 (see predict() method)
 
         if ENABLE_VALIDATION_MODE:
-            # Combine all test tickers
+            # Combine all test tickers from module-level VALIDATION_SUITE
             test_tickers = (
-                validation_suite['institutional_phoenix'] +
-                validation_suite['speculative_phoenix']
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
             )
 
             if not df_bot.empty and 'ticker' in df_bot.columns and test_tickers:
-                print(f"\n  [VALIDATION MODE] Testing {len(test_tickers)} known patterns...")
+                print(f"\n  [VALIDATION MODE] Adding {len(test_tickers)} tickers to candidate pool...")
                 for test_ticker in test_tickers:
                     if test_ticker not in df_bot['ticker'].values:
-                        # Add minimal row for forced ticker (will get enriched with real data later)
+                        # Add minimal row for forced ticker (will be force-included in top 75 later)
                         force_row = {
                             'ticker': test_ticker,
-                            'net_gamma': 0.0,  # Will be populated from actual data if available
+                            'net_gamma': 0.0,  # Low score OK - we force into top 75 anyway
                             'net_flow': 0.0,
-                            'dp_total': 0.0  # Will be populated from dark pool data
+                            'dp_total': 0.0
                         }
                         df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
-                        print(f"    → Testing {test_ticker} (institutional phoenix candidate)")
+                        print(f"    → Added {test_ticker} (will be force-included in pattern analysis)")
         # --- END VALIDATION SUITE ---
 
         if not df_bot.empty:
@@ -2738,18 +2858,46 @@ class SwingTradingEngine:
         df = df.sort_values('max_score', ascending=False)
         top_candidates = df.head(75).copy()
 
-        print(f"  [INFO] Base scoring complete. Running pattern detection on top 75 candidates...")
+        # --- v10.6 CRITICAL FIX: Force validation tickers into top candidates ---
+        # Without this, validation tickers with low ML scores (from zero features) never reach pattern analysis
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = (
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
+            )
+            forced_count = 0
+            for ticker in validation_tickers:
+                if ticker not in top_candidates['ticker'].values:
+                    # Find ticker in full df
+                    ticker_row = df[df['ticker'] == ticker]
+                    if not ticker_row.empty:
+                        top_candidates = pd.concat([top_candidates, ticker_row], ignore_index=True)
+                        forced_count += 1
+                        # Debug: Show LULU's actual ML score and rank
+                        if ticker == 'LULU':
+                            lulu_score = ticker_row.iloc[0].get('max_score', 0)
+                            lulu_rank = (df['max_score'] > lulu_score).sum() + 1
+                            print(f"  [VALIDATION] LULU ML score: {lulu_score:.2f}, rank: {lulu_rank}/{len(df)}")
+                    else:
+                        print(f"  [VALIDATION] ⚠️  {ticker} not in candidate pool (may be missing from data)")
+
+            if forced_count > 0:
+                print(f"  [VALIDATION] Force-added {forced_count} validation tickers to pattern analysis (bypassing top 75 filter)")
+        # --- END v10.6 FIX ---
+
+        print(f"  [INFO] Base scoring complete. Running pattern detection on {len(top_candidates)} candidates...")
 
         # --- PHASE 9: PATTERN DETECTION & EXPLANATION GENERATION ---
         pattern_results = {}
         tickers_to_analyze = top_candidates['ticker'].tolist()
 
         # Batch fetch price history for pattern detection
-        print(f"  [PATTERNS] Fetching price history for pattern analysis...")
+        # v10.6: Reduced batch size to 50 for reliability (same as Oracle fix)
+        print(f"  [PATTERNS] Fetching price history for {len(tickers_to_analyze)} tickers...")
         price_data = {}
-        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
-        for i in range(0, len(tickers_to_analyze), batch_size):
-            batch = tickers_to_analyze[i:i+batch_size]
+        pattern_batch_size = 50  # v10.6: Reduced from 75 for reliability
+        for i in range(0, len(tickers_to_analyze), pattern_batch_size):
+            batch = tickers_to_analyze[i:i+pattern_batch_size]
             try:
                 data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
                 for t in batch:
@@ -2759,8 +2907,20 @@ class SwingTradingEngine:
                             price_data[t] = hist
                     except:
                         pass
-            except:
-                pass
+                # Rate limiting for multiple batches
+                if i + pattern_batch_size < len(tickers_to_analyze):
+                    time.sleep(1.0)
+            except Exception as e:
+                print(f"    [!] Pattern batch download failed: {str(e)[:50]}")
+
+        # v10.6: Debug output for validation tickers
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']
+            for vt in validation_tickers:
+                if vt in tickers_to_analyze:
+                    has_data = vt in price_data
+                    data_len = len(price_data[vt]) if has_data else 0
+                    print(f"  [VALIDATION] {vt} in analysis: data={'✓' if has_data else '✗'} ({data_len} rows)")
 
         # Run pattern detection on each candidate
         print(f"  [PATTERNS] Analyzing {len(tickers_to_analyze)} tickers for bull flags, GEX walls, and reversals...")
@@ -2791,6 +2951,18 @@ class SwingTradingEngine:
                 'double_bottom': self.detect_double_bottom(ticker, hist_df)
             }
             pattern_results[ticker] = patterns
+
+            # v10.6: Debug output for validation ticker phoenix results
+            if ENABLE_VALIDATION_MODE:
+                validation_tickers = VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']
+                if ticker in validation_tickers:
+                    phoenix = patterns['phoenix']
+                    phoenix_score = phoenix.get('phoenix_score', 0)
+                    is_phoenix = phoenix.get('is_phoenix', False)
+                    explanation = phoenix.get('explanation', 'N/A')[:80]
+                    status = '✓ DETECTED' if is_phoenix else f'✗ Score={phoenix_score:.2f}/0.60'
+                    print(f"  [VALIDATION] {ticker} Phoenix: {status}")
+                    print(f"              → {explanation}")
 
             # --- PATTERN-BASED SCORE ADJUSTMENTS ---
 
@@ -2998,7 +3170,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.4 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.6 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3147,7 +3319,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.4 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.6 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
