@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.5 (Grandmaster) - VIP Override System
-Phase 10.5: Institutional Override - Money Flow > Technical Filters
+Swing Trading Engine - Version 10.5.1 (Grandmaster) - Flow-Adjusted Dynamic Scoring
+Phase 10.5.1: Probabilistic Flow-Based Phoenix Detection
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -97,6 +97,21 @@ Changelog v10.5 (VIP Override System - Systemic Blind Spot Fix):
 - Expected improvement: No more missed institutional plays due to "overbought" RSI
 - Rationale: v10.4.2 fixed LULU specifically, v10.5 fixes the systemic blind spot
 - User insight: "prefer their signals instead of rsi or anything that potentially blocks this process"
+
+Changelog v10.5.1 (Flow-Adjusted Dynamic Scoring - Continuous Scale):
+- ARCHITECTURE: Replaced binary VIP paths with continuous probabilistic scoring
+- FLOW FACTOR: 0.0-1.0 scale from max(DP Intensity, Volume Intensity)
+- DP INTENSITY: Linear mapping $0 → 0.0, $100M+ → 1.0
+- VOLUME INTENSITY: Linear mapping 1.0x → 0.0, 3.0x+ → 1.0
+- DYNAMIC RSI LIMIT: 70 + (flow_factor * 15) = 70-85 range (truly adaptive)
+- RSI AS PENALTY: No longer blocks - becomes penalty that flow compensates for
+- SCORING: Base Structure (0-30, REQUIRED) + RSI Penalty/Reward (-20 to +20) + Flow Bonus (0-50)
+- SAFEGUARDS: Penny stock volume cap (5x max), Falling knife prevention (base required), Missing data defaults
+- THRESHOLD: 60 points (0.60 normalized) - base structure alone insufficient
+- PHILOSOPHY: Flow "buys forgiveness" for technical weakness, but base structure mandatory
+- ADVANTAGE: Truly continuous (not binary), RSI never blocks, handles edge cases
+- Rationale: v10.5 was still binary (VIP vs Standard), v10.5.1 is continuous probabilistic
+- User feedback: "Penny Stock False Positive", "Falling Knife Trap", "Missing Data Handling"
 """
 
 import pandas as pd
@@ -1431,24 +1446,30 @@ class SwingTradingEngine:
 
     def detect_phoenix_reversal(self, ticker, history_df):
         """
-        Detect Phoenix reversal pattern with INSTITUTIONAL VIP OVERRIDE.
+        Detect Phoenix reversal pattern with FLOW-ADJUSTED DYNAMIC SCORING.
 
-        v10.5: Dual-Path Architecture
-        ==============================
-        PATH A (Standard): Strict technical pattern recognition (RSI < 70, tight base).
-        PATH B (VIP): Massive money flow ($100M+ DP / 3x Vol) bypasses strict filters.
+        v10.5.1: Probabilistic Flow-Based Scoring
+        ==========================================
+        Replaces binary filters with continuous scoring where institutional flow
+        "buys forgiveness" for overbought technicals.
 
-        VIP Triggers:
-        - $100M+ dark pool activity (institutional accumulation)
-        - 3x+ volume surge (fast institutional entry)
+        Philosophy: High institutional flow (Dark Pool + Volume) indicates strong
+        conviction. RSI becomes a PENALTY rather than a FILTER - high flow can
+        compensate for high RSI.
 
-        VIP Advantages:
-        - 0.40 head start (vs 0.00 for standard)
-        - RSI 40-85 allowed (vs 50-70 standard)
-        - 80% drawdown allowed (vs 35% standard)
+        Scoring Components (0-100 scale, threshold: 60):
+        - Base Structure (0-30): Consolidation quality (REQUIRED - can't pass on flow alone)
+        - RSI Penalty/Reward (-20 to +20): Clean RSI gets bonus, overbought gets penalty
+        - Flow Bonus (0-50): Institutional flow intensity
 
-        Philosophy: When institutions enter with massive capital, traditional technical
-        filters (RSI overbought, high drawdown) become SIGNALS not RED FLAGS.
+        Dynamic RSI Limit: 70 + (flow_factor * 15) = 70-85 range
+        - Low flow: RSI limit = 70 (strict)
+        - Max flow: RSI limit = 85 (lenient)
+
+        Safeguards:
+        - Penny stock volume cap (max 5x normalization)
+        - Falling knife prevention (base structure required)
+        - Missing data defaults to 0.0
 
         Returns dict with phoenix detection results and explanation.
         """
@@ -1461,39 +1482,15 @@ class SwingTradingEngine:
             'explanation': ''
         }
 
-        # --- 1. DETECT INSTITUTIONAL "VIP" STATUS ---
-        is_institutional_vip = False
-        vip_reason = ""
-
-        # Check DP Total
-        dp_total = 0
-        if ticker in self.full_df['ticker'].values:
-            row = self.full_df[self.full_df['ticker'] == ticker].iloc[0]
-            dp_total = row.get('dp_total', 0)
-
-        # TRIGGER 1: Massive Dark Pool Stake ($100M+)
-        if dp_total > PHOENIX_CONFIG['vip_dp_threshold']:  # $100M+
-            is_institutional_vip = True
-            vip_reason = f"MEGA DP FLOW (${dp_total/1e6:.0f}M)"
-
-        # --- 2. SETUP DYNAMIC THRESHOLDS ---
         min_days = PHOENIX_CONFIG['min_base_days']  # 60
         max_days = PHOENIX_CONFIG['max_base_days']  # 730
-
-        if is_institutional_vip:
-            effective_rsi_min = PHOENIX_CONFIG['vip_rsi_min']  # 40
-            effective_rsi_max = PHOENIX_CONFIG['vip_rsi_max']  # 85 (Allow hot activist momentum)
-            effective_drawdown_limit = PHOENIX_CONFIG['vip_drawdown_max']  # 0.80 (Allow deep value turnarounds)
-        else:
-            effective_rsi_min = PHOENIX_CONFIG['standard_rsi_min']  # 50
-            effective_rsi_max = PHOENIX_CONFIG['standard_rsi_max']  # 70 (Standard)
-            effective_drawdown_limit = PHOENIX_CONFIG['standard_drawdown_max']  # 0.35
 
         if history_df is None or len(history_df) < min_days:
             result['explanation'] = 'Insufficient history'
             return result
 
         try:
+            # --- STEP 1: DATA NORMALIZATION & SAFE RETRIEVAL ---
             close = history_df['Close']
             volume = history_df['Volume']
             if isinstance(close, pd.DataFrame):
@@ -1503,7 +1500,14 @@ class SwingTradingEngine:
 
             current_price = float(close.iloc[-1])
 
-            # --- 3. TECHNICAL CALCULATIONS (Retained) ---
+            # Safe retrieval of Dark Pool data with default to 0
+            dp_total = 0.0
+            try:
+                if ticker in self.full_df['ticker'].values:
+                    row = self.full_df[self.full_df['ticker'] == ticker].iloc[0]
+                    dp_total = float(row.get('dp_total', 0.0))
+            except Exception:
+                dp_total = 0.0  # Fallback on any error
 
             # Calculate RSI
             delta = close.diff()
@@ -1514,147 +1518,120 @@ class SwingTradingEngine:
             current_rsi = float(rsi.iloc[-1])
             result['rsi'] = current_rsi
 
-            # EARLY FILTER: RSI Check (Dynamic based on VIP status)
-            if current_rsi < effective_rsi_min or current_rsi > effective_rsi_max:
-                result['explanation'] = f"RSI {current_rsi:.0f} outside {effective_rsi_min}-{effective_rsi_max} range ({'VIP' if is_institutional_vip else 'Standard'})"
-                return result
+            # Volume ratio calculation (50-day rolling average baseline)
+            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent = volume.iloc[-5:].mean()
+            volume_ratio_raw = avg_volume_recent / (avg_volume_50d + 1)
 
-            # Base Analysis
+            # SAFEGUARD: Penny Stock Volume Cap (max 5x for normalization)
+            volume_ratio = min(volume_ratio_raw, 5.0)
+            result['volume_ratio'] = float(volume_ratio)
+
+            # --- STEP 2: CALCULATE "FLOW INTENSITY" FACTOR (0.0 to 1.0) ---
+
+            # Dark Pool Intensity: $0 = 0.0, $100M+ = 1.0
+            dp_intensity = min(dp_total / 100_000_000.0, 1.0)
+
+            # Volume Intensity: 1.0x average = 0.0, 3.0x surge = 1.0
+            # Map: [1.0, 3.0] → [0.0, 1.0]
+            if volume_ratio >= 3.0:
+                vol_intensity = 1.0
+            elif volume_ratio >= 1.0:
+                vol_intensity = (volume_ratio - 1.0) / 2.0  # Linear scale from 1x to 3x
+            else:
+                vol_intensity = 0.0
+
+            # Take the MAXIMUM of the two as the final flow_factor
+            flow_factor = max(dp_intensity, vol_intensity)
+
+            # --- STEP 3: DEFINE ADAPTIVE RSI THRESHOLD ---
+            # Base Limit = 70, Scaler = 15
+            # Dynamic Limit = 70 + (flow_factor * 15)
+            # Range: 70 (no flow) to 85 (max flow)
+            dynamic_rsi_limit = 70 + (flow_factor * 15)
+
+            # --- STEP 4: WEIGHTED SCORING MODEL (0-100 scale, threshold 60) ---
+
+            # COMPONENT A: Base Structure (0-30 points) - REQUIRED
+            # Calculate consolidation duration
             lookback_days = min(len(close), max_days)
-            recent_close = close.iloc[-min_days:]
-
-            # Smart SMA calculation
             sma50 = close.rolling(50).mean()
             recent_sma = sma50.iloc[-min_days:] if len(sma50) >= min_days else sma50
+            recent_close = close.iloc[-min_days:] if len(close) >= min_days else close
 
-            # Count days in consolidation (within 10% of SMA50)
-            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']
+            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']  # 0.10
             days_in_base = ((abs(recent_close - recent_sma) / recent_sma) < consolidation_threshold).sum()
             result['base_duration'] = int(days_in_base)
 
-            # Volume Analysis
-            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
-            avg_volume_recent = volume.iloc[-5:].mean()
-            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
-            result['volume_ratio'] = float(volume_ratio)
+            base_structure_score = 0.0
+            if days_in_base >= 90:  # Strong base (90+ days)
+                base_structure_score = 30.0
+            elif days_in_base >= 60:  # Decent base (60-89 days)
+                base_structure_score = 20.0 + ((days_in_base - 60) / 30.0) * 10.0
+            elif days_in_base >= 45:  # Minimal base (45-59 days)
+                base_structure_score = 10.0 + ((days_in_base - 45) / 15.0) * 10.0
+            else:
+                base_structure_score = 0.0  # No base structure
 
-            # TRIGGER 2: Extreme Volume Surge (VIP Override)
-            if volume_ratio > PHOENIX_CONFIG['vip_volume_surge']:  # 3x
-                if not is_institutional_vip:  # Don't overwrite DP reason
-                    is_institutional_vip = True
-                    vip_reason = f"VOL SURGE {volume_ratio:.1f}x"
-                # Update VIP thresholds on the fly if triggered here
-                effective_rsi_max = PHOENIX_CONFIG['vip_rsi_max']
-                effective_drawdown_limit = PHOENIX_CONFIG['vip_drawdown_max']
-
-            # Breakout Analysis
-            base_period = close.iloc[-lookback_days:]
-            base_low = base_period.min()
-            base_high = base_period.max()
-            breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
-            recent_breakout = (current_price - base_low) / base_low >= breakout_threshold
-            near_breakout = current_price >= base_low * (1 + (base_high-base_low)/base_low * 0.7)
-
-            # Drawdown Analysis
-            max_drawdown = (base_high - base_low) / base_high
-
-            # FILTER 2: Drawdown Check (Dynamic)
-            if max_drawdown > effective_drawdown_limit:
-                result['explanation'] = f"Drawdown {max_drawdown:.1%} > {effective_drawdown_limit:.1%} ({'VIP' if is_institutional_vip else 'Standard'})"
+            # SAFEGUARD: Falling Knife Prevention
+            # If base structure is 0, pattern CANNOT pass (max 50 pts from flow alone < 60 threshold)
+            if base_structure_score == 0.0:
+                result['explanation'] = f"No base structure (only {days_in_base}d consolidation)"
                 return result
 
-            # Dark pool support adds confidence
-            has_dp_support = False
-            dp_strength = 0.0
-            if ticker in self.dp_support_levels:
-                dp_levels = self.dp_support_levels[ticker]
-                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < 0.15]
-                has_dp_support = len(nearby_support) > 0
-                dp_strength = min(len(nearby_support) / 3.0, 1.0)  # More DP levels = stronger
+            # COMPONENT B: RSI Penalty/Reward (-20 to +20 points)
+            rsi_excess = current_rsi - dynamic_rsi_limit
 
-            # --- 4. SCORING SYSTEM (VIP Override) ---
+            if rsi_excess <= 0:  # RSI below dynamic limit (clean)
+                if 50 <= current_rsi <= 70:
+                    rsi_score = 20.0  # Perfect RSI range
+                elif 40 <= current_rsi < 50:
+                    rsi_score = 15.0  # Slightly oversold (acceptable)
+                else:
+                    rsi_score = 10.0  # Very low RSI (risky)
+            else:  # RSI above dynamic limit (overbought)
+                # Penalty: 2 points per RSI point over limit
+                penalty = rsi_excess * 2.0
+                rsi_score = -min(penalty, 20.0)  # Cap penalty at -20
 
-            # VIP HEAD START (The "Override")
-            # VIPs start at 0.40, Standard stocks start at 0.00
-            # Philosophy: Massive money flow IS the primary signal
-            composite_score = PHOENIX_CONFIG['vip_head_start'] if is_institutional_vip else 0.0
+            # COMPONENT C: Flow Bonus (0-50 points)
+            # Direct linear mapping of flow_factor to bonus points
+            flow_bonus = flow_factor * 50.0
 
-            institutional_threshold = PHOENIX_CONFIG.get('institutional_threshold', 365)
+            # --- TOTAL SCORE ---
+            total_score = base_structure_score + rsi_score + flow_bonus
 
-            # Layer 1: Base Duration (0-25 pts)
-            base_duration_score = 0.0
-            if min_days <= days_in_base:
-                if 90 <= days_in_base <= 180:
-                    base_duration_score = 0.25  # Optimal Wyckoff
-                elif days_in_base >= institutional_threshold:
-                    base_duration_score = 0.25  # Institutional Phoenix
-                elif days_in_base > 60:
-                    base_duration_score = 0.15
-            composite_score += base_duration_score
+            # Normalize to 0-1 scale for consistency with other patterns
+            normalized_score = total_score / 100.0
 
-            # Layer 2: Volume (0-25 pts)
-            volume_score = 0.0
-            if volume_ratio >= 3.0:
-                volume_score = 0.25  # Exceptional volume
-            elif volume_ratio >= 1.5:
-                volume_score = 0.15  # Good volume
-            composite_score += volume_score
-
-            # Layer 3: RSI Health (0-20 pts)
-            rsi_score = 0.0
-            if 50 <= current_rsi <= 70:
-                rsi_score = 0.20  # Sweet spot
-            elif 70 < current_rsi <= 85 and is_institutional_vip:
-                rsi_score = 0.15  # VIP allowance for breakout momentum
-            elif 40 <= current_rsi < 50:
-                rsi_score = 0.10  # Slightly oversold
-            composite_score += rsi_score
-
-            # Layer 4: Breakout (0-15 pts)
-            breakout_score = 0.0
-            if recent_breakout:
-                breakout_score = 0.15  # Confirmed breakout
-            elif near_breakout:
-                breakout_score = 0.10  # Near breakout
-            composite_score += breakout_score
-
-            # Layer 5: Drawdown Quality (0-10 pts)
-            drawdown_score = 0.0
-            if max_drawdown <= 0.35:
-                drawdown_score = 0.10  # Tight base
-            elif max_drawdown <= 0.70 and (days_in_base > institutional_threshold or is_institutional_vip):
-                drawdown_score = 0.10  # Deep value credit for institutional
-            composite_score += drawdown_score
-
-            # Layer 6: DP Score (0-15 pts)
-            # Already factored into VIP, but small additive bonus for support levels
-            dp_score = 0.0
-            if has_dp_support:
-                dp_score = 0.10 + (dp_strength * 0.05)
-            if not is_institutional_vip:  # Don't double count huge DP
-                composite_score += dp_score
-
-            # --- 5. FINAL DECISION ---
-            # Threshold is 0.60
-            # Standard stocks need to earn 0.60 pts manually
-            # VIPs start with 0.40 and need 0.20 pts from layers above
-            is_phoenix = composite_score >= 0.60
+            # Phoenix threshold: 60 points (0.60 normalized)
+            is_phoenix = total_score >= 60.0
 
             result['is_phoenix'] = is_phoenix
-            result['phoenix_score'] = composite_score
+            result['phoenix_score'] = normalized_score
 
+            # --- STEP 5: OUTPUT FORMATTING ---
             if is_phoenix:
-                base_msg = f"PHOENIX ({'VIP' if is_institutional_vip else 'Tech'}): Score={composite_score:.2f}"
+                explanation_parts = [f"Score: {total_score:.0f}"]
+                explanation_parts.append(f"Base(+{base_structure_score:.0f})")
+                if flow_bonus > 0:
+                    explanation_parts.append(f"Inst.Flow(+{flow_bonus:.0f})")
+                if rsi_score >= 0:
+                    explanation_parts.append(f"RSI({current_rsi:.0f})")
+                else:
+                    explanation_parts.append(f"Overbought({rsi_score:.0f})")
+
+                # Add context details
                 details = []
-                if is_institutional_vip:
-                    details.append(vip_reason)
-                if base_duration_score > 0.1:
-                    details.append(f"{days_in_base}d base")
-                if volume_score > 0.1:
+                if dp_total > 10_000_000:
+                    details.append(f"${dp_total/1e6:.0f}M DP")
+                if volume_ratio >= 2.0:
                     details.append(f"{volume_ratio:.1f}x vol")
-                result['explanation'] = f"{base_msg} | " + ", ".join(details)
+                details.append(f"{days_in_base}d base")
+
+                result['explanation'] = " | ".join(explanation_parts) + " | " + ", ".join(details)
             else:
-                result['explanation'] = f"Score {composite_score:.2f} < 0.60 ({'VIP' if is_institutional_vip else 'Standard'})"
+                result['explanation'] = f"Score {total_score:.0f} < 60 | Base(+{base_structure_score:.0f}) Flow(+{flow_bonus:.0f}) RSI({rsi_score:+.0f})"
 
         except Exception as e:
             result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
