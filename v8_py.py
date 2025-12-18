@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.6 (Grandmaster) - Validation Mode Fix
-Phase 10.6: Critical Fix - Force Validation Tickers into Pattern Analysis
+Swing Trading Engine - Version 10.6.1 (Grandmaster) - Data Sanitization
+Phase 10.6.1: yfinance Header Leak Fix - Robust Date Parsing
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -106,6 +106,14 @@ Changelog v10.6 (Validation Mode Fix - CRITICAL):
 - PATTERN CHUNKING: Applied 50-ticker chunking to pattern downloads too (safety)
 - EXPECTED: LULU now reaches pattern analysis → Phoenix detection can run
 - Rationale: Validation mode adds ticker but NOT data → Pattern analysis never reached
+
+Changelog v10.6.1 (Data Sanitization - yfinance Header Leak Fix):
+- BUG: yfinance batch downloads leak header "Ticker" into data rows
+- CRASH: pd.to_datetime("Ticker") fails → ValueError stops engine
+- FIX 1: prepare_supervised_data uses errors='coerce' + dropna for robust parsing
+- FIX 2: sync_prices sanitizes data BEFORE DB insert (defense-in-depth)
+- REMOVES: Corrupt rows with "Ticker" in date column automatically cleaned
+- Rationale: yfinance quirk when downloading in chunks/groups
 """
 
 import pandas as pd
@@ -669,8 +677,20 @@ class HistoryManager:
 
         if new_data:
             new_df = pd.DataFrame(new_data)
-            self.db.upsert_prices(new_df)
-            print(f"\n  [ORACLE] Price DB updated with {len(new_data)} records.")
+
+            # v10.6.1: Sanitize data before DB insert - remove corrupt rows
+            # yfinance sometimes leaks header "Ticker" into data rows
+            original_count = len(new_df)
+            new_df['date'] = pd.to_datetime(new_df['date'], errors='coerce')
+            new_df = new_df.dropna(subset=['date'])
+            new_df['date'] = new_df['date'].dt.strftime('%Y-%m-%d')  # Convert back to string for DB
+            sanitized_count = len(new_df)
+            if sanitized_count < original_count:
+                print(f"    [ORACLE] Sanitized: removed {original_count - sanitized_count} corrupt rows")
+
+            if not new_df.empty:
+                self.db.upsert_prices(new_df)
+                print(f"\n  [ORACLE] Price DB updated with {len(new_df)} records.")
 
         print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
 
@@ -1020,10 +1040,14 @@ class SwingTradingEngine:
         price_df = self.history_mgr.db.get_price_df()
         if price_df.empty: return self.prepare_inference_data(window_size)
 
-        price_df['date'] = pd.to_datetime(price_df['date'])
+        # v10.6.1: Robust date parsing - yfinance sometimes leaks header "Ticker" into data
+        price_df['date'] = pd.to_datetime(price_df['date'], errors='coerce')
+        price_df = price_df.dropna(subset=['date'])  # Remove corrupt rows with "Ticker" in date
+        if price_df.empty: return self.prepare_inference_data(window_size)
 
         df = hist_df[valid_cols].copy()
-        df['date'] = pd.to_datetime(df['date'])
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date'])  # Safety: remove any corrupt rows here too
         df = df.sort_values(['ticker', 'date'])
 
         feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
@@ -3170,7 +3194,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.6 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.6.1 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3319,7 +3343,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.6 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.6.1 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
