@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.3 (Grandmaster) - Ensemble Stacking + GPU
-Phase 10.3: ML Powerhouse - 3-Model Ensemble + GPU Acceleration
+Swing Trading Engine - Version 10.4 (Grandmaster) - Institutional Phoenix Patterns
+Phase 10.4: Pattern Quality - Institutional Phoenix + Synergy Detection
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -61,7 +61,7 @@ Changelog v10.2 (Production Optimization - Quick Wins):
 Changelog v10.3 (Ensemble Stacking + GPU Acceleration):
 - ML ARCHITECTURE: Replaced single CatBoost with ensemble stacking (3 models + meta-learner)
 - ML MODELS: CatBoost + LightGBM + XGBoost with LogisticRegression meta-learner
-- GPU ACCELERATION: All 3 base models use GPU when available (task_type='GPU', device='gpu', tree_method='gpu_hist')
+- GPU ACCELERATION: All 3 base models use GPU when available (task_type='GPU', device='gpu', device='cuda')
 - PERFORMANCE: Ensemble caching system (4 model caches with regime-aware invalidation)
 - PERFORMANCE: Cross-validated stacking predictions for meta-learner training
 - QUALITY: Expected AUC improvement from 0.92-0.93 → 0.95+ with ensemble diversity
@@ -69,6 +69,21 @@ Changelog v10.3 (Ensemble Stacking + GPU Acceleration):
 - LOGGING: Detailed model weights and individual AUC scores for transparency
 - Expected runtime: 34min → 18-22min with GPU (first run trains all 3, subsequent runs load cache)
 - Expected AUC: 0.92 → 0.95+ with ensemble stacking
+
+Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
+- PHOENIX EXTENDED: Base duration extended from 250 days → 730 days (24 months)
+- PHOENIX TIERS: Speculative (2-12 months) vs Institutional (12-24 months) phoenix patterns
+- PHOENIX SCORING: Institutional phoenix (365-730 days) gets FULL base duration score (0.25)
+- DRAWDOWN EXTENDED: Acceptable drawdown 35% → 70% for deep institutional corrections (LULU: 60%)
+- DRAWDOWN SCORING: 50-70% drawdowns score HIGHER for institutional patterns (deep value opportunity)
+- DARK POOL MAGNITUDE: Logarithmic scaling for mega-prints ($50M+, $500M+, $1B+ institutional activism)
+- DARK POOL BONUS: $500M+ prints (Elliott/LULU-level) get +0.25 total DP score (vs 0.15 baseline)
+- PATTERN SYNERGY: Phoenix + Double Bottom = +8 point bonus (LULU pattern recognition)
+- PATTERN SYNERGY: Phoenix + Cup-Handle = +6 point bonus (institutional continuation)
+- PATTERN SYNERGY: Bull Flag + GEX Wall = +5 point bonus (momentum + support)
+- INSTITUTIONAL FOCUS: Catches large-cap ($5B+) activist plays with extended accumulation periods
+- Expected improvement: Catch LULU-like patterns that were previously missed
+- Rationale: Real-world validation showed BHR flagged but LULU (Elliott $1B stake) missed
 """
 
 import pandas as pd
@@ -198,14 +213,16 @@ GEX_WALL_CONFIG = {
     'proximity_pct': 0.10            # 10% proximity - walls up to 10% away count
 }
 
-# Phoenix Reversal Configuration (6-12 month base breakouts)
+# Phoenix Reversal Configuration (Extended for Institutional Patterns)
+# v10.4: Supports both speculative (2-10 months) and institutional (12-24 months) phoenix patterns
 PHOENIX_CONFIG = {
     'min_base_days': 60,           # Minimum consolidation period (2 months)
-    'max_base_days': 250,          # Maximum consolidation period (8-10 months)
+    'max_base_days': 730,          # Extended to 24 months for institutional phoenix (was 250)
+    'institutional_threshold': 365,  # 12+ months = institutional phoenix (LULU-like patterns)
     'volume_surge_threshold': 1.5, # Volume must exceed 1.5x average
     'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
     'rsi_max': 70,
-    'max_drawdown_pct': 0.35,      # Max 35% drawdown during base
+    'max_drawdown_pct': 0.70,      # Extended to 70% for deep corrections (was 0.35, LULU had 60%)
     'min_consolidation_pct': 0.10, # Price must stay within 10% range for extended period
     'breakout_threshold': 0.03     # Breakout must be at least 3% move
 }
@@ -1479,16 +1496,32 @@ class SwingTradingEngine:
 
             # --- MULTI-LAYER SCORING SYSTEM ---
             # Layer 1: Base Duration Score (0-25 points)
+            # v10.4: Extended for institutional phoenix patterns (LULU-like 18-24 month bases)
             base_duration_score = 0.0
+            institutional_threshold = PHOENIX_CONFIG.get('institutional_threshold', 365)
+
             if min_days <= days_in_base <= max_days:
-                # Optimal range: 90-180 days (Wyckoff accumulation timeframe)
+                # SPECULATIVE PHOENIX (60-365 days / 2-12 months)
                 if 90 <= days_in_base <= 180:
+                    # Optimal Wyckoff accumulation timeframe
                     base_duration_score = 0.25
                 elif 60 <= days_in_base < 90:
-                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10  # Linear ramp up
-                elif 180 < days_in_base <= 250:
-                    base_duration_score = 0.20  # Slightly lower for very long bases
+                    # Shorter base (partial credit)
+                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10
+                elif 180 < days_in_base < institutional_threshold:
+                    # Long base but not yet institutional
+                    base_duration_score = 0.20
+
+                # INSTITUTIONAL PHOENIX (365-730 days / 12-24 months)
+                elif institutional_threshold <= days_in_base <= 730:
+                    # Large-cap institutional accumulation (LULU, activist plays)
+                    # Longer bases = deeper conviction for institutions
+                    if 365 <= days_in_base <= 550:
+                        base_duration_score = 0.25  # 12-18 months (optimal institutional)
+                    elif 550 < days_in_base <= 730:
+                        base_duration_score = 0.23  # 18-24 months (very deep base)
             else:
+                # Outside acceptable range
                 base_duration_score = 0.0
 
             # Layer 2: Volume Confirmation Score (0-25 points)
@@ -1535,23 +1568,58 @@ class SwingTradingEngine:
                     breakout_score = 0.10
 
             # Layer 5: Drawdown Quality Score (0-10 points)
+            # v10.4: Extended for deep institutional corrections (LULU-like 60% drops)
             drawdown_score = 0.0
-            if acceptable_drawdown:
-                # Lower drawdown = higher quality base
+            if max_drawdown <= 0.70:  # Extended acceptable drawdown
+                # Lower drawdown = higher quality base (for speculative)
+                # Higher drawdown = deeper value opportunity (for institutional)
                 if max_drawdown <= 0.20:
-                    drawdown_score = 0.10  # Tight base (best)
-                elif max_drawdown <= 0.30:
-                    drawdown_score = 0.07
-                else:
-                    drawdown_score = 0.05
+                    drawdown_score = 0.10  # Tight base (best for speculative)
+                elif max_drawdown <= 0.35:
+                    drawdown_score = 0.08  # Moderate correction
+                elif max_drawdown <= 0.50:
+                    drawdown_score = 0.07  # Significant correction (still acceptable)
+                elif max_drawdown <= 0.70:
+                    # Deep institutional correction (LULU: 60% drop)
+                    # If base is institutional (>365 days), this is POSITIVE (deep value + time to accumulate)
+                    if days_in_base >= institutional_threshold:
+                        drawdown_score = 0.10  # Deep value opportunity for institutions
+                    else:
+                        drawdown_score = 0.05  # Risky for short-term plays
             else:
-                # Excessive drawdown - penalize but don't eliminate
+                # Excessive drawdown (>70%) - severe distress signal
                 drawdown_score = -0.05
 
-            # Layer 6: Dark Pool Support Score (0-15 points)
+            # Layer 6: Dark Pool Support Score (0-15 points + BONUS for mega-prints)
+            # v10.4: Magnitude-based scaling for institutional activism (LULU-like $1B+ stakes)
             dp_score = 0.0
             if has_dp_support:
                 dp_score = 0.10 + (dp_strength * 0.05)  # Base 10 + up to 5 bonus
+
+            # BONUS: Check for massive institutional dark pool activity
+            # Look for signature prints or unusually large DP accumulation
+            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
+                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
+                if ticker_row is not None and 'dp_total' in ticker_row:
+                    dp_total = ticker_row['dp_total']
+                    # Institutional activism threshold: $50M+ dark pool activity
+                    if dp_total > 50_000_000:  # $50M+
+                        # Scale bonus logarithmically (prevents single print from dominating)
+                        import math
+                        mega_print_bonus = min(0.15, math.log10(dp_total / 50_000_000) * 0.10)
+                        dp_score += mega_print_bonus
+                        # For truly massive prints ($500M+), add extra weight
+                        if dp_total > 500_000_000:  # $500M+ (LULU Elliott-level)
+                            dp_score += 0.10
+
+            # Layer 7: Pattern Synergy Bonus (0-10 points)
+            # v10.4: Detect overlapping patterns that reinforce each other (LULU has both!)
+            synergy_score = 0.0
+
+            # Check if this ticker also has double bottom pattern (cache check)
+            # Double bottom within phoenix base = STRONG institutional accumulation signal
+            # We'll check this later during pattern integration, but add placeholder
+            # The actual synergy bonus will be added during pattern aggregation in predict()
 
             # --- COMPOSITE SCORE ---
             composite_score = (
@@ -1560,7 +1628,8 @@ class SwingTradingEngine:
                 rsi_score +
                 breakout_score +
                 drawdown_score +
-                dp_score
+                dp_score +
+                synergy_score  # Pattern overlap bonus
             )
 
             # Phoenix threshold: 0.60 (60% of max 1.0 score)
@@ -2716,6 +2785,25 @@ class SwingTradingEngine:
                 bonus = double_bottom_score * 10  # Up to 10 point bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
 
+            # --- PATTERN SYNERGY BONUSES (v10.4: LULU-inspired) ---
+            # When multiple patterns overlap, it's a MUCH stronger signal
+            # Phoenix + Double Bottom = Institutional accumulation with clear support
+            if phoenix_score > 0 and double_bottom_score > 0:
+                # LULU pattern: Extended base (phoenix) + double bottom support
+                synergy_bonus = 8  # Significant bonus for dual pattern confirmation
+                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
+                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + synergy_bonus
+
+            # Phoenix + Cup-Handle = Institutional accumulation with continuation setup
+            elif phoenix_score > 0 and cup_handle_score > 0:
+                synergy_bonus = 6
+                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
+
+            # Bull Flag + GEX Wall = Momentum with support
+            elif flag_score > 0 and wall_score > 0.3:
+                synergy_bonus = 5
+                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
+
             # Store pattern flags
             top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
             top_candidates.at[idx, 'has_gex_support'] = wall_score > 0.3
@@ -2862,7 +2950,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.3 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.4 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3011,7 +3099,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.3 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.4 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
