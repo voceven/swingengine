@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.5 (Grandmaster) - Oracle Reliability Fix
-Phase 10.5: Data Integrity - Oracle Chunking + Rate Limiting + Retry Logic
+Swing Trading Engine - Version 10.6 (Grandmaster) - Validation Mode Fix
+Phase 10.6: Critical Fix - Force Validation Tickers into Pattern Analysis
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -95,6 +95,17 @@ Changelog v10.5 (Oracle Reliability Fix - Data Integrity):
 - EXPECTED IMPROVEMENT: 63.5% → 95%+ Oracle fetch success rate
 - PHOENIX IMPACT: LULU-like patterns now detectable (data present → analysis works)
 - Rationale: Previous sessions found phoenix logic correct but no data to analyze
+
+Changelog v10.6 (Validation Mode Fix - CRITICAL):
+- ROOT CAUSE CORRECTED: Previous diagnosis missed the REAL blocker
+- THREE DATA STAGES: Oracle (781) → Fetch (3000) → Patterns (top 75 only)
+- FATAL FLAW: Validation mode added LULU with zeros → Low ML score → Never in top 75
+- FIX: Force validation tickers into top_candidates (bypass ML ranking filter)
+- VALIDATION_SUITE: Moved to module-level constant for cross-function access
+- DEBUG OUTPUT: Shows LULU's actual ML score, rank, data status, and phoenix result
+- PATTERN CHUNKING: Applied 50-ticker chunking to pattern downloads too (safety)
+- EXPECTED: LULU now reaches pattern analysis → Phoenix detection can run
+- Rationale: Validation mode adds ticker but NOT data → Pattern analysis never reached
 """
 
 import pandas as pd
@@ -258,6 +269,26 @@ PERFORMANCE_CONFIG = {
     'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
     'price_cache_days': 7,        # Refresh price cache weekly
     'batch_size': 75              # Batch size for yfinance downloads
+}
+
+# v10.6: Validation Suite Configuration (Module Level)
+# Force-include known institutional phoenix patterns to validate detection
+ENABLE_VALIDATION_MODE = True  # Change to False once validated
+
+VALIDATION_SUITE = {
+    # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
+    'institutional_phoenix': [
+        'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
+        # Add other confirmed institutional phoenix patterns here
+    ],
+    # Optional: Add other pattern types for comprehensive testing
+    'speculative_phoenix': [
+        # 'ABC',  # Example: 200-day base, moderate drawdown
+    ],
+    # Known false positives to test filtering
+    'negative_cases': [
+        # Tickers that look like phoenix but aren't (tests specificity)
+    ]
 }
 
 # Macro Score Weights (how much macro conditions affect individual scores)
@@ -2319,52 +2350,30 @@ class SwingTradingEngine:
                 df_bot['screener_flow'] = df_bot['net_call_premium'] - df_bot['net_put_premium']
                 df_bot['net_gamma'] = df_bot['screener_flow'] / 100.0
 
-        # --- PATTERN VALIDATION SUITE (v10.4.1: Testing Mode) ---
+        # --- PATTERN VALIDATION SUITE (v10.6: Uses module-level VALIDATION_SUITE) ---
         # Force-include known institutional phoenix patterns to validate detection
-        # These tickers have confirmed patterns and should be detected by the algorithm
-
-        # Set to True to enable validation mode, False for production
-        ENABLE_VALIDATION_MODE = True  # Change to False once validated
-
-        validation_suite = {
-            # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
-            'institutional_phoenix': [
-                'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
-                # Add other confirmed institutional phoenix patterns here:
-                # 'XYZ',  # Example: Another confirmed pattern
-            ],
-
-            # Optional: Add other pattern types for comprehensive testing
-            'speculative_phoenix': [
-                # 'ABC',  # Example: 200-day base, moderate drawdown
-            ],
-
-            # Known false positives to test filtering
-            'negative_cases': [
-                # Tickers that look like phoenix but aren't (tests specificity)
-            ]
-        }
+        # v10.6 FIX: Now forces validation tickers into top 75 (see predict() method)
 
         if ENABLE_VALIDATION_MODE:
-            # Combine all test tickers
+            # Combine all test tickers from module-level VALIDATION_SUITE
             test_tickers = (
-                validation_suite['institutional_phoenix'] +
-                validation_suite['speculative_phoenix']
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
             )
 
             if not df_bot.empty and 'ticker' in df_bot.columns and test_tickers:
-                print(f"\n  [VALIDATION MODE] Testing {len(test_tickers)} known patterns...")
+                print(f"\n  [VALIDATION MODE] Adding {len(test_tickers)} tickers to candidate pool...")
                 for test_ticker in test_tickers:
                     if test_ticker not in df_bot['ticker'].values:
-                        # Add minimal row for forced ticker (will get enriched with real data later)
+                        # Add minimal row for forced ticker (will be force-included in top 75 later)
                         force_row = {
                             'ticker': test_ticker,
-                            'net_gamma': 0.0,  # Will be populated from actual data if available
+                            'net_gamma': 0.0,  # Low score OK - we force into top 75 anyway
                             'net_flow': 0.0,
-                            'dp_total': 0.0  # Will be populated from dark pool data
+                            'dp_total': 0.0
                         }
                         df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
-                        print(f"    → Testing {test_ticker} (institutional phoenix candidate)")
+                        print(f"    → Added {test_ticker} (will be force-included in pattern analysis)")
         # --- END VALIDATION SUITE ---
 
         if not df_bot.empty:
@@ -2849,18 +2858,46 @@ class SwingTradingEngine:
         df = df.sort_values('max_score', ascending=False)
         top_candidates = df.head(75).copy()
 
-        print(f"  [INFO] Base scoring complete. Running pattern detection on top 75 candidates...")
+        # --- v10.6 CRITICAL FIX: Force validation tickers into top candidates ---
+        # Without this, validation tickers with low ML scores (from zero features) never reach pattern analysis
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = (
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
+            )
+            forced_count = 0
+            for ticker in validation_tickers:
+                if ticker not in top_candidates['ticker'].values:
+                    # Find ticker in full df
+                    ticker_row = df[df['ticker'] == ticker]
+                    if not ticker_row.empty:
+                        top_candidates = pd.concat([top_candidates, ticker_row], ignore_index=True)
+                        forced_count += 1
+                        # Debug: Show LULU's actual ML score and rank
+                        if ticker == 'LULU':
+                            lulu_score = ticker_row.iloc[0].get('max_score', 0)
+                            lulu_rank = (df['max_score'] > lulu_score).sum() + 1
+                            print(f"  [VALIDATION] LULU ML score: {lulu_score:.2f}, rank: {lulu_rank}/{len(df)}")
+                    else:
+                        print(f"  [VALIDATION] ⚠️  {ticker} not in candidate pool (may be missing from data)")
+
+            if forced_count > 0:
+                print(f"  [VALIDATION] Force-added {forced_count} validation tickers to pattern analysis (bypassing top 75 filter)")
+        # --- END v10.6 FIX ---
+
+        print(f"  [INFO] Base scoring complete. Running pattern detection on {len(top_candidates)} candidates...")
 
         # --- PHASE 9: PATTERN DETECTION & EXPLANATION GENERATION ---
         pattern_results = {}
         tickers_to_analyze = top_candidates['ticker'].tolist()
 
         # Batch fetch price history for pattern detection
-        print(f"  [PATTERNS] Fetching price history for pattern analysis...")
+        # v10.6: Reduced batch size to 50 for reliability (same as Oracle fix)
+        print(f"  [PATTERNS] Fetching price history for {len(tickers_to_analyze)} tickers...")
         price_data = {}
-        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
-        for i in range(0, len(tickers_to_analyze), batch_size):
-            batch = tickers_to_analyze[i:i+batch_size]
+        pattern_batch_size = 50  # v10.6: Reduced from 75 for reliability
+        for i in range(0, len(tickers_to_analyze), pattern_batch_size):
+            batch = tickers_to_analyze[i:i+pattern_batch_size]
             try:
                 data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
                 for t in batch:
@@ -2870,8 +2907,20 @@ class SwingTradingEngine:
                             price_data[t] = hist
                     except:
                         pass
-            except:
-                pass
+                # Rate limiting for multiple batches
+                if i + pattern_batch_size < len(tickers_to_analyze):
+                    time.sleep(1.0)
+            except Exception as e:
+                print(f"    [!] Pattern batch download failed: {str(e)[:50]}")
+
+        # v10.6: Debug output for validation tickers
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']
+            for vt in validation_tickers:
+                if vt in tickers_to_analyze:
+                    has_data = vt in price_data
+                    data_len = len(price_data[vt]) if has_data else 0
+                    print(f"  [VALIDATION] {vt} in analysis: data={'✓' if has_data else '✗'} ({data_len} rows)")
 
         # Run pattern detection on each candidate
         print(f"  [PATTERNS] Analyzing {len(tickers_to_analyze)} tickers for bull flags, GEX walls, and reversals...")
@@ -2902,6 +2951,18 @@ class SwingTradingEngine:
                 'double_bottom': self.detect_double_bottom(ticker, hist_df)
             }
             pattern_results[ticker] = patterns
+
+            # v10.6: Debug output for validation ticker phoenix results
+            if ENABLE_VALIDATION_MODE:
+                validation_tickers = VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']
+                if ticker in validation_tickers:
+                    phoenix = patterns['phoenix']
+                    phoenix_score = phoenix.get('phoenix_score', 0)
+                    is_phoenix = phoenix.get('is_phoenix', False)
+                    explanation = phoenix.get('explanation', 'N/A')[:80]
+                    status = '✓ DETECTED' if is_phoenix else f'✗ Score={phoenix_score:.2f}/0.60'
+                    print(f"  [VALIDATION] {ticker} Phoenix: {status}")
+                    print(f"              → {explanation}")
 
             # --- PATTERN-BASED SCORE ADJUSTMENTS ---
 
@@ -3109,7 +3170,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.5 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.6 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3258,7 +3319,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.5 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.6 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
