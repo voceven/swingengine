@@ -221,7 +221,7 @@ PHOENIX_CONFIG = {
     'institutional_threshold': 365,  # 12+ months = institutional phoenix (LULU-like patterns)
     'volume_surge_threshold': 1.5, # Volume must exceed 1.5x average
     'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
-    'rsi_max': 70,
+    'rsi_max': 80,                 # Extended to 80 for activist breakouts (was 70, LULU fix)
     'max_drawdown_pct': 0.70,      # Extended to 70% for deep corrections (was 0.35, LULU had 60%)
     'min_consolidation_pct': 0.10, # Price must stay within 10% range for extended period
     'breakout_threshold': 0.03     # Breakout must be at least 3% move
@@ -1539,17 +1539,44 @@ class SwingTradingEngine:
                     volume_score = 0.05
 
             # Layer 3: RSI Health Score (0-20 points)
+            # v10.4.2: Extended for institutional breakouts (LULU RSI 73-78 fix)
             rsi_score = 0.0
-            if 50 <= current_rsi <= 70:
-                # Optimal range - not oversold, not overbought
-                if 55 <= current_rsi <= 65:
-                    rsi_score = 0.20  # Sweet spot
-                else:
-                    rsi_score = 0.15  # Good but not perfect
-            elif 45 <= current_rsi < 50:
-                rsi_score = 0.10  # Slightly oversold (partial credit)
-            elif 70 < current_rsi <= 75:
-                rsi_score = 0.08  # Slightly overbought (lower credit)
+
+            # Check for mega-print override (activist plays gap up FAST)
+            has_mega_print = False
+            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
+                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
+                if ticker_row is not None and 'dp_total' in ticker_row:
+                    dp_total_check = ticker_row['dp_total']
+                    if dp_total_check > 500_000_000:  # $500M+ Elliott/activist-level
+                        has_mega_print = True
+
+            # INSTITUTIONAL PHOENIX: Allow higher RSI for breakout momentum
+            if days_in_base >= institutional_threshold or has_mega_print:
+                # Activist breakouts often push RSI to 70-85 immediately (NORMAL)
+                if 50 <= current_rsi <= 85:  # Extended range for institutional
+                    if 55 <= current_rsi <= 70:
+                        rsi_score = 0.20  # Sweet spot (pre-breakout or early)
+                    elif 70 < current_rsi <= 80:
+                        rsi_score = 0.18  # Breakout momentum (LULU range) - HIGH CREDIT
+                    elif 80 < current_rsi <= 85:
+                        rsi_score = 0.15  # Very strong momentum (partial credit)
+                    else:
+                        rsi_score = 0.15  # 50-55 range
+                elif 45 <= current_rsi < 50:
+                    rsi_score = 0.10  # Slightly oversold
+
+            # SPECULATIVE PHOENIX: Stricter RSI requirements
+            else:
+                if 50 <= current_rsi <= 70:
+                    if 55 <= current_rsi <= 65:
+                        rsi_score = 0.20  # Sweet spot
+                    else:
+                        rsi_score = 0.15  # Good but not perfect
+                elif 45 <= current_rsi < 50:
+                    rsi_score = 0.10  # Slightly oversold
+                elif 70 < current_rsi <= 75:
+                    rsi_score = 0.08  # Slightly overbought (speculative penalty)
 
             # Layer 4: Breakout Confirmation Score (0-15 points)
             breakout_score = 0.0
@@ -2219,18 +2246,25 @@ class SwingTradingEngine:
             # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
             'institutional_phoenix': [
                 'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
+                'PEP',   # Elliott $4B+ stake ("The Elliott Twin"), multi-month base, -16% from highs
+                'NKE',   # Ackman $250M stake, down 50% from ATH, 12+ month base, "loss of cool"
+                'GOLD',  # Elliott operational turnaround, multi-year lows, massive base structure
+                'EL',    # Deep phoenix: 50%+ drop, 37% snap-back, 2-year decline + institutional accumulation
                 # Add other confirmed institutional phoenix patterns here:
-                # 'XYZ',  # Example: Another confirmed pattern
             ],
 
             # Optional: Add other pattern types for comprehensive testing
             'speculative_phoenix': [
-                # 'ABC',  # Example: 200-day base, moderate drawdown
+                # Already detected patterns (regression testing):
+                # 'BHR',   # 200-day base (detected in previous runs)
+                # 'CRON',  # Score 0.63 (detected in previous runs)
             ],
 
             # Known false positives to test filtering
             'negative_cases': [
-                # Tickers that look like phoenix but aren't (tests specificity)
+                # Mega-caps with no phoenix pattern (test specificity):
+                # 'SPY',   # Index ETF
+                # 'AAPL',  # No extended base
             ]
         }
 
