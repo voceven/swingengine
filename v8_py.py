@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.4 (Grandmaster) - Institutional Phoenix Patterns
-Phase 10.4: Pattern Quality - Institutional Phoenix + Synergy Detection
+Swing Trading Engine - Version 10.5 (Grandmaster) - Oracle Reliability Fix
+Phase 10.5: Data Integrity - Oracle Chunking + Rate Limiting + Retry Logic
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -84,6 +84,17 @@ Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
 - INSTITUTIONAL FOCUS: Catches large-cap ($5B+) activist plays with extended accumulation periods
 - Expected improvement: Catch LULU-like patterns that were previously missed
 - Rationale: Real-world validation showed BHR flagged but LULU (Elliott $1B stake) missed
+
+Changelog v10.5 (Oracle Reliability Fix - Data Integrity):
+- ROOT CAUSE: yfinance bulk downloads failing silently (63.5% success rate → 36.5% data loss)
+- ORACLE CHUNKING: Reduced batch size 75 → 50 tickers per chunk (API limit compliance)
+- RATE LIMITING: 1.5s delay between chunks with exponential backoff on errors (prevents bans)
+- INDIVIDUAL RETRY: Failed tickers get individual fetch retry (yfinance quirk workaround)
+- DATA INTEGRITY GATE: <90% fetch success → WARNING + user notification (no silent failures)
+- PROGRESS FEEDBACK: Chunk-by-chunk progress reporting for transparency
+- EXPECTED IMPROVEMENT: 63.5% → 95%+ Oracle fetch success rate
+- PHOENIX IMPACT: LULU-like patterns now detectable (data present → analysis works)
+- Rationale: Previous sessions found phoenix logic correct but no data to analyze
 """
 
 import pandas as pd
@@ -459,7 +470,16 @@ class HistoryManager:
         self.sync_prices()
 
     def sync_prices(self):
-        print("\n[ORACLE] Syncing Price History & ATR...")
+        """
+        v10.5: Enhanced Oracle with chunking, rate limiting, retry logic, and data integrity gate.
+
+        Key improvements:
+        - Chunk size: 50 (down from 75) for API compliance
+        - Rate limiting: 1.5s between chunks, exponential backoff on errors
+        - Individual retry: Failed tickers get individual fetch (yfinance quirk workaround)
+        - Data integrity gate: <90% success rate triggers warning
+        """
+        print("\n[ORACLE v10.5] Syncing Price History & ATR...")
         try:
             hist_df = self.db.get_history_df()
             if hist_df.empty: return
@@ -486,20 +506,35 @@ class HistoryManager:
 
         new_data = []
         successful_fetches = 0
-        failed_fetches = 0
-        batch_size = PERFORMANCE_CONFIG.get('batch_size', 75)
+        failed_tickers = []  # Track failed tickers for individual retry
 
-        for i in range(0, len(to_fetch), batch_size):
-            batch = to_fetch[i:i+batch_size]
+        # v10.5: Reduced chunk size for API compliance (was 75, now 50)
+        chunk_size = 50
+        base_delay = 1.5  # Rate limiting: 1.5s between chunks
+        total_chunks = (len(to_fetch) + chunk_size - 1) // chunk_size
+
+        print(f"  [ORACLE] Processing {total_chunks} chunks of {chunk_size} tickers each...")
+
+        for chunk_idx, i in enumerate(range(0, len(to_fetch), chunk_size)):
+            batch = to_fetch[i:i+chunk_size]
+            chunk_num = chunk_idx + 1
+
+            # Progress feedback
+            print(f"    [Chunk {chunk_num}/{total_chunks}] Fetching {len(batch)} tickers...", end=" ")
+
             try:
                 data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
+                chunk_success = 0
+                chunk_fail = 0
+
                 for t in batch:
                     try:
                         hist = data[t] if len(batch) > 1 else data
                         if not hist.empty and len(hist) > 0:
                             # Check if we have required columns
                             if not all(col in hist.columns for col in ['High', 'Low', 'Close']):
-                                failed_fetches += 1
+                                failed_tickers.append(t)
+                                chunk_fail += 1
                                 continue
 
                             high = hist['High']
@@ -529,22 +564,98 @@ class HistoryManager:
                                 new_data.append({'ticker': t, 'date': d_str, 'close': float(close_val), 'atr': float(atr_val)})
 
                             successful_fetches += 1
+                            chunk_success += 1
                         else:
-                            failed_fetches += 1
+                            failed_tickers.append(t)
+                            chunk_fail += 1
                     except Exception as ticker_error:
-                        failed_fetches += 1
-                        # Uncomment for debugging: print(f"    [!] Failed to process {t}: {ticker_error}")
+                        failed_tickers.append(t)
+                        chunk_fail += 1
+
+                print(f"✓ {chunk_success} OK, {chunk_fail} failed")
+
             except Exception as batch_error:
-                failed_fetches += len(batch)
-                print(f"    [!] Batch download failed: {batch_error}")
+                failed_tickers.extend(batch)
+                print(f"✗ Batch failed: {str(batch_error)[:50]}")
+
+            # v10.5: Rate limiting between chunks (prevents API throttling/bans)
+            if chunk_num < total_chunks:
+                time.sleep(base_delay)
+
+        # v10.5: Individual retry for failed tickers (yfinance quirk workaround)
+        if failed_tickers:
+            print(f"\n  [ORACLE] Retrying {len(failed_tickers)} failed tickers individually...")
+            retry_delay = 0.5  # Shorter delay for individual fetches
+            recovered = 0
+
+            for retry_idx, t in enumerate(failed_tickers[:50]):  # Limit retry to first 50 to avoid excessive time
+                try:
+                    data = yf.download(t, period="3mo", progress=False)
+                    if not data.empty and len(data) > 0 and all(col in data.columns for col in ['High', 'Low', 'Close']):
+                        high = data['High']
+                        low = data['Low']
+                        close = data['Close']
+                        tr1 = high - low
+                        tr2 = abs(high - close.shift(1))
+                        tr3 = abs(low - close.shift(1))
+                        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                        atr = tr.rolling(14).mean()
+
+                        data = data.reset_index()
+                        if 'Date' not in data.columns and 'index' in data.columns:
+                            data.rename(columns={'index': 'Date'}, inplace=True)
+
+                        atr_vals = atr.values
+
+                        for idx, row in data.iterrows():
+                            d_val = row.get('Date', row.name)
+                            close_val = row.get('Close', 0)
+                            if isinstance(close_val, pd.Series): close_val = close_val.iloc[0]
+
+                            atr_val = atr_vals[idx] if idx < len(atr_vals) else 0
+                            if np.isnan(atr_val): atr_val = 0
+
+                            d_str = str(d_val).split()[0]
+                            new_data.append({'ticker': t, 'date': d_str, 'close': float(close_val), 'atr': float(atr_val)})
+
+                        successful_fetches += 1
+                        recovered += 1
+                        failed_tickers.remove(t)
+                except Exception:
+                    pass  # Ticker truly unavailable
+
+                # Progressive delay for individual retries
+                if (retry_idx + 1) % 10 == 0:
+                    time.sleep(retry_delay)
+
+            if recovered > 0:
+                print(f"    [ORACLE] Recovered {recovered} tickers via individual retry")
+
+        # Calculate final statistics
+        total_attempts = len(to_fetch)
+        final_failed = len(failed_tickers)
+        success_rate = (successful_fetches / total_attempts * 100) if total_attempts > 0 else 0
 
         if new_data:
             new_df = pd.DataFrame(new_data)
             self.db.upsert_prices(new_df)
-            total_attempts = successful_fetches + failed_fetches
-            success_rate = (successful_fetches / total_attempts * 100) if total_attempts > 0 else 0
-            print(f"  [ORACLE] Price DB updated with {len(new_data)} records.")
-            print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
+            print(f"\n  [ORACLE] Price DB updated with {len(new_data)} records.")
+
+        print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
+
+        # v10.5: Data integrity gate - warn user if success rate is too low
+        if success_rate < 90.0:
+            print(f"\n  ⚠️  [ORACLE DATA INTEGRITY WARNING]")
+            print(f"      Success rate {success_rate:.1f}% is below 90% threshold.")
+            print(f"      {final_failed} tickers failed to fetch data.")
+            print(f"      Phoenix detection may miss patterns due to missing data.")
+            print(f"      Consider: 1) Retry later, 2) Check network, 3) Reduce ticker count")
+            if final_failed <= 20:
+                print(f"      Failed tickers: {', '.join(failed_tickers[:20])}")
+        elif success_rate >= 95.0:
+            print(f"  ✓ [ORACLE] Data integrity EXCELLENT ({success_rate:.1f}%)")
+        else:
+            print(f"  ✓ [ORACLE] Data integrity GOOD ({success_rate:.1f}%)")
 
 class SwingTradingEngine:
     def __init__(self, base_dir=None):
@@ -2998,7 +3109,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.4 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.5 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3147,7 +3258,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.4 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.5 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
