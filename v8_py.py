@@ -2208,22 +2208,53 @@ class SwingTradingEngine:
                 df_bot['screener_flow'] = df_bot['net_call_premium'] - df_bot['net_put_premium']
                 df_bot['net_gamma'] = df_bot['screener_flow'] / 100.0
 
-        # --- FORCE INCLUDE TEST TICKERS (v10.4.1: LULU testing) ---
-        # Manually inject LULU for phoenix detection testing if not present
-        force_include_tickers = ['LULU']  # Add any tickers you want to force-include here
-        if not df_bot.empty and 'ticker' in df_bot.columns:
-            for test_ticker in force_include_tickers:
-                if test_ticker not in df_bot['ticker'].values:
-                    # Add minimal row for forced ticker (will get enriched with real data later)
-                    force_row = {
-                        'ticker': test_ticker,
-                        'net_gamma': 0.0,  # Will be populated from actual data if available
-                        'net_flow': 0.0,
-                        'dp_total': 0.0  # Will be populated from dark pool data
-                    }
-                    df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
-                    print(f"  [TEST] Force-included {test_ticker} for pattern detection")
-        # --- END FORCE INCLUDE ---
+        # --- PATTERN VALIDATION SUITE (v10.4.1: Testing Mode) ---
+        # Force-include known institutional phoenix patterns to validate detection
+        # These tickers have confirmed patterns and should be detected by the algorithm
+
+        # Set to True to enable validation mode, False for production
+        ENABLE_VALIDATION_MODE = True  # Change to False once validated
+
+        validation_suite = {
+            # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
+            'institutional_phoenix': [
+                'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
+                # Add other confirmed institutional phoenix patterns here:
+                # 'XYZ',  # Example: Another confirmed pattern
+            ],
+
+            # Optional: Add other pattern types for comprehensive testing
+            'speculative_phoenix': [
+                # 'ABC',  # Example: 200-day base, moderate drawdown
+            ],
+
+            # Known false positives to test filtering
+            'negative_cases': [
+                # Tickers that look like phoenix but aren't (tests specificity)
+            ]
+        }
+
+        if ENABLE_VALIDATION_MODE:
+            # Combine all test tickers
+            test_tickers = (
+                validation_suite['institutional_phoenix'] +
+                validation_suite['speculative_phoenix']
+            )
+
+            if not df_bot.empty and 'ticker' in df_bot.columns and test_tickers:
+                print(f"\n  [VALIDATION MODE] Testing {len(test_tickers)} known patterns...")
+                for test_ticker in test_tickers:
+                    if test_ticker not in df_bot['ticker'].values:
+                        # Add minimal row for forced ticker (will get enriched with real data later)
+                        force_row = {
+                            'ticker': test_ticker,
+                            'net_gamma': 0.0,  # Will be populated from actual data if available
+                            'net_flow': 0.0,
+                            'dp_total': 0.0  # Will be populated from dark pool data
+                        }
+                        df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
+                        print(f"    → Testing {test_ticker} (institutional phoenix candidate)")
+        # --- END VALIDATION SUITE ---
 
         if not df_bot.empty:
             target_gamma = 'authentic_gamma' if 'authentic_gamma' in df_bot.columns else 'net_gamma'
