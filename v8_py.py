@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.4 (Grandmaster) - Institutional Phoenix Patterns
-Phase 10.4: Pattern Quality - Institutional Phoenix + Synergy Detection
+Swing Trading Engine - Version 10.5 (Grandmaster) - VIP Override System
+Phase 10.5: Institutional Override - Money Flow > Technical Filters
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -84,6 +84,19 @@ Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
 - INSTITUTIONAL FOCUS: Catches large-cap ($5B+) activist plays with extended accumulation periods
 - Expected improvement: Catch LULU-like patterns that were previously missed
 - Rationale: Real-world validation showed BHR flagged but LULU (Elliott $1B stake) missed
+
+Changelog v10.5 (VIP Override System - Systemic Blind Spot Fix):
+- ARCHITECTURE: Dual-path phoenix detection (Standard vs Institutional VIP)
+- VIP TRIGGERS: $100M+ dark pool (was $500M) OR 3x+ volume surge
+- VIP HEAD START: 0.40/0.60 base score (67% of threshold pre-loaded)
+- VIP RSI RANGE: 40-85 (vs 50-70 standard) - allows activist breakout momentum
+- VIP DRAWDOWN: 0.80 (vs 0.35 standard) - allows deep value turnarounds
+- DYNAMIC THRESHOLDS: VIPs evaluated with relaxed filters, standard with strict filters
+- PHILOSOPHY SHIFT: Money flow > Technicals (institutional capital IS the signal)
+- SYSTEMIC FIX: Catches RSI 75-85 breakouts, $100-500M plays, volume surges
+- Expected improvement: No more missed institutional plays due to "overbought" RSI
+- Rationale: v10.4.2 fixed LULU specifically, v10.5 fixes the systemic blind spot
+- User insight: "prefer their signals instead of rsi or anything that potentially blocks this process"
 """
 
 import pandas as pd
@@ -213,18 +226,33 @@ GEX_WALL_CONFIG = {
     'proximity_pct': 0.10            # 10% proximity - walls up to 10% away count
 }
 
-# Phoenix Reversal Configuration (Extended for Institutional Patterns)
-# v10.4: Supports both speculative (2-10 months) and institutional (12-24 months) phoenix patterns
+# Phoenix Reversal Configuration (VIP Override System)
+# v10.5: Dual-path architecture - Standard vs Institutional VIP
+# PATH A (Standard): Strict technical pattern recognition (RSI < 70, tight base)
+# PATH B (VIP): Massive money flow ($100M+ DP / 3x Vol) bypasses strict filters
 PHOENIX_CONFIG = {
+    # Base parameters (apply to both paths)
     'min_base_days': 60,           # Minimum consolidation period (2 months)
-    'max_base_days': 730,          # Extended to 24 months for institutional phoenix (was 250)
-    'institutional_threshold': 365,  # 12+ months = institutional phoenix (LULU-like patterns)
+    'max_base_days': 730,          # Extended to 24 months for institutional phoenix
+    'institutional_threshold': 365,  # 12+ months = institutional phoenix
     'volume_surge_threshold': 1.5, # Volume must exceed 1.5x average
-    'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
-    'rsi_max': 80,                 # Extended to 80 for activist breakouts (was 70, LULU fix)
-    'max_drawdown_pct': 0.70,      # Extended to 70% for deep corrections (was 0.35, LULU had 60%)
     'min_consolidation_pct': 0.10, # Price must stay within 10% range for extended period
-    'breakout_threshold': 0.03     # Breakout must be at least 3% move
+    'breakout_threshold': 0.03,    # Breakout must be at least 3% move
+
+    # VIP TRIGGERS (Institutional Override)
+    'vip_dp_threshold': 100_000_000,   # $100M+ dark pool = VIP status (was $500M)
+    'vip_volume_surge': 3.0,            # 3x+ volume surge = VIP status (fast institutional entry)
+    'vip_head_start': 0.40,             # VIPs start with 0.40/0.60 (67% of threshold)
+
+    # STANDARD PATH (Strict technical filters)
+    'standard_rsi_min': 50,
+    'standard_rsi_max': 70,             # Strict RSI ceiling for speculative plays
+    'standard_drawdown_max': 0.35,      # Tight drawdown for speculative phoenix
+
+    # VIP PATH (Relaxed institutional filters)
+    'vip_rsi_min': 40,                  # Allow oversold for turnarounds
+    'vip_rsi_max': 85,                  # Allow hot breakout momentum (activist gaps)
+    'vip_drawdown_max': 0.80,           # Allow deep value corrections (50%+ drops)
 }
 
 REVERSAL_CONFIG = {
@@ -1403,14 +1431,24 @@ class SwingTradingEngine:
 
     def detect_phoenix_reversal(self, ticker, history_df):
         """
-        Detect Phoenix reversal pattern: 6-12 month base with volume surge breakout.
+        Detect Phoenix reversal pattern with INSTITUTIONAL VIP OVERRIDE.
 
-        Criteria:
-        1. Extended consolidation period (60-250 days)
-        2. Price staying within tight range (max 35% drawdown)
-        3. Volume surge on breakout (1.5x average)
-        4. RSI between 50-70 (healthy, not oversold)
-        5. Recent breakout above consolidation range
+        v10.5: Dual-Path Architecture
+        ==============================
+        PATH A (Standard): Strict technical pattern recognition (RSI < 70, tight base).
+        PATH B (VIP): Massive money flow ($100M+ DP / 3x Vol) bypasses strict filters.
+
+        VIP Triggers:
+        - $100M+ dark pool activity (institutional accumulation)
+        - 3x+ volume surge (fast institutional entry)
+
+        VIP Advantages:
+        - 0.40 head start (vs 0.00 for standard)
+        - RSI 40-85 allowed (vs 50-70 standard)
+        - 80% drawdown allowed (vs 35% standard)
+
+        Philosophy: When institutions enter with massive capital, traditional technical
+        filters (RSI overbought, high drawdown) become SIGNALS not RED FLAGS.
 
         Returns dict with phoenix detection results and explanation.
         """
@@ -1423,11 +1461,36 @@ class SwingTradingEngine:
             'explanation': ''
         }
 
-        min_days = PHOENIX_CONFIG['min_base_days']
-        max_days = PHOENIX_CONFIG['max_base_days']
+        # --- 1. DETECT INSTITUTIONAL "VIP" STATUS ---
+        is_institutional_vip = False
+        vip_reason = ""
+
+        # Check DP Total
+        dp_total = 0
+        if ticker in self.full_df['ticker'].values:
+            row = self.full_df[self.full_df['ticker'] == ticker].iloc[0]
+            dp_total = row.get('dp_total', 0)
+
+        # TRIGGER 1: Massive Dark Pool Stake ($100M+)
+        if dp_total > PHOENIX_CONFIG['vip_dp_threshold']:  # $100M+
+            is_institutional_vip = True
+            vip_reason = f"MEGA DP FLOW (${dp_total/1e6:.0f}M)"
+
+        # --- 2. SETUP DYNAMIC THRESHOLDS ---
+        min_days = PHOENIX_CONFIG['min_base_days']  # 60
+        max_days = PHOENIX_CONFIG['max_base_days']  # 730
+
+        if is_institutional_vip:
+            effective_rsi_min = PHOENIX_CONFIG['vip_rsi_min']  # 40
+            effective_rsi_max = PHOENIX_CONFIG['vip_rsi_max']  # 85 (Allow hot activist momentum)
+            effective_drawdown_limit = PHOENIX_CONFIG['vip_drawdown_max']  # 0.80 (Allow deep value turnarounds)
+        else:
+            effective_rsi_min = PHOENIX_CONFIG['standard_rsi_min']  # 50
+            effective_rsi_max = PHOENIX_CONFIG['standard_rsi_max']  # 70 (Standard)
+            effective_drawdown_limit = PHOENIX_CONFIG['standard_drawdown_max']  # 0.35
 
         if history_df is None or len(history_df) < min_days:
-            result['explanation'] = 'Insufficient history for phoenix analysis'
+            result['explanation'] = 'Insufficient history'
             return result
 
         try:
@@ -1440,30 +1503,7 @@ class SwingTradingEngine:
 
             current_price = float(close.iloc[-1])
 
-            # Look for consolidation base in the past 60-250 days
-            lookback_days = min(len(close), max_days)
-            base_period = close.iloc[-lookback_days:]
-            base_high = base_period.max()
-            base_low = base_period.min()
-            base_range = (base_high - base_low) / base_low
-
-            # Calculate how long price has been consolidating
-            sma50 = close.rolling(50).mean()
-            recent_sma = sma50.iloc[-min_days:] if len(sma50) >= min_days else sma50
-            recent_close = close.iloc[-min_days:] if len(close) >= min_days else close
-
-            # Count days in consolidation (within 10% of SMA50)
-            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']
-            days_in_base = ((abs(recent_close - recent_sma) / recent_sma) < consolidation_threshold).sum()
-            result['base_duration'] = int(days_in_base)
-
-            # Check for volume surge (recent 5-day average vs 50-day average)
-            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
-            avg_volume_recent = volume.iloc[-5:].mean()
-            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
-            result['volume_ratio'] = float(volume_ratio)
-
-            has_volume_surge = volume_ratio >= PHOENIX_CONFIG['volume_surge_threshold']
+            # --- 3. TECHNICAL CALCULATIONS (Retained) ---
 
             # Calculate RSI
             delta = close.diff()
@@ -1474,16 +1514,54 @@ class SwingTradingEngine:
             current_rsi = float(rsi.iloc[-1])
             result['rsi'] = current_rsi
 
-            rsi_in_range = PHOENIX_CONFIG['rsi_min'] <= current_rsi <= PHOENIX_CONFIG['rsi_max']
+            # EARLY FILTER: RSI Check (Dynamic based on VIP status)
+            if current_rsi < effective_rsi_min or current_rsi > effective_rsi_max:
+                result['explanation'] = f"RSI {current_rsi:.0f} outside {effective_rsi_min}-{effective_rsi_max} range ({'VIP' if is_institutional_vip else 'Standard'})"
+                return result
 
-            # Check for breakout (price near top of range)
+            # Base Analysis
+            lookback_days = min(len(close), max_days)
+            recent_close = close.iloc[-min_days:]
+
+            # Smart SMA calculation
+            sma50 = close.rolling(50).mean()
+            recent_sma = sma50.iloc[-min_days:] if len(sma50) >= min_days else sma50
+
+            # Count days in consolidation (within 10% of SMA50)
+            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']
+            days_in_base = ((abs(recent_close - recent_sma) / recent_sma) < consolidation_threshold).sum()
+            result['base_duration'] = int(days_in_base)
+
+            # Volume Analysis
+            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent = volume.iloc[-5:].mean()
+            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
+            result['volume_ratio'] = float(volume_ratio)
+
+            # TRIGGER 2: Extreme Volume Surge (VIP Override)
+            if volume_ratio > PHOENIX_CONFIG['vip_volume_surge']:  # 3x
+                if not is_institutional_vip:  # Don't overwrite DP reason
+                    is_institutional_vip = True
+                    vip_reason = f"VOL SURGE {volume_ratio:.1f}x"
+                # Update VIP thresholds on the fly if triggered here
+                effective_rsi_max = PHOENIX_CONFIG['vip_rsi_max']
+                effective_drawdown_limit = PHOENIX_CONFIG['vip_drawdown_max']
+
+            # Breakout Analysis
+            base_period = close.iloc[-lookback_days:]
+            base_low = base_period.min()
+            base_high = base_period.max()
             breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
-            near_breakout = current_price >= base_low * (1 + base_range * 0.7)  # Near top 30% of range
             recent_breakout = (current_price - base_low) / base_low >= breakout_threshold
+            near_breakout = current_price >= base_low * (1 + (base_high-base_low)/base_low * 0.7)
 
-            # Check drawdown constraint
+            # Drawdown Analysis
             max_drawdown = (base_high - base_low) / base_high
-            acceptable_drawdown = max_drawdown <= PHOENIX_CONFIG['max_drawdown_pct']
+
+            # FILTER 2: Drawdown Check (Dynamic)
+            if max_drawdown > effective_drawdown_limit:
+                result['explanation'] = f"Drawdown {max_drawdown:.1%} > {effective_drawdown_limit:.1%} ({'VIP' if is_institutional_vip else 'Standard'})"
+                return result
 
             # Dark pool support adds confidence
             has_dp_support = False
@@ -1494,208 +1572,89 @@ class SwingTradingEngine:
                 has_dp_support = len(nearby_support) > 0
                 dp_strength = min(len(nearby_support) / 3.0, 1.0)  # More DP levels = stronger
 
-            # --- MULTI-LAYER SCORING SYSTEM ---
-            # Layer 1: Base Duration Score (0-25 points)
-            # v10.4: Extended for institutional phoenix patterns (LULU-like 18-24 month bases)
-            base_duration_score = 0.0
+            # --- 4. SCORING SYSTEM (VIP Override) ---
+
+            # VIP HEAD START (The "Override")
+            # VIPs start at 0.40, Standard stocks start at 0.00
+            # Philosophy: Massive money flow IS the primary signal
+            composite_score = PHOENIX_CONFIG['vip_head_start'] if is_institutional_vip else 0.0
+
             institutional_threshold = PHOENIX_CONFIG.get('institutional_threshold', 365)
 
-            if min_days <= days_in_base <= max_days:
-                # SPECULATIVE PHOENIX (60-365 days / 2-12 months)
+            # Layer 1: Base Duration (0-25 pts)
+            base_duration_score = 0.0
+            if min_days <= days_in_base:
                 if 90 <= days_in_base <= 180:
-                    # Optimal Wyckoff accumulation timeframe
-                    base_duration_score = 0.25
-                elif 60 <= days_in_base < 90:
-                    # Shorter base (partial credit)
-                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10
-                elif 180 < days_in_base < institutional_threshold:
-                    # Long base but not yet institutional
-                    base_duration_score = 0.20
+                    base_duration_score = 0.25  # Optimal Wyckoff
+                elif days_in_base >= institutional_threshold:
+                    base_duration_score = 0.25  # Institutional Phoenix
+                elif days_in_base > 60:
+                    base_duration_score = 0.15
+            composite_score += base_duration_score
 
-                # INSTITUTIONAL PHOENIX (365-730 days / 12-24 months)
-                elif institutional_threshold <= days_in_base <= 730:
-                    # Large-cap institutional accumulation (LULU, activist plays)
-                    # Longer bases = deeper conviction for institutions
-                    if 365 <= days_in_base <= 550:
-                        base_duration_score = 0.25  # 12-18 months (optimal institutional)
-                    elif 550 < days_in_base <= 730:
-                        base_duration_score = 0.23  # 18-24 months (very deep base)
-            else:
-                # Outside acceptable range
-                base_duration_score = 0.0
-
-            # Layer 2: Volume Confirmation Score (0-25 points)
+            # Layer 2: Volume (0-25 pts)
             volume_score = 0.0
-            if volume_ratio >= 1.5:
-                if volume_ratio >= 3.0:
-                    volume_score = 0.25  # Exceptional volume
-                elif volume_ratio >= 2.0:
-                    volume_score = 0.20  # Strong volume
-                else:
-                    volume_score = 0.10 + (volume_ratio - 1.5) / 0.5 * 0.10  # Gradual increase
-            else:
-                # Partial credit for moderate volume
-                if volume_ratio >= 1.2:
-                    volume_score = 0.05
+            if volume_ratio >= 3.0:
+                volume_score = 0.25  # Exceptional volume
+            elif volume_ratio >= 1.5:
+                volume_score = 0.15  # Good volume
+            composite_score += volume_score
 
-            # Layer 3: RSI Health Score (0-20 points)
-            # v10.4.2: Extended for institutional breakouts (LULU RSI 73-78 fix)
+            # Layer 3: RSI Health (0-20 pts)
             rsi_score = 0.0
+            if 50 <= current_rsi <= 70:
+                rsi_score = 0.20  # Sweet spot
+            elif 70 < current_rsi <= 85 and is_institutional_vip:
+                rsi_score = 0.15  # VIP allowance for breakout momentum
+            elif 40 <= current_rsi < 50:
+                rsi_score = 0.10  # Slightly oversold
+            composite_score += rsi_score
 
-            # Check for mega-print override (activist plays gap up FAST)
-            has_mega_print = False
-            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
-                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
-                if ticker_row is not None and 'dp_total' in ticker_row:
-                    dp_total_check = ticker_row['dp_total']
-                    if dp_total_check > 500_000_000:  # $500M+ Elliott/activist-level
-                        has_mega_print = True
-
-            # INSTITUTIONAL PHOENIX: Allow higher RSI for breakout momentum
-            if days_in_base >= institutional_threshold or has_mega_print:
-                # Activist breakouts often push RSI to 70-85 immediately (NORMAL)
-                if 50 <= current_rsi <= 85:  # Extended range for institutional
-                    if 55 <= current_rsi <= 70:
-                        rsi_score = 0.20  # Sweet spot (pre-breakout or early)
-                    elif 70 < current_rsi <= 80:
-                        rsi_score = 0.18  # Breakout momentum (LULU range) - HIGH CREDIT
-                    elif 80 < current_rsi <= 85:
-                        rsi_score = 0.15  # Very strong momentum (partial credit)
-                    else:
-                        rsi_score = 0.15  # 50-55 range
-                elif 45 <= current_rsi < 50:
-                    rsi_score = 0.10  # Slightly oversold
-
-            # SPECULATIVE PHOENIX: Stricter RSI requirements
-            else:
-                if 50 <= current_rsi <= 70:
-                    if 55 <= current_rsi <= 65:
-                        rsi_score = 0.20  # Sweet spot
-                    else:
-                        rsi_score = 0.15  # Good but not perfect
-                elif 45 <= current_rsi < 50:
-                    rsi_score = 0.10  # Slightly oversold
-                elif 70 < current_rsi <= 75:
-                    rsi_score = 0.08  # Slightly overbought (speculative penalty)
-
-            # Layer 4: Breakout Confirmation Score (0-15 points)
+            # Layer 4: Breakout (0-15 pts)
             breakout_score = 0.0
-            if near_breakout or recent_breakout:
-                if recent_breakout:
-                    # Already broken out
-                    breakout_pct = (current_price - base_low) / base_low
-                    if breakout_pct >= 0.10:
-                        breakout_score = 0.15  # Strong breakout (10%+)
-                    elif breakout_pct >= 0.05:
-                        breakout_score = 0.12
-                    else:
-                        breakout_score = 0.08
-                elif near_breakout:
-                    # Near breakout (anticipatory)
-                    breakout_score = 0.10
+            if recent_breakout:
+                breakout_score = 0.15  # Confirmed breakout
+            elif near_breakout:
+                breakout_score = 0.10  # Near breakout
+            composite_score += breakout_score
 
-            # Layer 5: Drawdown Quality Score (0-10 points)
-            # v10.4: Extended for deep institutional corrections (LULU-like 60% drops)
+            # Layer 5: Drawdown Quality (0-10 pts)
             drawdown_score = 0.0
-            if max_drawdown <= 0.70:  # Extended acceptable drawdown
-                # Lower drawdown = higher quality base (for speculative)
-                # Higher drawdown = deeper value opportunity (for institutional)
-                if max_drawdown <= 0.20:
-                    drawdown_score = 0.10  # Tight base (best for speculative)
-                elif max_drawdown <= 0.35:
-                    drawdown_score = 0.08  # Moderate correction
-                elif max_drawdown <= 0.50:
-                    drawdown_score = 0.07  # Significant correction (still acceptable)
-                elif max_drawdown <= 0.70:
-                    # Deep institutional correction (LULU: 60% drop)
-                    # If base is institutional (>365 days), this is POSITIVE (deep value + time to accumulate)
-                    if days_in_base >= institutional_threshold:
-                        drawdown_score = 0.10  # Deep value opportunity for institutions
-                    else:
-                        drawdown_score = 0.05  # Risky for short-term plays
-            else:
-                # Excessive drawdown (>70%) - severe distress signal
-                drawdown_score = -0.05
+            if max_drawdown <= 0.35:
+                drawdown_score = 0.10  # Tight base
+            elif max_drawdown <= 0.70 and (days_in_base > institutional_threshold or is_institutional_vip):
+                drawdown_score = 0.10  # Deep value credit for institutional
+            composite_score += drawdown_score
 
-            # Layer 6: Dark Pool Support Score (0-15 points + BONUS for mega-prints)
-            # v10.4: Magnitude-based scaling for institutional activism (LULU-like $1B+ stakes)
+            # Layer 6: DP Score (0-15 pts)
+            # Already factored into VIP, but small additive bonus for support levels
             dp_score = 0.0
             if has_dp_support:
-                dp_score = 0.10 + (dp_strength * 0.05)  # Base 10 + up to 5 bonus
+                dp_score = 0.10 + (dp_strength * 0.05)
+            if not is_institutional_vip:  # Don't double count huge DP
+                composite_score += dp_score
 
-            # BONUS: Check for massive institutional dark pool activity
-            # Look for signature prints or unusually large DP accumulation
-            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
-                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
-                if ticker_row is not None and 'dp_total' in ticker_row:
-                    dp_total = ticker_row['dp_total']
-                    # Institutional activism threshold: $50M+ dark pool activity
-                    if dp_total > 50_000_000:  # $50M+
-                        # Scale bonus logarithmically (prevents single print from dominating)
-                        import math
-                        mega_print_bonus = min(0.15, math.log10(dp_total / 50_000_000) * 0.10)
-                        dp_score += mega_print_bonus
-                        # For truly massive prints ($500M+), add extra weight
-                        if dp_total > 500_000_000:  # $500M+ (LULU Elliott-level)
-                            dp_score += 0.10
-
-            # Layer 7: Pattern Synergy Bonus (0-10 points)
-            # v10.4: Detect overlapping patterns that reinforce each other (LULU has both!)
-            synergy_score = 0.0
-
-            # Check if this ticker also has double bottom pattern (cache check)
-            # Double bottom within phoenix base = STRONG institutional accumulation signal
-            # We'll check this later during pattern integration, but add placeholder
-            # The actual synergy bonus will be added during pattern aggregation in predict()
-
-            # --- COMPOSITE SCORE ---
-            composite_score = (
-                base_duration_score +
-                volume_score +
-                rsi_score +
-                breakout_score +
-                drawdown_score +
-                dp_score +
-                synergy_score  # Pattern overlap bonus
-            )
-
-            # Phoenix threshold: 0.60 (60% of max 1.0 score)
-            # This allows patterns that are strong in some dimensions but weaker in others
+            # --- 5. FINAL DECISION ---
+            # Threshold is 0.60
+            # Standard stocks need to earn 0.60 pts manually
+            # VIPs start with 0.40 and need 0.20 pts from layers above
             is_phoenix = composite_score >= 0.60
 
             result['is_phoenix'] = is_phoenix
             result['phoenix_score'] = composite_score
 
-            # --- DETAILED EXPLANATION ---
-            score_components = []
-
             if is_phoenix:
-                # Highlight strengths
-                if base_duration_score >= 0.20:
-                    score_components.append(f"{days_in_base}d base ({base_duration_score*100:.0f} pts)")
-                if volume_score >= 0.15:
-                    score_components.append(f"{volume_ratio:.1f}x volume ({volume_score*100:.0f} pts)")
-                if rsi_score >= 0.15:
-                    score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
-                if breakout_score >= 0.10:
-                    score_components.append(f"Breakout confirmed ({breakout_score*100:.0f} pts)")
-                if dp_score >= 0.10:
-                    score_components.append(f"DP support ({dp_score*100:.0f} pts)")
-
-                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f} | " + ", ".join(score_components)
+                base_msg = f"PHOENIX ({'VIP' if is_institutional_vip else 'Tech'}): Score={composite_score:.2f}"
+                details = []
+                if is_institutional_vip:
+                    details.append(vip_reason)
+                if base_duration_score > 0.1:
+                    details.append(f"{days_in_base}d base")
+                if volume_score > 0.1:
+                    details.append(f"{volume_ratio:.1f}x vol")
+                result['explanation'] = f"{base_msg} | " + ", ".join(details)
             else:
-                # Show why it didn't qualify (scores too low)
-                weak_components = []
-                if base_duration_score < 0.15:
-                    weak_components.append(f"base {days_in_base}d ({base_duration_score*100:.0f} pts)")
-                if volume_score < 0.10:
-                    weak_components.append(f"volume {volume_ratio:.1f}x ({volume_score*100:.0f} pts)")
-                if rsi_score < 0.10:
-                    weak_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
-                if breakout_score < 0.08:
-                    weak_components.append(f"no breakout ({breakout_score*100:.0f} pts)")
-
-                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}/0.60): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
+                result['explanation'] = f"Score {composite_score:.2f} < 0.60 ({'VIP' if is_institutional_vip else 'Standard'})"
 
         except Exception as e:
             result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
