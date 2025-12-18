@@ -2208,6 +2208,23 @@ class SwingTradingEngine:
                 df_bot['screener_flow'] = df_bot['net_call_premium'] - df_bot['net_put_premium']
                 df_bot['net_gamma'] = df_bot['screener_flow'] / 100.0
 
+        # --- FORCE INCLUDE TEST TICKERS (v10.4.1: LULU testing) ---
+        # Manually inject LULU for phoenix detection testing if not present
+        force_include_tickers = ['LULU']  # Add any tickers you want to force-include here
+        if not df_bot.empty and 'ticker' in df_bot.columns:
+            for test_ticker in force_include_tickers:
+                if test_ticker not in df_bot['ticker'].values:
+                    # Add minimal row for forced ticker (will get enriched with real data later)
+                    force_row = {
+                        'ticker': test_ticker,
+                        'net_gamma': 0.0,  # Will be populated from actual data if available
+                        'net_flow': 0.0,
+                        'dp_total': 0.0  # Will be populated from dark pool data
+                    }
+                    df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
+                    print(f"  [TEST] Force-included {test_ticker} for pattern detection")
+        # --- END FORCE INCLUDE ---
+
         if not df_bot.empty:
             target_gamma = 'authentic_gamma' if 'authentic_gamma' in df_bot.columns else 'net_gamma'
             if target_gamma in df_bot.columns:
