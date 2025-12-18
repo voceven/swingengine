@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.6 (Grandmaster) - Validation Mode Fix
-Phase 10.6: Critical Fix - Force Validation Tickers into Pattern Analysis
+Swing Trading Engine - Version 10.7 (Grandmaster) - Phoenix Data Fix
+Phase 10.7: Extended History (1y) + Macro Cooldown + Individual Fallback
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -106,6 +106,26 @@ Changelog v10.6 (Validation Mode Fix - CRITICAL):
 - PATTERN CHUNKING: Applied 50-ticker chunking to pattern downloads too (safety)
 - EXPECTED: LULU now reaches pattern analysis → Phoenix detection can run
 - Rationale: Validation mode adds ticker but NOT data → Pattern analysis never reached
+
+Changelog v10.6.1 (Data Sanitization - yfinance Header Leak Fix):
+- BUG: yfinance batch downloads leak header "Ticker" into data rows
+- CRASH: pd.to_datetime("Ticker") fails → ValueError stops engine
+- FIX 1: prepare_supervised_data uses errors='coerce' + dropna for robust parsing
+- FIX 2: sync_prices sanitizes data BEFORE DB insert (defense-in-depth)
+- REMOVES: Corrupt rows with "Ticker" in date column automatically cleaned
+- Rationale: yfinance quirk when downloading in chunks/groups
+
+Changelog v10.7 (Phoenix Data Fix - Extended History):
+- PROBLEM: LULU only got 64 rows (3mo) - Phoenix needs 730-day base (24 months)
+- FIX 1: Oracle bulk download extended from period="3mo" to period="2y"
+- FIX 2: Oracle individual retry extended from period="3mo" to period="2y"
+- FIX 3: Pattern analysis download extended from period="3mo" to period="2y"
+- EXPECTED: LULU now gets ~504 trading days (2 years) for proper 730d base detection
+- MACRO FIX: get_market_regime with cooldown, individual fallback, and sanitization
+- MACRO COOLDOWN: 2s initial delay + exponential backoff (2, 4, 8s between retries)
+- MACRO FALLBACK: If batch fails, tries individual ticker fetches with 1s cooldown each
+- MACRO SANITIZE: Validates ranges (VIX 5-100, TNX 0-20, DXY 80-130) before use
+- Rationale: Previous 3mo history made phoenix base appear as 11d instead of 730d
 """
 
 import pandas as pd
@@ -554,7 +574,8 @@ class HistoryManager:
             print(f"    [Chunk {chunk_num}/{total_chunks}] Fetching {len(batch)} tickers...", end=" ")
 
             try:
-                data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
+                # v10.7: Extended to 2y for phoenix detection (was 3mo) - phoenix needs 730-day base
+                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=True)
                 chunk_success = 0
                 chunk_fail = 0
 
@@ -621,7 +642,8 @@ class HistoryManager:
 
             for retry_idx, t in enumerate(failed_tickers[:50]):  # Limit retry to first 50 to avoid excessive time
                 try:
-                    data = yf.download(t, period="3mo", progress=False)
+                    # v10.7: Extended to 2y for phoenix detection (was 3mo) - phoenix needs 730-day base
+                    data = yf.download(t, period="2y", progress=False)
                     if not data.empty and len(data) > 0 and all(col in data.columns for col in ['High', 'Low', 'Close']):
                         high = data['High']
                         low = data['Low']
@@ -669,8 +691,20 @@ class HistoryManager:
 
         if new_data:
             new_df = pd.DataFrame(new_data)
-            self.db.upsert_prices(new_df)
-            print(f"\n  [ORACLE] Price DB updated with {len(new_data)} records.")
+
+            # v10.6.1: Sanitize data before DB insert - remove corrupt rows
+            # yfinance sometimes leaks header "Ticker" into data rows
+            original_count = len(new_df)
+            new_df['date'] = pd.to_datetime(new_df['date'], errors='coerce')
+            new_df = new_df.dropna(subset=['date'])
+            new_df['date'] = new_df['date'].dt.strftime('%Y-%m-%d')  # Convert back to string for DB
+            sanitized_count = len(new_df)
+            if sanitized_count < original_count:
+                print(f"    [ORACLE] Sanitized: removed {original_count - sanitized_count} corrupt rows")
+
+            if not new_df.empty:
+                self.db.upsert_prices(new_df)
+                print(f"\n  [ORACLE] Price DB updated with {len(new_df)} records.")
 
         print(f"  [ORACLE] Fetch success: {successful_fetches}/{total_attempts} ({success_rate:.1f}%)")
 
@@ -753,56 +787,130 @@ class SwingTradingEngine:
             return pd.DataFrame()
 
     def get_market_regime(self):
+        """
+        v10.7: Robust macro regime assessment with cooldown, individual fallback, and sanitization.
+        """
         print("\n[TITAN] Assessing Macro Regime...")
 
+        # v10.7: Default values used if fetch fails completely
+        default_macro = {
+            'vix': 20.0, 'tnx': 4.0, 'dxy': 100.0,
+            'spy_trend': True, 'spy_return': 0.0,
+            'adjustment': 0, 'regime_details': ['Data unavailable']
+        }
+
         try:
-            # Retry logic for yfinance reliability
             max_retries = 3
-            vix = tnx = dxy = spy_trend = spy_return = None
+            vix = tnx = dxy = spy_current = spy_start = None
+
+            # v10.7: Initial cooldown to let yfinance rate limiter reset
+            time.sleep(2.0)
 
             for attempt in range(max_retries):
                 try:
+                    # v10.7: Try batch download first
                     tickers = ['^VIX', '^TNX', 'DX-Y.NYB', 'SPY']
-                    data = yf.download(tickers, period="5d", progress=False)['Close']
+                    data = yf.download(tickers, period="5d", progress=False, threads=False)
+
+                    # v10.7: Handle both single and multi-column return formats
+                    if 'Close' in data.columns or (isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns.get_level_values(0)):
+                        close_data = data['Close'] if 'Close' in data.columns else data.xs('Close', axis=1, level=0)
+                    else:
+                        close_data = data
 
                     # Extract values with NaN checking
-                    vix = data['^VIX'].iloc[-1] if '^VIX' in data.columns else None
-                    tnx = data['^TNX'].iloc[-1] if '^TNX' in data.columns else None
-                    dxy = data['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in data.columns else None
-                    spy_current = data['SPY'].iloc[-1] if 'SPY' in data.columns else None
-                    spy_start = data['SPY'].iloc[0] if 'SPY' in data.columns else None
+                    vix = close_data['^VIX'].iloc[-1] if '^VIX' in close_data.columns else None
+                    tnx = close_data['^TNX'].iloc[-1] if '^TNX' in close_data.columns else None
+                    dxy = close_data['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in close_data.columns else None
+                    spy_current = close_data['SPY'].iloc[-1] if 'SPY' in close_data.columns else None
+                    spy_start = close_data['SPY'].iloc[0] if 'SPY' in close_data.columns else None
+
+                    # v10.7: Sanitize - convert to float and check for NaN
+                    try:
+                        vix = float(vix) if vix is not None and not pd.isna(vix) else None
+                        tnx = float(tnx) if tnx is not None and not pd.isna(tnx) else None
+                        dxy = float(dxy) if dxy is not None and not pd.isna(dxy) else None
+                        spy_current = float(spy_current) if spy_current is not None and not pd.isna(spy_current) else None
+                        spy_start = float(spy_start) if spy_start is not None and not pd.isna(spy_start) else None
+                    except (TypeError, ValueError):
+                        pass
 
                     # Check for NaN values and retry if needed
-                    if pd.isna(vix) or pd.isna(tnx) or pd.isna(dxy) or pd.isna(spy_current) or pd.isna(spy_start):
+                    missing = []
+                    if vix is None: missing.append('VIX')
+                    if tnx is None: missing.append('TNX')
+                    if dxy is None: missing.append('DXY')
+                    if spy_current is None or spy_start is None: missing.append('SPY')
+
+                    if missing:
                         if attempt < max_retries - 1:
-                            print(f"  [MACRO] NaN values detected, retrying ({attempt + 1}/{max_retries})...")
-                            import time
-                            time.sleep(2 ** attempt)  # Exponential backoff
+                            print(f"  [MACRO] Missing {', '.join(missing)}, retrying ({attempt + 1}/{max_retries})...")
+                            time.sleep(2 ** (attempt + 1))  # Exponential backoff: 2, 4, 8 seconds
                             continue
                         else:
-                            raise ValueError("Macro data contains NaN after all retries")
+                            # v10.7: Try individual fetches as last resort
+                            print(f"  [MACRO] Batch failed, trying individual fetches...")
+                            time.sleep(2.0)
 
-                    spy_trend = spy_current > spy_start
-                    spy_return = (spy_current - spy_start) / spy_start
+                            if vix is None:
+                                try:
+                                    vix_data = yf.download('^VIX', period='5d', progress=False)
+                                    vix = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else default_macro['vix']
+                                except: vix = default_macro['vix']
+                                time.sleep(1.0)
 
-                    # Store raw macro values for score weighting
-                    self.macro_data = {
-                        'vix': float(vix),
-                        'tnx': float(tnx),
-                        'dxy': float(dxy),
-                        'spy_trend': spy_trend,
-                        'spy_return': float(spy_return)
-                    }
-                    break  # Success, exit retry loop
+                            if tnx is None:
+                                try:
+                                    tnx_data = yf.download('^TNX', period='5d', progress=False)
+                                    tnx = float(tnx_data['Close'].iloc[-1]) if not tnx_data.empty else default_macro['tnx']
+                                except: tnx = default_macro['tnx']
+                                time.sleep(1.0)
+
+                            if dxy is None:
+                                try:
+                                    dxy_data = yf.download('DX-Y.NYB', period='5d', progress=False)
+                                    dxy = float(dxy_data['Close'].iloc[-1]) if not dxy_data.empty else default_macro['dxy']
+                                except: dxy = default_macro['dxy']
+                                time.sleep(1.0)
+
+                            if spy_current is None or spy_start is None:
+                                try:
+                                    spy_data = yf.download('SPY', period='5d', progress=False)
+                                    if not spy_data.empty:
+                                        spy_current = float(spy_data['Close'].iloc[-1])
+                                        spy_start = float(spy_data['Close'].iloc[0])
+                                except:
+                                    spy_current = 500.0
+                                    spy_start = 500.0
+
+                    break  # Exit retry loop
 
                 except Exception as retry_error:
                     if attempt < max_retries - 1:
-                        print(f"  [MACRO] Fetch attempt {attempt + 1} failed, retrying...")
-                        import time
-                        time.sleep(2 ** attempt)
+                        print(f"  [MACRO] Fetch attempt {attempt + 1} failed: {str(retry_error)[:50]}")
+                        time.sleep(2 ** (attempt + 1))
                         continue
                     else:
                         raise retry_error
+
+            # v10.7: Final sanitization - ensure we have valid values
+            vix = vix if vix is not None and 5 < vix < 100 else default_macro['vix']
+            tnx = tnx if tnx is not None and 0 < tnx < 20 else default_macro['tnx']
+            dxy = dxy if dxy is not None and 80 < dxy < 130 else default_macro['dxy']
+            spy_current = spy_current if spy_current is not None else 500.0
+            spy_start = spy_start if spy_start is not None else 500.0
+
+            spy_trend = spy_current > spy_start
+            spy_return = (spy_current - spy_start) / spy_start if spy_start > 0 else 0
+
+            # Store raw macro values for score weighting
+            self.macro_data = {
+                'vix': vix,
+                'tnx': tnx,
+                'dxy': dxy,
+                'spy_trend': spy_trend,
+                'spy_return': spy_return
+            }
 
             # Calculate regime based on successfully fetched data
             regime = "Neutral"
@@ -841,8 +949,8 @@ class SwingTradingEngine:
             return regime
 
         except Exception as e:
-            print(f"  [MACRO] Data fetch failed after {max_retries} retries ({e}). Defaulting to Neutral.")
-            self.macro_data = {'vix': 20, 'tnx': 4.0, 'dxy': 100, 'spy_trend': True, 'spy_return': 0, 'adjustment': 0, 'regime_details': ['Data unavailable']}
+            print(f"  [MACRO] Data fetch failed ({str(e)[:50]}). Using defaults.")
+            self.macro_data = default_macro.copy()
             self.market_regime = "Neutral"
             return "Neutral"
 
@@ -1020,10 +1128,14 @@ class SwingTradingEngine:
         price_df = self.history_mgr.db.get_price_df()
         if price_df.empty: return self.prepare_inference_data(window_size)
 
-        price_df['date'] = pd.to_datetime(price_df['date'])
+        # v10.6.1: Robust date parsing - yfinance sometimes leaks header "Ticker" into data
+        price_df['date'] = pd.to_datetime(price_df['date'], errors='coerce')
+        price_df = price_df.dropna(subset=['date'])  # Remove corrupt rows with "Ticker" in date
+        if price_df.empty: return self.prepare_inference_data(window_size)
 
         df = hist_df[valid_cols].copy()
-        df['date'] = pd.to_datetime(df['date'])
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date'])  # Safety: remove any corrupt rows here too
         df = df.sort_values(['ticker', 'date'])
 
         feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
@@ -2893,13 +3005,14 @@ class SwingTradingEngine:
 
         # Batch fetch price history for pattern detection
         # v10.6: Reduced batch size to 50 for reliability (same as Oracle fix)
-        print(f"  [PATTERNS] Fetching price history for {len(tickers_to_analyze)} tickers...")
+        # v10.7: Extended to 2y for phoenix detection (was 3mo) - phoenix needs 730-day base
+        print(f"  [PATTERNS] Fetching 2-year price history for {len(tickers_to_analyze)} tickers...")
         price_data = {}
         pattern_batch_size = 50  # v10.6: Reduced from 75 for reliability
         for i in range(0, len(tickers_to_analyze), pattern_batch_size):
             batch = tickers_to_analyze[i:i+pattern_batch_size]
             try:
-                data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=True)
+                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=True)
                 for t in batch:
                     try:
                         hist = data[t] if len(batch) > 1 else data
@@ -3170,7 +3283,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.6 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v10.7 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3319,7 +3432,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Reversals: {phoenix_count}")
 
-            msg = f"v10.6 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v10.7 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
