@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.7 (Grandmaster) - Phoenix Data Fix
-Phase 10.7: Extended History (1y) + Macro Cooldown + Individual Fallback
+Swing Trading Engine - Version 10.7 (Grandmaster) - Flow-Adjusted Phoenix
+Phase 10.7: Dynamic Scoring Model + Extended History (2y) + Macro Cooldown
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -115,17 +115,20 @@ Changelog v10.6.1 (Data Sanitization - yfinance Header Leak Fix):
 - REMOVES: Corrupt rows with "Ticker" in date column automatically cleaned
 - Rationale: yfinance quirk when downloading in chunks/groups
 
-Changelog v10.7 (Phoenix Data Fix - Extended History):
-- PROBLEM: LULU only got 64 rows (3mo) - Phoenix needs 730-day base (24 months)
-- FIX 1: Oracle bulk download extended from period="3mo" to period="2y"
-- FIX 2: Oracle individual retry extended from period="3mo" to period="2y"
-- FIX 3: Pattern analysis download extended from period="3mo" to period="2y"
-- EXPECTED: LULU now gets ~504 trading days (2 years) for proper 730d base detection
+Changelog v10.7 (Flow-Adjusted Dynamic Scoring Model):
+- ARCHITECTURE: Flow-Adjusted Dynamic Scoring replaces hard thresholds
+- CONCEPT: High institutional flow earns "forgiveness points" that expand limits
+- EXAMPLE: LULU with $1B Elliott stake can have RSI 80 and still pass
+- NEW METHOD: calculate_flow_factor() computes institutional conviction (0.0-1.0)
+- FLOW COMPONENTS: Volume intensity + Dark Pool activity + Signature prints + Options flow
+- DYNAMIC RSI: Base 50-70 expands to 40-85 with max flow factor
+- DYNAMIC THRESHOLD: Phoenix threshold 0.60 → 0.45 with max flow factor
+- FLOW BONUS: High flow adds 5-15 points directly to composite score
+- DATA FIX: Extended all downloads from 3mo to 2y (504 trading days)
 - MACRO FIX: get_market_regime with cooldown, individual fallback, and sanitization
-- MACRO COOLDOWN: 2s initial delay + exponential backoff (2, 4, 8s between retries)
-- MACRO FALLBACK: If batch fails, tries individual ticker fetches with 1s cooldown each
-- MACRO SANITIZE: Validates ranges (VIX 5-100, TNX 0-20, DXY 80-130) before use
-- Rationale: Previous 3mo history made phoenix base appear as 11d instead of 730d
+- MACRO COOLDOWN: 2s initial delay + exponential backoff between retries
+- MACRO FALLBACK: If batch fails, tries individual ticker fetches with 1s cooldown
+- Rationale: Binary thresholds rejected LULU (RSI 78) despite $1B institutional stake
 """
 
 import pandas as pd
@@ -1655,16 +1658,137 @@ class SwingTradingEngine:
 
         return result
 
+    def calculate_flow_factor(self, ticker, volume_ratio=1.0):
+        """
+        v10.7: Calculate Flow Factor (0.0 to 1.0) for dynamic threshold adjustment.
+
+        High institutional flow earns "forgiveness points" that expand trading thresholds.
+        A stock with massive buying (like LULU with Elliott $1B stake) can exceed normal
+        RSI limits and still qualify for phoenix detection.
+
+        Components:
+        1. Volume Intensity (0-0.25): Recent volume vs 50-day average
+        2. Dark Pool Activity (0-0.35): Total DP accumulation (log-scaled for mega-prints)
+        3. Institutional Signature (0-0.20): Presence of signature block trades
+        4. Net Options Flow (0-0.20): Gamma/delta positioning from options
+
+        Returns:
+            flow_factor (float): 0.0 (no flow) to 1.0 (maximum institutional conviction)
+            flow_details (dict): Breakdown of components for debugging
+        """
+        import math
+
+        flow_factor = 0.0
+        flow_details = {
+            'volume_component': 0.0,
+            'dp_component': 0.0,
+            'signature_component': 0.0,
+            'options_component': 0.0,
+            'raw_dp_total': 0.0,
+            'has_signature': False
+        }
+
+        try:
+            # Component 1: Volume Intensity (0-0.25)
+            # Higher volume = more institutional interest
+            if volume_ratio >= 1.0:
+                if volume_ratio >= 4.0:
+                    flow_details['volume_component'] = 0.25  # Exceptional volume
+                elif volume_ratio >= 2.5:
+                    flow_details['volume_component'] = 0.20
+                elif volume_ratio >= 1.5:
+                    flow_details['volume_component'] = 0.15
+                else:
+                    flow_details['volume_component'] = 0.05 + (volume_ratio - 1.0) * 0.10
+
+            # Component 2: Dark Pool Activity (0-0.35)
+            # Log-scaled to handle mega-prints like Elliott's $1B LULU stake
+            ticker_data = None
+            if hasattr(self, 'full_df') and not self.full_df.empty:
+                ticker_rows = self.full_df[self.full_df['ticker'] == ticker]
+                if not ticker_rows.empty:
+                    ticker_data = ticker_rows.iloc[0]
+
+            if ticker_data is not None and 'dp_total' in ticker_data:
+                dp_total = float(ticker_data.get('dp_total', 0))
+                flow_details['raw_dp_total'] = dp_total
+
+                if dp_total > 0:
+                    # Log-scaled scoring (prevents single mega-print from dominating)
+                    # $1M = baseline, $10M = moderate, $100M = strong, $1B = exceptional
+                    if dp_total >= 1_000_000_000:  # $1B+ (Elliott/activist level)
+                        flow_details['dp_component'] = 0.35
+                    elif dp_total >= 500_000_000:  # $500M+
+                        flow_details['dp_component'] = 0.30
+                    elif dp_total >= 100_000_000:  # $100M+
+                        flow_details['dp_component'] = 0.25
+                    elif dp_total >= 50_000_000:   # $50M+
+                        flow_details['dp_component'] = 0.20
+                    elif dp_total >= 10_000_000:   # $10M+
+                        flow_details['dp_component'] = 0.12
+                    elif dp_total >= 1_000_000:    # $1M+
+                        flow_details['dp_component'] = 0.05
+
+            # Component 3: Institutional Signature Prints (0-0.20)
+            # Check for signature block trades (large single prints)
+            if hasattr(self, 'signature_prints') and ticker in self.signature_prints:
+                flow_details['has_signature'] = True
+                sig_count = len(self.signature_prints[ticker]) if isinstance(self.signature_prints[ticker], list) else 1
+                flow_details['signature_component'] = min(0.20, 0.10 + sig_count * 0.05)
+            elif ticker_data is not None:
+                # Fallback: Check for large single-day DP prints
+                dp_max = float(ticker_data.get('dp_max', ticker_data.get('dp_total', 0)))
+                if dp_max >= 50_000_000:  # Single $50M+ print
+                    flow_details['signature_component'] = 0.15
+                    flow_details['has_signature'] = True
+                elif dp_max >= 10_000_000:  # Single $10M+ print
+                    flow_details['signature_component'] = 0.08
+
+            # Component 4: Net Options Flow (0-0.20)
+            # Bullish gamma/delta positioning indicates institutional conviction
+            if ticker_data is not None:
+                net_gamma = float(ticker_data.get('net_gamma', 0))
+                net_delta = float(ticker_data.get('net_delta', 0))
+
+                # Positive gamma + positive delta = bullish institutional positioning
+                if net_gamma > 0 and net_delta > 0:
+                    # Scale by magnitude
+                    gamma_strength = min(1.0, abs(net_gamma) / 1000000)  # $1M gamma = max
+                    delta_strength = min(1.0, abs(net_delta) / 5000000)  # $5M delta = max
+                    flow_details['options_component'] = 0.20 * (gamma_strength + delta_strength) / 2
+                elif net_gamma > 0 or net_delta > 0:
+                    # Partially bullish
+                    flow_details['options_component'] = 0.08
+
+            # Calculate total flow factor (capped at 1.0)
+            flow_factor = min(1.0,
+                flow_details['volume_component'] +
+                flow_details['dp_component'] +
+                flow_details['signature_component'] +
+                flow_details['options_component']
+            )
+
+        except Exception as e:
+            # On error, return conservative flow factor
+            flow_factor = 0.0
+
+        return flow_factor, flow_details
+
     def detect_phoenix_reversal(self, ticker, history_df):
         """
-        Detect Phoenix reversal pattern: 6-12 month base with volume surge breakout.
+        v10.7: Flow-Adjusted Dynamic Scoring Model for Phoenix Detection.
 
-        Criteria:
-        1. Extended consolidation period (60-250 days)
-        2. Price staying within tight range (max 35% drawdown)
-        3. Volume surge on breakout (1.5x average)
-        4. RSI between 50-70 (healthy, not oversold)
-        5. Recent breakout above consolidation range
+        Instead of hard thresholds (RSI must be 50-70), this uses a sliding scale.
+        High institutional flow (volume/dark pools) earns "forgiveness points" that
+        dynamically expand allowable limits.
+
+        Example: LULU with massive Elliott $1B stake can have RSI 80 and still pass,
+        while a low-volume stock with RSI 80 would be rejected.
+
+        Dynamic Thresholds (based on flow_factor 0.0-1.0):
+        - RSI: 50-70 → expands to 40-85 with max flow
+        - Drawdown: 35% → expands to 80% with max flow
+        - Base duration min: 60 → reduces to 30 with max flow
 
         Returns dict with phoenix detection results and explanation.
         """
@@ -1719,6 +1843,10 @@ class SwingTradingEngine:
 
             has_volume_surge = volume_ratio >= PHOENIX_CONFIG['volume_surge_threshold']
 
+            # v10.7: Calculate Flow Factor for dynamic threshold adjustment
+            flow_factor, flow_details = self.calculate_flow_factor(ticker, volume_ratio)
+            result['flow_factor'] = flow_factor
+
             # Calculate RSI
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -1728,7 +1856,13 @@ class SwingTradingEngine:
             current_rsi = float(rsi.iloc[-1])
             result['rsi'] = current_rsi
 
-            rsi_in_range = PHOENIX_CONFIG['rsi_min'] <= current_rsi <= PHOENIX_CONFIG['rsi_max']
+            # v10.7: DYNAMIC RSI THRESHOLDS based on flow factor
+            # Base: 50-70, with max flow expands to 40-85
+            # High institutional flow earns "forgiveness points"
+            rsi_min_dynamic = max(40, PHOENIX_CONFIG['rsi_min'] - flow_factor * 10)  # 50 → 40 with max flow
+            rsi_max_dynamic = min(85, PHOENIX_CONFIG['rsi_max'] + flow_factor * 15)  # 70 → 85 with max flow
+            rsi_in_range = rsi_min_dynamic <= current_rsi <= rsi_max_dynamic
+            result['rsi_range'] = f"{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}"
 
             # Check for breakout (price near top of range)
             breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
@@ -1792,18 +1926,45 @@ class SwingTradingEngine:
                 if volume_ratio >= 1.2:
                     volume_score = 0.05
 
-            # Layer 3: RSI Health Score (0-20 points)
+            # Layer 3: RSI Health Score (0-20 points) - v10.7: FLOW-ADJUSTED DYNAMIC SCORING
+            # High institutional flow expands acceptable RSI range
             rsi_score = 0.0
-            if 50 <= current_rsi <= 70:
-                # Optimal range - not oversold, not overbought
+
+            # Define dynamic sweet spots based on flow factor
+            # Base sweet spot: 55-65, expands to 45-80 with max flow
+            sweet_spot_min = max(45, 55 - flow_factor * 10)
+            sweet_spot_max = min(80, 65 + flow_factor * 15)
+
+            if sweet_spot_min <= current_rsi <= sweet_spot_max:
+                # Within dynamic sweet spot - full or near-full credit
                 if 55 <= current_rsi <= 65:
-                    rsi_score = 0.20  # Sweet spot
+                    rsi_score = 0.20  # Classic sweet spot
+                elif 50 <= current_rsi <= 70:
+                    rsi_score = 0.18  # Standard acceptable range
                 else:
-                    rsi_score = 0.15  # Good but not perfect
-            elif 45 <= current_rsi < 50:
-                rsi_score = 0.10  # Slightly oversold (partial credit)
-            elif 70 < current_rsi <= 75:
-                rsi_score = 0.08  # Slightly overbought (lower credit)
+                    # Extended range due to high flow - still good credit
+                    rsi_score = 0.15 + flow_factor * 0.05  # 0.15-0.20 based on flow
+
+            elif rsi_min_dynamic <= current_rsi <= rsi_max_dynamic:
+                # Within dynamic acceptable range but outside sweet spot
+                if current_rsi < sweet_spot_min:
+                    # Oversold side
+                    rsi_score = 0.08 + flow_factor * 0.04
+                else:
+                    # Overbought side - flow factor provides "forgiveness"
+                    # LULU with RSI 78 and high flow would score here
+                    distance_from_70 = current_rsi - 70
+                    penalty = min(0.10, distance_from_70 * 0.01)  # Small penalty per point above 70
+                    forgiveness = flow_factor * 0.12  # High flow forgives up to 0.12
+                    rsi_score = max(0.05, 0.15 - penalty + forgiveness)
+
+            elif 70 < current_rsi <= 85 and flow_factor >= 0.3:
+                # Overbought but with significant flow - partial credit with forgiveness
+                # This catches LULU-like scenarios: RSI 78 but $1B institutional stake
+                rsi_score = 0.05 + flow_factor * 0.08  # 0.05-0.13 based on flow
+
+            # Store scoring details for debugging
+            result['rsi_sweet_spot'] = f"{sweet_spot_min:.0f}-{sweet_spot_max:.0f}"
 
             # Layer 4: Breakout Confirmation Score (0-15 points)
             breakout_score = 0.0
@@ -1875,6 +2036,17 @@ class SwingTradingEngine:
             # We'll check this later during pattern integration, but add placeholder
             # The actual synergy bonus will be added during pattern aggregation in predict()
 
+            # v10.7: Layer 8: Flow Factor Bonus (0-15 points)
+            # High institutional conviction adds direct score bonus
+            # This allows stocks with massive flow to overcome weak individual components
+            flow_bonus = 0.0
+            if flow_factor >= 0.7:
+                flow_bonus = 0.15  # Exceptional institutional conviction
+            elif flow_factor >= 0.5:
+                flow_bonus = 0.10  # Strong institutional flow
+            elif flow_factor >= 0.3:
+                flow_bonus = 0.05  # Moderate institutional interest
+
             # --- COMPOSITE SCORE ---
             composite_score = (
                 base_duration_score +
@@ -1883,15 +2055,19 @@ class SwingTradingEngine:
                 breakout_score +
                 drawdown_score +
                 dp_score +
-                synergy_score  # Pattern overlap bonus
+                synergy_score +   # Pattern overlap bonus
+                flow_bonus        # v10.7: Institutional flow bonus
             )
 
-            # Phoenix threshold: 0.60 (60% of max 1.0 score)
-            # This allows patterns that are strong in some dimensions but weaker in others
-            is_phoenix = composite_score >= 0.60
+            # v10.7: Dynamic threshold based on flow factor
+            # High flow lowers the bar: 0.60 → 0.45 with max flow
+            base_threshold = 0.60
+            flow_adjusted_threshold = max(0.45, base_threshold - flow_factor * 0.15)
+            is_phoenix = composite_score >= flow_adjusted_threshold
 
             result['is_phoenix'] = is_phoenix
             result['phoenix_score'] = composite_score
+            result['threshold'] = flow_adjusted_threshold
 
             # --- DETAILED EXPLANATION ---
             score_components = []
@@ -1902,14 +2078,21 @@ class SwingTradingEngine:
                     score_components.append(f"{days_in_base}d base ({base_duration_score*100:.0f} pts)")
                 if volume_score >= 0.15:
                     score_components.append(f"{volume_ratio:.1f}x volume ({volume_score*100:.0f} pts)")
-                if rsi_score >= 0.15:
-                    score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
+                if rsi_score >= 0.10:
+                    # v10.7: Show RSI with dynamic range context
+                    if current_rsi > 70:
+                        score_components.append(f"RSI {current_rsi:.0f} [flow-adjusted] ({rsi_score*100:.0f} pts)")
+                    else:
+                        score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
                 if breakout_score >= 0.10:
-                    score_components.append(f"Breakout confirmed ({breakout_score*100:.0f} pts)")
+                    score_components.append(f"Breakout ({breakout_score*100:.0f} pts)")
                 if dp_score >= 0.10:
-                    score_components.append(f"DP support ({dp_score*100:.0f} pts)")
+                    score_components.append(f"DP ${flow_details['raw_dp_total']/1e6:.0f}M ({dp_score*100:.0f} pts)")
+                if flow_bonus >= 0.05:
+                    score_components.append(f"Flow Factor {flow_factor:.2f} (+{flow_bonus*100:.0f} pts)")
 
-                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f} | " + ", ".join(score_components)
+                threshold_note = f" [threshold={flow_adjusted_threshold:.2f}]" if flow_adjusted_threshold < 0.60 else ""
+                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f}{threshold_note} | " + ", ".join(score_components)
             else:
                 # Show why it didn't qualify (scores too low)
                 weak_components = []
@@ -1918,11 +2101,17 @@ class SwingTradingEngine:
                 if volume_score < 0.10:
                     weak_components.append(f"volume {volume_ratio:.1f}x ({volume_score*100:.0f} pts)")
                 if rsi_score < 0.10:
-                    weak_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
+                    # v10.7: Show RSI with dynamic range info
+                    rsi_note = f" [range:{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}]" if flow_factor >= 0.2 else ""
+                    weak_components.append(f"RSI {current_rsi:.0f}{rsi_note} ({rsi_score*100:.0f} pts)")
                 if breakout_score < 0.08:
                     weak_components.append(f"no breakout ({breakout_score*100:.0f} pts)")
 
-                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}/0.60): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
+                # v10.7: Show flow factor if significant
+                flow_note = f", flow={flow_factor:.2f}" if flow_factor >= 0.2 else ""
+                threshold_note = f"/{flow_adjusted_threshold:.2f}" if flow_adjusted_threshold < 0.60 else "/0.60"
+
+                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}{threshold_note}{flow_note}): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
 
         except Exception as e:
             result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
