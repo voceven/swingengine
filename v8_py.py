@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """SwingEngine_v10_Grandmaster.py
 
-Swing Trading Engine - Version 10.8 (Grandmaster) - Anti-Throttling Oracle
-Phase 10.8: User-Agent Spoofing + Random Delays + Incremental Updates
+Swing Trading Engine - Version 10.8.1 (Grandmaster) - Phoenix Detection Fix
+Phase 10.8.1: Fixed Phoenix Lookback Bug + Dynamic Consolidation Threshold
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -140,6 +140,22 @@ Changelog v10.8 (Anti-Throttling Oracle - Yahoo Rate Limit Defense):
 - SESSION POOLING: Persistent requests session with connection pooling
 - EXPECTED: 40% → 90%+ Oracle success rate via stealth + efficiency
 - Rationale: Repeated large bulk requests triggered Yahoo's rate limiter
+
+Changelog v10.8.1 (Phoenix Detection Fix - LULU-Critical):
+- BUG 1 FIX: Phoenix lookback was truncated to 60 days (min_days)
+  - Previous: days_in_base capped at 60, institutional phoenix (365+) IMPOSSIBLE
+  - Now: Looks at FULL lookback period (up to 730 days)
+- BUG 2 FIX: Consolidation threshold was too strict (10%)
+  - Industry standard: 15-18% for VCP/flat base patterns (TraderLion/Minervini)
+  - For deep drawdown recoveries (60%+ drop like LULU): 20-25% is acceptable
+  - New: Dynamic threshold 15% base, +10% for deep drawdowns, +5% for high flow
+- DYNAMIC CONSOLIDATION: consolidation_threshold = 0.15 + drawdown_bonus + flow_bonus
+  - drawdown_bonus: Up to 10% extra for deep drawdowns (base_range * 0.15)
+  - flow_bonus: Up to 5% extra for institutional flow (flow_factor * 0.05)
+  - Capped at 30% maximum (prevents false positives)
+- DEBUG OUTPUT: Phoenix analysis now prints detailed debug for validation tickers
+- EXPECTED: LULU should now qualify for Phoenix detection with institutional scoring
+- Rationale: LULU had 60% drawdown + ~400 day base but failed 10% consolidation test
 """
 
 import pandas as pd
@@ -337,6 +353,7 @@ GEX_WALL_CONFIG = {
 
 # Phoenix Reversal Configuration (Extended for Institutional Patterns)
 # v10.4: Supports both speculative (2-10 months) and institutional (12-24 months) phoenix patterns
+# v10.8.1: Fixed consolidation threshold (10% too strict for deep drawdown recoveries)
 PHOENIX_CONFIG = {
     'min_base_days': 60,           # Minimum consolidation period (2 months)
     'max_base_days': 730,          # Extended to 24 months for institutional phoenix (was 250)
@@ -345,7 +362,7 @@ PHOENIX_CONFIG = {
     'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
     'rsi_max': 70,
     'max_drawdown_pct': 0.70,      # Extended to 70% for deep corrections (was 0.35, LULU had 60%)
-    'min_consolidation_pct': 0.10, # Price must stay within 10% range for extended period
+    'min_consolidation_pct': 0.15, # v10.8.1: Increased from 0.10 to 0.15 (VCP standard)
     'breakout_threshold': 0.03     # Breakout must be at least 3% move
 }
 
@@ -1980,15 +1997,46 @@ class SwingTradingEngine:
             base_low = base_period.min()
             base_range = (base_high - base_low) / base_low
 
-            # Calculate how long price has been consolidating
+            # v10.8.1: FIX - Look at FULL lookback period, not just min_days
+            # Previous bug: Only looked at last 60 days, making institutional phoenix (365+) impossible
             sma50 = close.rolling(50).mean()
-            recent_sma = sma50.iloc[-min_days:] if len(sma50) >= min_days else sma50
-            recent_close = close.iloc[-min_days:] if len(close) >= min_days else close
 
-            # Count days in consolidation (within 10% of SMA50)
-            consolidation_threshold = PHOENIX_CONFIG['min_consolidation_pct']
-            days_in_base = ((abs(recent_close - recent_sma) / recent_sma) < consolidation_threshold).sum()
+            # Use the full available lookback period (up to max_days)
+            full_lookback = min(len(close), max_days)
+            full_sma = sma50.iloc[-full_lookback:] if len(sma50) >= full_lookback else sma50
+            full_close = close.iloc[-full_lookback:] if len(close) >= full_lookback else close
+
+            # v10.8.1: Dynamic consolidation threshold
+            # Base: 15% (increased from 10%), expands based on:
+            # 1. Flow factor (institutional conviction allows messier bases)
+            # 2. Drawdown magnitude (deeper corrections = choppier recoveries)
+            base_consolidation_pct = PHOENIX_CONFIG['min_consolidation_pct']  # 0.15
+
+            # Calculate pre-emptive flow factor for threshold adjustment
+            avg_volume_50d_prelim = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent_prelim = volume.iloc[-5:].mean()
+            volume_ratio_prelim = avg_volume_recent_prelim / (avg_volume_50d_prelim + 1)
+            flow_factor_prelim, _ = self.calculate_flow_factor(ticker, volume_ratio_prelim)
+
+            # Drawdown-based expansion: deeper drawdowns allow looser consolidation
+            # LULU with 60% drawdown gets +5% tolerance
+            drawdown_bonus = min(0.10, base_range * 0.15)  # Up to 10% extra for deep drawdowns
+
+            # Flow-based expansion: high institutional flow allows +5% tolerance
+            flow_bonus = flow_factor_prelim * 0.05  # Up to 5% extra for max flow
+
+            # Dynamic consolidation threshold: 15% base, up to 30% for deep drawdown + high flow
+            consolidation_threshold = base_consolidation_pct + drawdown_bonus + flow_bonus
+            consolidation_threshold = min(consolidation_threshold, 0.30)  # Cap at 30%
+            result['consolidation_threshold'] = consolidation_threshold
+
+            # Count days in consolidation across FULL lookback period
+            days_in_base = ((abs(full_close - full_sma) / full_sma) < consolidation_threshold).sum()
             result['base_duration'] = int(days_in_base)
+
+            # Debug output for validation tickers
+            if ENABLE_VALIDATION_MODE and ticker in (VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']):
+                print(f"  [PHOENIX DEBUG] {ticker}: lookback={full_lookback}d, threshold={consolidation_threshold:.1%}, days_in_base={days_in_base}")
 
             # Check for volume surge (recent 5-day average vs 50-day average)
             avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
