@@ -700,7 +700,7 @@ class HistoryManager:
 
             try:
                 # v10.8: Level 1 - Use session with browser headers
-                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=False, session=YF_SESSION)
+                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=False)
                 chunk_success = 0
                 chunk_fail = 0
 
@@ -772,7 +772,7 @@ class HistoryManager:
                     start_str = start_date.strftime('%Y-%m-%d')
 
                     # v10.8: Incremental fetch with session
-                    data = yf.download(ticker, start=start_str, progress=False, session=YF_SESSION)
+                    data = yf.download(ticker, start=start_str, progress=False)
 
                     if not data.empty and len(data) > 0 and all(col in data.columns for col in ['High', 'Low', 'Close']):
                         high = data['High']
@@ -821,7 +821,7 @@ class HistoryManager:
 
             for retry_idx, t in enumerate(failed_tickers[:30]):  # Limit retry to first 30
                 try:
-                    data = yf.download(t, period="2y", progress=False, session=YF_SESSION)
+                    data = yf.download(t, period="2y", progress=False)
                     if not data.empty and len(data) > 0 and all(col in data.columns for col in ['High', 'Low', 'Close']):
                         high = data['High']
                         low = data['Low']
@@ -985,7 +985,7 @@ class SwingTradingEngine:
                 try:
                     # v10.7: Try batch download first (v10.8: with session)
                     tickers = ['^VIX', '^TNX', 'DX-Y.NYB', 'SPY']
-                    data = yf.download(tickers, period="5d", progress=False, threads=False, session=YF_SESSION)
+                    data = yf.download(tickers, period="5d", progress=False, threads=False)
 
                     # v10.7: Handle both single and multi-column return formats
                     if 'Close' in data.columns or (isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns.get_level_values(0)):
@@ -1029,28 +1029,28 @@ class SwingTradingEngine:
 
                             if vix is None:
                                 try:
-                                    vix_data = yf.download('^VIX', period='5d', progress=False, session=YF_SESSION)
+                                    vix_data = yf.download('^VIX', period='5d', progress=False)
                                     vix = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else default_macro['vix']
                                 except: vix = default_macro['vix']
                                 time.sleep(1.0)
 
                             if tnx is None:
                                 try:
-                                    tnx_data = yf.download('^TNX', period='5d', progress=False, session=YF_SESSION)
+                                    tnx_data = yf.download('^TNX', period='5d', progress=False)
                                     tnx = float(tnx_data['Close'].iloc[-1]) if not tnx_data.empty else default_macro['tnx']
                                 except: tnx = default_macro['tnx']
                                 time.sleep(1.0)
 
                             if dxy is None:
                                 try:
-                                    dxy_data = yf.download('DX-Y.NYB', period='5d', progress=False, session=YF_SESSION)
+                                    dxy_data = yf.download('DX-Y.NYB', period='5d', progress=False)
                                     dxy = float(dxy_data['Close'].iloc[-1]) if not dxy_data.empty else default_macro['dxy']
                                 except: dxy = default_macro['dxy']
                                 time.sleep(1.0)
 
                             if spy_current is None or spy_start is None:
                                 try:
-                                    spy_data = yf.download('SPY', period='5d', progress=False, session=YF_SESSION)
+                                    spy_data = yf.download('SPY', period='5d', progress=False)
                                     if not spy_data.empty:
                                         spy_current = float(spy_data['Close'].iloc[-1])
                                         spy_start = float(spy_data['Close'].iloc[0])
@@ -1437,7 +1437,7 @@ class SwingTradingEngine:
         print("  [CONTEXT] Fetching Sector ETF History...")
         try:
             etfs = list(SECTOR_MAP.values()) + ['SPY']
-            data = yf.download(etfs, period="1mo", progress=False, session=YF_SESSION)['Close']
+            data = yf.download(etfs, period="1mo", progress=False)['Close']
             if isinstance(data, pd.Series): data = data.to_frame()
             for etf in etfs:
                 if etf in data.columns:
@@ -2963,7 +2963,7 @@ class SwingTradingEngine:
             for batch_idx, i in enumerate(range(0, len(to_fetch), batch_size)):
                 batch = to_fetch[i:i+batch_size]
                 try:
-                    data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=False, session=YF_SESSION)
+                    data = yf.download(batch, period="3mo", group_by='ticker', progress=False, threads=False)
                     for t in batch:
                         try:
                             hist = data[t] if len(batch) > 1 else data
@@ -3409,7 +3409,7 @@ class SwingTradingEngine:
         for batch_idx, i in enumerate(range(0, len(tickers_to_analyze), pattern_batch_size)):
             batch = tickers_to_analyze[i:i+pattern_batch_size]
             try:
-                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=False, session=YF_SESSION)
+                data = yf.download(batch, period="2y", group_by='ticker', progress=False, threads=False)
                 for t in batch:
                     try:
                         hist = data[t] if len(batch) > 1 else data
