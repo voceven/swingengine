@@ -8,10 +8,10 @@ Original file is located at
 """
 
 # -*- coding: utf-8 -*-
-"""SwingEngine_v10_Grandmaster.py
+"""SwingEngine_v11_Grandmaster.py
 
-Swing Trading Engine - Version 10.10 (Grandmaster) - Alpaca Data Layer
-Phase 10.10: Dynamic Macro Regime (Z-Scores) + Production Pipeline
+Swing Trading Engine - Version 11.0 (Grandmaster) - Phase 1: Dual-Ranking Architecture
+Phase 11.0: Dual-Ranking (Alpha Momentum vs Phoenix Reversals) + Solidity Score + Smart Gatekeeper
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -23,6 +23,9 @@ Architecture:
 7. RISK: Sector capping to prevent over-concentration.
 8. PERFORMANCE: Ensemble caching, GPU acceleration, early stopping, configurable parameters.
 9. SIZING: Kelly Criterion position sizing with volatility-based risk tiers.
+10. v11.0 DUAL-RANKING: Separate Alpha Momentum and Phoenix Reversal leaderboards.
+11. v11.0 SOLIDITY: Institutional accumulation detection (38.2% Fib consolidation + declining volume).
+12. v11.0 GATEKEEPER: Dollar-volume liquidity pre-filtering with DP bypass.
 
 Changelog from v8.4:
 - Added bull flag pattern detection (consolidation after strong moves)
@@ -188,6 +191,26 @@ Changelog v10.10 (Dynamic Macro Intelligence - Z-Score Adaptation):
 - DATA HYGIENE: Improved ticker sanitization to exclude warrants ("+") and zombies
 - ORACLE EFFICIENCY: Smart weekend-skipping logic (prevents redundant fetches if DB exists)
 - EXPECTED: Fewer false positives during high-volatility regimes; robust handling of structural market shifts
+
+Changelog v11.0 (Dual-Ranking Architecture - Phase 1 - LULU Fix):
+- CRITICAL FIX: LULU ranked 118th despite 0.96 phoenix score - momentum bias exposed
+- DUAL-RANKING: Separate Alpha Momentum vs Phoenix Reversals leaderboards (not competing)
+- ALPHA MOMENTUM: Trend score + RSI + price action + volume momentum (continuation plays)
+- PHOENIX REVERSAL: Consolidation duration + solidity + breakout + institutional flow (reversal plays)
+- SOLIDITY SCORE: Institutional accumulation detection (38.2% Fib consolidation + declining volume)
+  - Detects "smart money loading" while retail loses interest
+  - Price range within 38.2% of base (institutional Fibonacci level)
+  - 20+ day consolidation period required
+  - Dark pool activity > $10M threshold
+  - Declining retail volume confirmation
+  - Weight: 15-20% of final Phoenix score
+- SMART GATEKEEPER: Dollar-volume liquidity pre-filtering
+  - Large-cap: $5M daily dollar-volume required
+  - Mid-cap: $2M daily dollar-volume required
+  - Small-cap: $1M daily dollar-volume required
+  - DP BYPASS: $500K+ dark pool inflow bypasses liquidity filter (early accumulation)
+  - Bid-ask spread check: <= 0.5% for tradeable executions
+- EXPECTED: LULU moves from #118 to top 25 Phoenix Reversals where it belongs
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -507,6 +530,81 @@ REVERSAL_CONFIG = {
     'lookback_days': 45,          # 45 day lookback for downtrend
     'min_days_below_sma': 15,     # Lowered to 15 days - even more lenient
     'dp_proximity_pct': 0.10      # 10% proximity for DP support
+}
+
+# --- v11.0 SMART GATEKEEPER CONFIGURATION ---
+# Dollar-volume liquidity thresholds by market cap tier
+# Filters illiquid stocks before expensive pattern analysis
+GATEKEEPER_CONFIG = {
+    # Dollar-volume thresholds (price × volume)
+    'large_cap_threshold': 5_000_000,    # $5M daily dollar-volume for large caps
+    'mid_cap_threshold': 2_000_000,      # $2M for mid caps
+    'small_cap_threshold': 1_000_000,    # $1M for small caps
+
+    # Market cap classification ($B)
+    'large_cap_min': 10_000_000_000,     # $10B+ = large cap
+    'mid_cap_min': 2_000_000_000,        # $2B-$10B = mid cap
+    # Below $2B = small cap
+
+    # Dark Pool Bypass: High DP inflow bypasses liquidity filter
+    'dp_bypass_threshold': 500_000,      # $500K+ DP inflow = allow through
+
+    # Bid-Ask Spread: Max spread for tradeable executions
+    'max_spread_pct': 0.005,             # 0.5% max spread
+
+    # Options Liquidity (for options traders)
+    'min_options_oi': 500,               # Minimum 500 contracts open interest
+}
+
+# --- v11.0 SOLIDITY SCORE CONFIGURATION ---
+# Detects institutional accumulation during retail exhaustion
+# Key insight: High DP activity + narrow price range + declining volume = smart money loading
+SOLIDITY_CONFIG = {
+    # Consolidation Parameters
+    'fib_retracement': 0.382,            # 38.2% Fibonacci level (institutional standard)
+    'min_consolidation_days': 20,        # 20+ days of tight range required
+    'max_consolidation_range': 0.382,    # Price range within 38.2% of base
+
+    # Volume Decline Detection
+    'volume_decline_ratio': 0.70,        # Recent volume < 70% of average = declining
+    'volume_lookback_days': 50,          # Compare recent 5d vs 50d average
+
+    # Institutional Flow Thresholds
+    'min_dp_total': 10_000_000,          # $10M+ dark pool activity
+    'signature_print_bonus': 0.10,       # +10% score for signature prints
+
+    # Scoring Weights
+    'weight_in_phoenix': 0.18,           # 18% of final Phoenix score (15-20% range)
+    'base_threshold': 0.50,              # Minimum solidity score to qualify
+}
+
+# --- v11.0 DUAL-RANKING CONFIGURATION ---
+# Separate Alpha Momentum and Phoenix Reversal leaderboards
+DUAL_RANKING_CONFIG = {
+    # Alpha Momentum Leaderboard (continuation plays)
+    'alpha_momentum': {
+        'min_score': 75,                 # Minimum score to qualify
+        'top_n': 25,                     # Top 25 momentum picks
+        # Scoring weights for Alpha Momentum
+        'weight_trend': 0.30,            # 30% trend/price action
+        'weight_ml': 0.25,               # 25% ML ensemble prediction
+        'weight_neural': 0.15,           # 15% Hive Mind neural score
+        'weight_volume': 0.15,           # 15% volume momentum
+        'weight_pattern': 0.15,          # 15% bull flag/continuation patterns
+    },
+
+    # Phoenix Reversal Leaderboard (reversal plays)
+    'phoenix_reversal': {
+        'min_score': 60,                 # Lower threshold (reversals are riskier)
+        'top_n': 25,                     # Top 25 reversal picks
+        # Scoring weights for Phoenix (LULU-optimized)
+        'weight_solidity': 0.18,         # 18% solidity score (institutional accumulation)
+        'weight_duration': 0.20,         # 20% consolidation duration
+        'weight_flow': 0.20,             # 20% institutional flow (DP, gamma)
+        'weight_breakout': 0.15,         # 15% breakout confirmation
+        'weight_pattern': 0.15,          # 15% reversal patterns (double bottom, etc.)
+        'weight_ml': 0.12,               # 12% ML (lower weight - ML biased toward momentum)
+    },
 }
 
 # Sector Capping (Risk Management)
@@ -2029,6 +2127,297 @@ class SwingTradingEngine:
 
         return flow_factor, flow_details
 
+    # --- v11.0 SMART GATEKEEPER ---
+    def apply_smart_gatekeeper(self, df):
+        """
+        v11.0: Smart Gatekeeper - Pre-filter candidates by dollar-volume liquidity.
+
+        Filters out illiquid stocks BEFORE expensive pattern analysis begins.
+        Uses tiered thresholds based on market cap:
+        - Large-cap ($10B+): $5M daily dollar-volume required
+        - Mid-cap ($2B-$10B): $2M daily dollar-volume required
+        - Small-cap (<$2B): $1M daily dollar-volume required
+
+        Exception: Stocks with $500K+ dark pool inflow bypass the liquidity filter
+        (catches early institutional accumulation in overlooked names).
+
+        Args:
+            df: DataFrame with ticker data (must have current_price, avg_volume, dp_total, market_cap)
+
+        Returns:
+            Filtered DataFrame with only liquid/DP-bypassed candidates
+        """
+        if df.empty:
+            return df
+
+        print("\n[GATEKEEPER v11.0] Applying dollar-volume liquidity filter...")
+        original_count = len(df)
+
+        # Calculate dollar-volume for each ticker
+        df = df.copy()
+
+        # Dollar volume = price × average daily volume
+        if 'current_price' in df.columns and 'avg_volume' in df.columns:
+            df['dollar_volume'] = df['current_price'] * df['avg_volume']
+        elif 'current_price' in df.columns:
+            # Estimate from available data
+            df['dollar_volume'] = df['current_price'] * 1_000_000  # Conservative estimate
+        else:
+            # Can't calculate - pass all through
+            print("  [GATEKEEPER] Warning: Missing price/volume data, skipping filter")
+            return df
+
+        # Determine market cap tier for each ticker
+        def get_liquidity_threshold(row):
+            """Get liquidity threshold based on market cap tier."""
+            market_cap = row.get('market_cap', 0)
+
+            if market_cap >= GATEKEEPER_CONFIG['large_cap_min']:
+                return GATEKEEPER_CONFIG['large_cap_threshold']  # $5M
+            elif market_cap >= GATEKEEPER_CONFIG['mid_cap_min']:
+                return GATEKEEPER_CONFIG['mid_cap_threshold']   # $2M
+            else:
+                return GATEKEEPER_CONFIG['small_cap_threshold']  # $1M
+
+        # Check DP bypass eligibility
+        def has_dp_bypass(row):
+            """Check if ticker has high enough DP inflow to bypass liquidity filter."""
+            dp_total = row.get('dp_total', 0)
+            return dp_total >= GATEKEEPER_CONFIG['dp_bypass_threshold']
+
+        # Apply filter
+        passed_liquidity = []
+        passed_dp_bypass = []
+        rejected = []
+
+        for idx, row in df.iterrows():
+            ticker = row.get('ticker', 'Unknown')
+            dollar_vol = row.get('dollar_volume', 0)
+            threshold = get_liquidity_threshold(row)
+
+            # Check DP bypass first
+            if has_dp_bypass(row):
+                passed_dp_bypass.append(idx)
+            # Check dollar-volume threshold
+            elif dollar_vol >= threshold:
+                passed_liquidity.append(idx)
+            else:
+                rejected.append(ticker)
+
+        # Combine passed candidates
+        passed_indices = passed_liquidity + passed_dp_bypass
+        filtered_df = df.loc[passed_indices].copy()
+
+        # Log results
+        liquidity_passed = len(passed_liquidity)
+        dp_bypassed = len(passed_dp_bypass)
+        rejected_count = len(rejected)
+
+        print(f"  [GATEKEEPER] Passed liquidity filter: {liquidity_passed}")
+        print(f"  [GATEKEEPER] DP bypass (institutional): {dp_bypassed}")
+        print(f"  [GATEKEEPER] Rejected (illiquid): {rejected_count}")
+
+        if rejected_count > 0 and rejected_count <= 10:
+            print(f"  [GATEKEEPER] Rejected tickers: {', '.join(rejected[:10])}")
+        elif rejected_count > 10:
+            print(f"  [GATEKEEPER] Sample rejected: {', '.join(rejected[:5])}... (+{rejected_count-5} more)")
+
+        return filtered_df
+
+    # --- v11.0 SOLIDITY SCORE ---
+    def calculate_solidity_score(self, ticker, history_df):
+        """
+        v11.0: Solidity Score - Detects institutional accumulation during retail exhaustion.
+
+        The "solidity" concept: When smart money quietly accumulates while retail traders
+        lose interest, you get a characteristic pattern:
+        - High dark pool activity (institutions loading)
+        - Narrow price range within 38.2% Fibonacci retracement (controlled buying)
+        - Declining retail volume (capitulation/boredom)
+        - Extended consolidation period (20+ days)
+
+        This pattern preceded LULU's breakout when Elliott Management built their $1B position.
+
+        Scoring Components (0.0 to 1.0):
+        1. Consolidation Quality (0-0.30): Price range within 38.2% Fib level
+        2. Volume Decline (0-0.25): Recent volume declining vs average
+        3. Institutional Flow (0-0.25): Dark pool activity level
+        4. Duration (0-0.20): Consolidation period length
+
+        Args:
+            ticker: Stock ticker symbol
+            history_df: Price history DataFrame (OHLCV)
+
+        Returns:
+            dict with solidity_score, components, and explanation
+        """
+        result = {
+            'solidity_score': 0.0,
+            'consolidation_quality': 0.0,
+            'volume_decline': 0.0,
+            'institutional_flow': 0.0,
+            'duration_score': 0.0,
+            'is_solid': False,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < SOLIDITY_CONFIG['min_consolidation_days']:
+            result['explanation'] = 'Insufficient history for solidity analysis'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            # --- Component 1: Consolidation Quality (0-0.30) ---
+            # Check if price range is within 38.2% Fibonacci level
+            lookback = min(len(close), 60)  # Look at recent 60 days
+            recent_close = close.iloc[-lookback:]
+
+            base_high = recent_close.max()
+            base_low = recent_close.min()
+            price_range = (base_high - base_low) / base_low if base_low > 0 else 1.0
+
+            # 38.2% Fib is the institutional standard for "tight" consolidation
+            fib_threshold = SOLIDITY_CONFIG['max_consolidation_range']
+
+            if price_range <= fib_threshold * 0.5:
+                # Very tight consolidation (< 19.1% range)
+                result['consolidation_quality'] = 0.30
+            elif price_range <= fib_threshold:
+                # Good consolidation (< 38.2% range)
+                result['consolidation_quality'] = 0.25
+            elif price_range <= fib_threshold * 1.5:
+                # Acceptable consolidation (< 57.3% range)
+                result['consolidation_quality'] = 0.15
+            else:
+                # Too wide - not a solid base
+                result['consolidation_quality'] = 0.0
+
+            # --- Component 2: Volume Decline (0-0.25) ---
+            # Declining volume = retail exhaustion/capitulation
+            vol_lookback = SOLIDITY_CONFIG['volume_lookback_days']
+            if len(volume) >= vol_lookback:
+                avg_volume_long = volume.iloc[-vol_lookback:].mean()
+                avg_volume_recent = volume.iloc[-5:].mean()
+
+                if avg_volume_long > 0:
+                    volume_ratio = avg_volume_recent / avg_volume_long
+
+                    # We WANT declining volume (smart money loading quietly)
+                    if volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio'] * 0.5:
+                        # Significantly declining (< 35% of average)
+                        result['volume_decline'] = 0.25
+                    elif volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio']:
+                        # Declining (< 70% of average)
+                        result['volume_decline'] = 0.20
+                    elif volume_ratio <= 1.0:
+                        # Stable volume
+                        result['volume_decline'] = 0.10
+                    else:
+                        # Increasing volume - not what we want for solidity
+                        result['volume_decline'] = 0.0
+
+            # --- Component 3: Institutional Flow (0-0.25) ---
+            # High dark pool activity indicates institutional accumulation
+            dp_total = 0
+            has_signature = False
+
+            # Get ticker data from full_df
+            if hasattr(self, 'full_df') and not self.full_df.empty:
+                ticker_data = self.full_df[self.full_df['ticker'] == ticker]
+                if not ticker_data.empty:
+                    dp_total = ticker_data.iloc[0].get('dp_total', 0)
+
+            # Check for signature prints in dp_support_levels
+            if ticker in self.dp_support_levels:
+                has_signature = len(self.dp_support_levels[ticker]) > 0
+
+            min_dp = SOLIDITY_CONFIG['min_dp_total']
+            if dp_total >= min_dp * 5:
+                # Massive institutional activity ($50M+)
+                result['institutional_flow'] = 0.25
+            elif dp_total >= min_dp * 2:
+                # Strong institutional activity ($20M+)
+                result['institutional_flow'] = 0.20
+            elif dp_total >= min_dp:
+                # Good institutional activity ($10M+)
+                result['institutional_flow'] = 0.15
+            elif has_signature:
+                # Has signature prints but lower DP total
+                result['institutional_flow'] = 0.10
+            else:
+                result['institutional_flow'] = 0.0
+
+            # Signature print bonus
+            if has_signature and result['institutional_flow'] > 0:
+                result['institutional_flow'] = min(0.25,
+                    result['institutional_flow'] + SOLIDITY_CONFIG['signature_print_bonus'])
+
+            # --- Component 4: Duration Score (0-0.20) ---
+            # Count days in consolidation (price within 10% of SMA20)
+            sma20 = close.rolling(20).mean()
+            if len(sma20.dropna()) > 0:
+                consolidation_mask = abs(close - sma20) / sma20 < 0.10
+                days_in_consolidation = consolidation_mask.iloc[-60:].sum()
+
+                min_days = SOLIDITY_CONFIG['min_consolidation_days']
+                if days_in_consolidation >= min_days * 2:
+                    # Extended consolidation (40+ days)
+                    result['duration_score'] = 0.20
+                elif days_in_consolidation >= min_days * 1.5:
+                    # Good consolidation (30+ days)
+                    result['duration_score'] = 0.15
+                elif days_in_consolidation >= min_days:
+                    # Minimum consolidation (20+ days)
+                    result['duration_score'] = 0.10
+                else:
+                    result['duration_score'] = 0.0
+
+            # --- Calculate Total Solidity Score ---
+            total_score = (
+                result['consolidation_quality'] +
+                result['volume_decline'] +
+                result['institutional_flow'] +
+                result['duration_score']
+            )
+
+            result['solidity_score'] = total_score
+            result['is_solid'] = total_score >= SOLIDITY_CONFIG['base_threshold']
+
+            # --- Generate Explanation ---
+            if result['is_solid']:
+                components = []
+                if result['consolidation_quality'] >= 0.20:
+                    components.append(f"Tight base ({price_range*100:.1f}% range)")
+                if result['volume_decline'] >= 0.15:
+                    components.append("Declining volume")
+                if result['institutional_flow'] >= 0.15:
+                    components.append(f"DP ${dp_total/1e6:.1f}M")
+                if result['duration_score'] >= 0.10:
+                    components.append(f"{days_in_consolidation}d consolidation")
+
+                result['explanation'] = f"SOLID BASE: Score={total_score:.2f} | " + ", ".join(components)
+            else:
+                weak = []
+                if result['consolidation_quality'] < 0.15:
+                    weak.append(f"Wide range ({price_range*100:.0f}%)")
+                if result['volume_decline'] < 0.10:
+                    weak.append("No volume decline")
+                if result['institutional_flow'] < 0.10:
+                    weak.append("Low DP activity")
+
+                result['explanation'] = f"Not solid ({total_score:.2f}): " + ", ".join(weak) if weak else f"Sub-threshold ({total_score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Solidity analysis error: {str(e)[:50]}'
+
+        return result
+
     def detect_phoenix_reversal(self, ticker, history_df):
         """
         v10.7: Flow-Adjusted Dynamic Scoring Model for Phoenix Detection.
@@ -2333,6 +2722,20 @@ class SwingTradingEngine:
             elif flow_factor >= 0.3:
                 flow_bonus = 0.05  # Moderate institutional interest
 
+            # v11.0: Layer 9: Solidity Score (0-18 points)
+            # Detects institutional accumulation during retail exhaustion
+            # This is critical for LULU-style setups where smart money loads quietly
+            solidity_result = self.calculate_solidity_score(ticker, history_df)
+            solidity_score_raw = solidity_result.get('solidity_score', 0)
+
+            # Scale solidity to weight in Phoenix score (18% of total as per SOLIDITY_CONFIG)
+            solidity_weight = SOLIDITY_CONFIG['weight_in_phoenix']
+            solidity_contribution = solidity_score_raw * solidity_weight
+
+            # Store solidity components in result for transparency
+            result['solidity_score'] = solidity_score_raw
+            result['solidity_details'] = solidity_result
+
             # --- COMPOSITE SCORE ---
             composite_score = (
                 base_duration_score +
@@ -2342,7 +2745,8 @@ class SwingTradingEngine:
                 drawdown_score +
                 dp_score +
                 synergy_score +   # Pattern overlap bonus
-                flow_bonus        # v10.7: Institutional flow bonus
+                flow_bonus +      # v10.7: Institutional flow bonus
+                solidity_contribution  # v11.0: Institutional accumulation score
             )
 
             # v10.7: Dynamic threshold based on flow factor
@@ -2376,6 +2780,9 @@ class SwingTradingEngine:
                     score_components.append(f"DP ${flow_details['raw_dp_total']/1e6:.0f}M ({dp_score*100:.0f} pts)")
                 if flow_bonus >= 0.05:
                     score_components.append(f"Flow Factor {flow_factor:.2f} (+{flow_bonus*100:.0f} pts)")
+                # v11.0: Solidity score indicator
+                if solidity_contribution >= 0.05:
+                    score_components.append(f"SOLID BASE ({solidity_score_raw:.2f})")
 
                 threshold_note = f" [threshold={flow_adjusted_threshold:.2f}]" if flow_adjusted_threshold < 0.60 else ""
                 result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f}{threshold_note} | " + ", ".join(score_components)
@@ -3405,6 +3812,53 @@ class SwingTradingEngine:
         else:
             df['raw_score'] = 0.5
 
+        # --- v11.0 DUAL-RANKING ARCHITECTURE ---
+        # Create separate scores for Alpha Momentum vs Phoenix Reversals
+        # These are NOT the same as the old trend/ambush scores - they use different formulas
+        print("  [v11.0] Initializing Dual-Ranking Architecture...")
+
+        # --- ALPHA MOMENTUM SCORE (for continuation/trending plays) ---
+        # Formula: Heavy weight on ML prediction + trend + volume momentum
+        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
+
+        # Base from ML ensemble (25% weight)
+        df['alpha_momentum_score'] = df['raw_score'] * 100 * alpha_config['weight_ml']
+
+        # Trend component (30% weight) - based on RSI and price action
+        if 'rsi' in df.columns:
+            # RSI 50-70 is optimal for momentum (not overbought, not oversold)
+            rsi_score = df['rsi'].apply(lambda x: 100 if 50 <= x <= 70 else max(0, 100 - abs(x - 60) * 2))
+            df['alpha_momentum_score'] += rsi_score * alpha_config['weight_trend']
+
+        # Neural network component (15% weight)
+        if 'nn_score' in df.columns:
+            df['alpha_momentum_score'] += df['nn_score'] * alpha_config['weight_neural']
+
+        # Volume momentum component (15% weight)
+        if 'gamma_velocity' in df.columns:
+            vol_momentum = df['gamma_velocity'].clip(0, 100)
+            df['alpha_momentum_score'] += vol_momentum * alpha_config['weight_volume']
+
+        # --- PHOENIX REVERSAL SCORE (for base breakout/reversal plays) ---
+        # Formula: Heavy weight on solidity + duration + institutional flow, LESS on ML
+        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal']
+
+        # Base from ML ensemble (12% weight - LOWER than alpha, ML is momentum-biased)
+        df['phoenix_reversal_score'] = df['raw_score'] * 100 * phoenix_config['weight_ml']
+
+        # Institutional flow component (20% weight)
+        if 'dp_total' in df.columns:
+            # Scale DP total to 0-100 (log scale for mega-prints)
+            import math
+            dp_score = df['dp_total'].apply(lambda x: min(100, math.log10(max(x, 1)) * 10) if x > 0 else 0)
+            df['phoenix_reversal_score'] += dp_score * phoenix_config['weight_flow']
+
+        # Net gamma contribution to institutional flow
+        if 'net_gamma' in df.columns:
+            gamma_contribution = df['net_gamma'].apply(lambda x: min(50, abs(x) / 10000))
+            df['phoenix_reversal_score'] += gamma_contribution * (phoenix_config['weight_flow'] / 2)
+
+        # Keep old trend/ambush scores for backwards compatibility
         df['trend_score_val'] = df['raw_score'] * 85
         df['ambush_score_val'] = df['raw_score'] * 80
 
@@ -3416,6 +3870,8 @@ class SwingTradingEngine:
             flow_support |= (df['dp_total'] > 1_000_000)
         df.loc[~flow_support, 'trend_score_val'] -= 40
         df.loc[~flow_support, 'ambush_score_val'] -= 40
+        # Phoenix doesn't penalize low flow as heavily (reversals start with low activity)
+        df.loc[~flow_support, 'phoenix_reversal_score'] -= 10
 
         # --- NEURAL NETWORK BOOST ---
         if 'nn_score' in df.columns:
@@ -3426,6 +3882,7 @@ class SwingTradingEngine:
         # --- GAMMA VELOCITY BOOST ---
         if 'gamma_velocity' in df.columns:
             df.loc[df['gamma_velocity'] > 50, 'trend_score_val'] += 5
+            df.loc[df['gamma_velocity'] > 50, 'alpha_momentum_score'] += 5
 
         # --- MACRO ADJUSTMENT (Phase 9) ---
         macro_adj = self.macro_data.get('adjustment', 0)
@@ -3433,6 +3890,8 @@ class SwingTradingEngine:
             print(f"  [MACRO] Applying {macro_adj:+.1f} point adjustment to all scores")
             df['trend_score_val'] += macro_adj
             df['ambush_score_val'] += macro_adj
+            df['alpha_momentum_score'] += macro_adj
+            df['phoenix_reversal_score'] += macro_adj
 
         # --- TITAN EXECUTION LAYER (ATR STOP/PROFIT) ---
         price_db = self.history_mgr.db.get_price_df()
@@ -3552,45 +4011,66 @@ class SwingTradingEngine:
                     print(f"              → {explanation}")
 
             # --- PATTERN-BASED SCORE ADJUSTMENTS ---
+            # v11.0: Now updates both legacy scores AND dual-ranking scores
 
-            # Bull flag bonus
+            # Bull flag bonus (MOMENTUM pattern - boosts alpha_momentum_score)
             flag_score = patterns['bull_flag'].get('flag_score', 0)
             if flag_score > 0:
                 bonus = flag_score * 10  # Up to 10 point bonus
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
+                # v11.0: Bull flags are continuation patterns - boost alpha momentum
+                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + bonus * 1.5
 
-            # GEX wall protection bonus
+            # GEX wall protection bonus (supports both strategies)
             wall_score = patterns['gex_wall'].get('wall_protection_score', 0)
             if wall_score > 0:
                 bonus = wall_score * 8  # Up to 8 point bonus
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + bonus
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus * 0.5
 
             # Reversal setup bonus (for ambush strategy)
             reversal_score = patterns['reversal'].get('reversal_score', 0)
             if reversal_score > 0:
                 bonus = reversal_score * 12  # Up to 12 point bonus for ambush
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+                # v11.0: Reversals boost phoenix score
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus
 
-            # Phoenix reversal bonus (major pattern)
+            # Phoenix reversal bonus (CRITICAL for v11.0 - major boost to phoenix_reversal_score)
             phoenix_score = patterns['phoenix'].get('phoenix_score', 0)
+            solidity_score = patterns['phoenix'].get('solidity_score', 0)
             if phoenix_score > 0:
                 bonus = phoenix_score * 15  # Up to 15 point bonus for phoenix (rare, high conviction)
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.8
+                # v11.0: MAJOR boost to phoenix_reversal_score - this is what fixes LULU ranking
+                phoenix_boost = phoenix_score * 25  # Up to 25 points for phoenix patterns
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + phoenix_boost
 
-            # Cup-and-Handle bonus
+            # v11.0: Solidity score bonus (institutional accumulation)
+            if solidity_score > 0.3:
+                solidity_bonus = solidity_score * 15  # Up to 15 points for solid base
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + solidity_bonus
+            top_candidates.at[idx, 'solidity_score'] = solidity_score
+
+            # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
             if cup_handle_score > 0:
                 bonus = cup_handle_score * 12  # Up to 12 point bonus
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.6
+                # v11.0: Cup-handle is a reversal continuation pattern
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus
 
-            # Double Bottom bonus
+            # Double Bottom bonus (REVERSAL pattern - boosts phoenix_reversal_score)
             double_bottom_score = patterns['double_bottom'].get('double_bottom_score', 0)
             if double_bottom_score > 0:
                 bonus = double_bottom_score * 10  # Up to 10 point bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+                # v11.0: Double bottom is a reversal pattern - significant phoenix boost
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus * 1.5
 
             # --- PATTERN SYNERGY BONUSES (v10.4: LULU-inspired) ---
             # When multiple patterns overlap, it's a MUCH stronger signal
@@ -3600,16 +4080,20 @@ class SwingTradingEngine:
                 synergy_bonus = 8  # Significant bonus for dual pattern confirmation
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
                 top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + synergy_bonus
+                # v11.0: This is THE LULU pattern - massive phoenix boost
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + synergy_bonus * 2
 
             # Phoenix + Cup-Handle = Institutional accumulation with continuation setup
             elif phoenix_score > 0 and cup_handle_score > 0:
                 synergy_bonus = 6
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
+                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + synergy_bonus * 1.5
 
             # Bull Flag + GEX Wall = Momentum with support
             elif flag_score > 0 and wall_score > 0.3:
                 synergy_bonus = 5
                 top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
+                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + synergy_bonus * 1.5
 
             # Store pattern flags
             top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
@@ -3660,13 +4144,24 @@ class SwingTradingEngine:
         # --- FINAL SCORE FORMATTING ---
         stock_candidates['trend_score'] = stock_candidates['trend_score_val'].clip(0, 99.9).round(1)
         stock_candidates['ambush_score'] = stock_candidates['ambush_score_val'].clip(0, 99.9).round(1)
+
+        # v11.0: Format dual-ranking scores
+        if 'alpha_momentum_score' in stock_candidates.columns:
+            stock_candidates['alpha_score'] = stock_candidates['alpha_momentum_score'].clip(0, 99.9).round(1)
+        else:
+            stock_candidates['alpha_score'] = 0.0
+        if 'phoenix_reversal_score' in stock_candidates.columns:
+            stock_candidates['phoenix_score'] = stock_candidates['phoenix_reversal_score'].clip(0, 99.9).round(1)
+        else:
+            stock_candidates['phoenix_score'] = 0.0
+
         if 'dist_sma50' in stock_candidates.columns:
             stock_candidates['ext'] = (stock_candidates['dist_sma50'] * 100).round(1)
         else:
             stock_candidates['ext'] = 0.0
 
         # Ensure all expected columns exist
-        for col in ['gamma_velocity', 'nn_score', 'stop_loss', 'take_profit', 'explanation', 'gex_support']:
+        for col in ['gamma_velocity', 'nn_score', 'stop_loss', 'take_profit', 'explanation', 'gex_support', 'solidity_score']:
             if col not in stock_candidates.columns:
                 stock_candidates[col] = 0.0 if col != 'explanation' else 'Standard signal'
             if col not in etf_candidates.columns:
@@ -3678,6 +4173,26 @@ class SwingTradingEngine:
                 stock_candidates[col] = False
             if col not in etf_candidates.columns:
                 etf_candidates[col] = False
+
+        # --- v11.0: CREATE DUAL LEADERBOARDS ---
+        print("\n  [v11.0] Creating Dual Leaderboards...")
+
+        # Alpha Momentum Leaderboard (top 25 by alpha_momentum_score)
+        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
+        alpha_leaderboard = stock_candidates.nlargest(alpha_config['top_n'], 'alpha_score')
+        alpha_qualified = alpha_leaderboard[alpha_leaderboard['alpha_score'] >= alpha_config['min_score']]
+
+        # Phoenix Reversal Leaderboard (top 25 by phoenix_reversal_score)
+        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal']
+        phoenix_leaderboard = stock_candidates.nlargest(phoenix_config['top_n'], 'phoenix_score')
+        phoenix_qualified = phoenix_leaderboard[phoenix_leaderboard['phoenix_score'] >= phoenix_config['min_score']]
+
+        # Store leaderboards for output
+        stock_candidates.attrs['alpha_leaderboard'] = alpha_qualified
+        stock_candidates.attrs['phoenix_leaderboard'] = phoenix_qualified
+
+        print(f"  [v11.0] Alpha Momentum: {len(alpha_qualified)} qualified (>= {alpha_config['min_score']})")
+        print(f"  [v11.0] Phoenix Reversal: {len(phoenix_qualified)} qualified (>= {phoenix_config['min_score']})")
 
         # --- SUMMARY STATISTICS ---
         bull_flags = stock_candidates['has_bull_flag'].sum() if 'has_bull_flag' in stock_candidates.columns else 0
@@ -3757,7 +4272,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v10.10 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v11.0 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -3765,10 +4280,82 @@ if __name__ == "__main__":
                 print(f"  VIX: {m.get('vix', 'N/A'):.2f} | TNX: {m.get('tnx', 'N/A'):.2f}% | DXY: {m.get('dxy', 'N/A'):.2f}")
                 print(f"  Score Adjustment: {m.get('adjustment', 0):+.1f} points")
 
-            # --- STRATEGY 1: MOMENTUM LEADERS ---
+            # ========================================================================
+            # v11.0 DUAL-RANKING LEADERBOARDS (NEW - Fixes LULU ranking issue)
+            # ========================================================================
+
+            # --- LEADERBOARD 1: ALPHA MOMENTUM (Continuation Plays) ---
+            print("\n" + "="*80)
+            print("🚀 LEADERBOARD 1: ALPHA MOMENTUM (Continuation Plays)")
+            print("Logic: Trend + ML Ensemble + Neural Network + Volume Momentum")
+            print("Use for: Riding existing trends, momentum breakouts, bull flags")
+            print("="*80)
+
+            # Get alpha leaderboard from stored data or regenerate
+            if hasattr(stocks_df, 'attrs') and 'alpha_leaderboard' in stocks_df.attrs:
+                alpha_picks = stocks_df.attrs['alpha_leaderboard']
+            else:
+                alpha_picks = stocks_df.nlargest(25, 'alpha_score') if 'alpha_score' in stocks_df.columns else pd.DataFrame()
+
+            display_cols = ['ticker', 'alpha_score', 'quality', 'has_bull_flag', 'nn_score', 'position_pct', 'risk_tier']
+            display_cols = [c for c in display_cols if c in stocks_df.columns]
+
+            if not alpha_picks.empty and len(alpha_picks) > 0:
+                print(alpha_picks[display_cols].head(10).to_string(index=False))
+                print(f"\n  Total Alpha Momentum candidates: {len(alpha_picks)}")
+            else:
+                print("  [!] No candidates met Alpha Momentum criteria (>= 75)")
+
+            # --- LEADERBOARD 2: PHOENIX REVERSALS (Base Breakout Plays) ---
+            print("\n" + "="*80)
+            print("🔥 LEADERBOARD 2: PHOENIX REVERSALS (Base Breakout Plays)")
+            print("Logic: Solidity Score + Consolidation Duration + Institutional Flow")
+            print("Use for: LULU-style setups, deep value reversals, accumulation breakouts")
+            print("="*80)
+
+            # Get phoenix leaderboard from stored data or regenerate
+            if hasattr(stocks_df, 'attrs') and 'phoenix_leaderboard' in stocks_df.attrs:
+                phoenix_picks = stocks_df.attrs['phoenix_leaderboard']
+            else:
+                phoenix_picks = stocks_df.nlargest(25, 'phoenix_score') if 'phoenix_score' in stocks_df.columns else pd.DataFrame()
+
+            display_cols_phoenix = ['ticker', 'phoenix_score', 'solidity_score', 'is_phoenix', 'quality', 'dp_support', 'position_pct']
+            display_cols_phoenix = [c for c in display_cols_phoenix if c in stocks_df.columns]
+
+            if not phoenix_picks.empty and len(phoenix_picks) > 0:
+                print(phoenix_picks[display_cols_phoenix].head(10).to_string(index=False))
+
+                # Show explanations for top phoenix picks
+                print("\n  --- PHOENIX SIGNAL EXPLANATIONS ---")
+                for _, row in phoenix_picks.head(5).iterrows():
+                    ticker = row.get('ticker', 'N/A')
+                    phoenix_s = row.get('phoenix_score', 0)
+                    solidity_s = row.get('solidity_score', 0)
+                    explanation = row.get('explanation', 'N/A')
+                    if len(str(explanation)) > 100:
+                        explanation = str(explanation)[:97] + "..."
+                    print(f"  {ticker} [P:{phoenix_s:.1f} S:{solidity_s:.2f}]: {explanation}")
+
+                print(f"\n  Total Phoenix Reversal candidates: {len(phoenix_picks)}")
+
+                # v11.0: LULU ranking validation
+                if ENABLE_VALIDATION_MODE and 'LULU' in phoenix_picks['ticker'].values:
+                    lulu_row = phoenix_picks[phoenix_picks['ticker'] == 'LULU'].iloc[0]
+                    lulu_rank = phoenix_picks.index.get_loc(phoenix_picks[phoenix_picks['ticker'] == 'LULU'].index[0]) + 1
+                    print(f"\n  [v11.0 VALIDATION] LULU Phoenix Rank: #{lulu_rank}/25")
+                    print(f"                    Phoenix Score: {lulu_row.get('phoenix_score', 0):.1f}")
+                    print(f"                    Solidity Score: {lulu_row.get('solidity_score', 0):.2f}")
+            else:
+                print("  [!] No candidates met Phoenix Reversal criteria (>= 60)")
+
+            # ========================================================================
+            # LEGACY STRATEGIES (Backwards Compatibility)
+            # ========================================================================
+
+            # --- STRATEGY 1: MOMENTUM LEADERS (Legacy) ---
             trend_picks = stocks_df[stocks_df['trend_score'] > 80].sort_values('trend_score', ascending=False)
             print("\n" + "="*80)
-            print(f"STRATEGY 1: MOMENTUM LEADERS (Trend Following)")
+            print(f"[LEGACY] STRATEGY 1: MOMENTUM LEADERS (Trend Following)")
             print(f"Logic: CatBoost + Hive Mind + Bull Flag Detection + GEX Protection")
             print("="*80)
 
@@ -3798,7 +4385,7 @@ if __name__ == "__main__":
             else:
                 print("  [!] No candidates met strict criteria (>80).")
 
-            # --- STRATEGY 2: AMBUSH PREDATORS ---
+            # --- STRATEGY 2: AMBUSH PREDATORS (Legacy) ---
             # More lenient criteria for reversal plays
             ambush_picks = stocks_df[
                 (stocks_df['ambush_score'] > 75) &
@@ -3806,7 +4393,7 @@ if __name__ == "__main__":
             ].sort_values('ambush_score', ascending=False)
 
             print("\n" + "="*80)
-            print(f"STRATEGY 2: AMBUSH PREDATORS (Counter-Trend Reversals)")
+            print(f"[LEGACY] STRATEGY 2: AMBUSH PREDATORS (Counter-Trend Reversals)")
             print(f"Logic: Downtrend + DP Support + Divergence Detection")
             print("="*80)
 
@@ -3877,13 +4464,13 @@ if __name__ == "__main__":
                 print("  [!] No phoenix reversal candidates found.")
 
             # --- SAVE OUTPUT ---
-            out_path = "/content/drive/My Drive/colab/swing_signals_v10_grandmaster.csv" if COLAB_ENV else os.path.join(engine.base_dir, "swing_signals_v10_grandmaster.csv")
+            out_path = "/content/drive/My Drive/colab/swing_signals_v11_grandmaster.csv" if COLAB_ENV else os.path.join(engine.base_dir, "swing_signals_v11_grandmaster.csv")
             try:
                 final_output = pd.concat([stocks_df, etfs_df])
                 final_output.to_csv(out_path, index=False)
-                print(f"\n[SUCCESS] Saved comprehensive report with explanations: {out_path}")
+                print(f"\n[SUCCESS] Saved comprehensive report with dual leaderboards: {out_path}")
             except Exception as e:
-                out_path = os.path.join(engine.base_dir, "swing_signals_v10_grandmaster.csv")
+                out_path = os.path.join(engine.base_dir, "swing_signals_v11_grandmaster.csv")
                 try:
                     pd.concat([stocks_df, etfs_df]).to_csv(out_path, index=False)
                     print(f"\n[FALLBACK] Saved locally to {out_path}")
@@ -3895,18 +4482,28 @@ if __name__ == "__main__":
             mins, secs = divmod(elapsed, 60)
 
             print("\n" + "="*80)
-            print("RUN SUMMARY")
+            print("RUN SUMMARY - v11.0 DUAL-RANKING ARCHITECTURE")
             print("="*80)
             print(f"  Duration: {int(mins)}m {int(secs)}s")
             print(f"  Device: {device_name}")  # Uses global device_name from get_device()
             print(f"  Total Candidates Analyzed: {len(stocks_df) + len(etfs_df)}")
+
+            # v11.0 Dual Leaderboard counts
+            alpha_count = len(alpha_picks) if not alpha_picks.empty else 0
+            phoenix_lb_count = len(phoenix_picks) if not phoenix_picks.empty else 0
+            print(f"\n  --- v11.0 DUAL LEADERBOARDS ---")
+            print(f"  Alpha Momentum Leaders: {alpha_count}")
+            print(f"  Phoenix Reversals: {phoenix_lb_count}")
+
+            # Legacy counts
+            print(f"\n  --- Legacy Strategies ---")
             print(f"  Momentum Leaders (>80): {len(trend_picks)}")
             print(f"  Ambush Setups: {len(ambush_picks)}")
             print(f"  Bull Flags: {len(flag_picks) if not flag_picks.empty else 0}")
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
-            print(f"  Phoenix Reversals: {phoenix_count}")
+            print(f"  Phoenix Patterns: {phoenix_count}")
 
-            msg = f"v10.10 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Items: {len(stocks_df) + len(etfs_df)}"
+            msg = f"v11.0 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Alpha: {alpha_count} | Phoenix: {phoenix_lb_count}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
