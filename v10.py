@@ -211,6 +211,7 @@ Changelog v11.0 (Dual-Ranking Architecture - Phase 1 - LULU Fix):
   - DP BYPASS: $500K+ dark pool inflow bypasses liquidity filter (early accumulation)
   - Bid-ask spread check: <= 0.5% for tradeable executions
 - EXPECTED: LULU moves from #118 to top 25 Phoenix Reversals where it belongs
+- BUG FIX: Leaderboard display regenerated AFTER position sizing (position_pct/risk_tier available)
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -4291,11 +4292,13 @@ if __name__ == "__main__":
             print("Use for: Riding existing trends, momentum breakouts, bull flags")
             print("="*80)
 
-            # Get alpha leaderboard from stored data or regenerate
-            if hasattr(stocks_df, 'attrs') and 'alpha_leaderboard' in stocks_df.attrs:
-                alpha_picks = stocks_df.attrs['alpha_leaderboard']
+            # v11.0 FIX: Regenerate leaderboards from stocks_df AFTER position sizing is applied
+            # (attrs were created before position_pct/risk_tier existed)
+            if 'alpha_score' in stocks_df.columns:
+                alpha_min = DUAL_RANKING_CONFIG['alpha_momentum']['min_score']
+                alpha_picks = stocks_df[stocks_df['alpha_score'] >= alpha_min].nlargest(25, 'alpha_score')
             else:
-                alpha_picks = stocks_df.nlargest(25, 'alpha_score') if 'alpha_score' in stocks_df.columns else pd.DataFrame()
+                alpha_picks = pd.DataFrame()
 
             display_cols = ['ticker', 'alpha_score', 'quality', 'has_bull_flag', 'nn_score', 'position_pct', 'risk_tier']
             display_cols = [c for c in display_cols if c in stocks_df.columns]
@@ -4313,11 +4316,12 @@ if __name__ == "__main__":
             print("Use for: LULU-style setups, deep value reversals, accumulation breakouts")
             print("="*80)
 
-            # Get phoenix leaderboard from stored data or regenerate
-            if hasattr(stocks_df, 'attrs') and 'phoenix_leaderboard' in stocks_df.attrs:
-                phoenix_picks = stocks_df.attrs['phoenix_leaderboard']
+            # v11.0 FIX: Regenerate leaderboards from stocks_df AFTER position sizing is applied
+            if 'phoenix_score' in stocks_df.columns:
+                phoenix_min = DUAL_RANKING_CONFIG['phoenix_reversal']['min_score']
+                phoenix_picks = stocks_df[stocks_df['phoenix_score'] >= phoenix_min].nlargest(25, 'phoenix_score')
             else:
-                phoenix_picks = stocks_df.nlargest(25, 'phoenix_score') if 'phoenix_score' in stocks_df.columns else pd.DataFrame()
+                phoenix_picks = pd.DataFrame()
 
             display_cols_phoenix = ['ticker', 'phoenix_score', 'solidity_score', 'is_phoenix', 'quality', 'dp_support', 'position_pct']
             display_cols_phoenix = [c for c in display_cols_phoenix if c in stocks_df.columns]
