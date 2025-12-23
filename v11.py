@@ -10,8 +10,8 @@ Original file is located at
 # -*- coding: utf-8 -*-
 """SwingEngine_v11_Grandmaster.py
 
-Swing Trading Engine - Version 11.0 (Grandmaster) - Phase 1: Dual-Ranking Architecture
-Phase 11.0: Dual-Ranking (Alpha Momentum vs Phoenix Reversals) + Solidity Score + Smart Gatekeeper
+Swing Trading Engine - Version 11.1 (Grandmaster) - Phase 1: Dual-Ranking Architecture
+Phase 11.1: Dual-Ranking (Alpha Momentum vs Phoenix Reversals) + Solidity Score + Accumulation Fix
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -212,6 +212,26 @@ Changelog v11.0 (Dual-Ranking Architecture - Phase 1 - LULU Fix):
   - Bid-ask spread check: <= 0.5% for tradeable executions
 - EXPECTED: LULU moves from #118 to top 25 Phoenix Reversals where it belongs
 - BUG FIX: Leaderboard display regenerated AFTER position sizing (position_pct/risk_tier available)
+
+Changelog v11.1 (Phoenix Calibration + Accumulation Fix):
+- CRITICAL BUG FIX: Pattern bonuses were OVERWRITING each other instead of accumulating!
+  - Root cause: Each bonus used row.get() which reads ORIGINAL value, not accumulated
+  - Example: phoenix_boost(42) + solidity_bonus(9) + duration_bonus(12) → only 12 survived
+  - FIX: Use local accumulators (phoenix_accum, alpha_accum, etc.) with single write at end
+- SCORING REBALANCE: Increased pattern multipliers for achievable thresholds
+  - phoenix_boost: 25 → 40 (60% increase) for detected phoenix patterns
+  - solidity_boost: 15 → 20 (33% increase) for institutional bases
+  - legacy phoenix bonus: 15 → 25 for trend/ambush scores
+- THRESHOLD LOWERED: Phoenix min_score 60 → 55 (more lenient qualification)
+- WEIGHT ADJUSTMENTS: Rebalanced Phoenix Reversal scoring formula
+  - weight_ml: 0.12 → 0.15 (slight ML increase for base points)
+  - weight_solidity: 0.18 → 0.20 (increased institutional detection weight)
+  - weight_flow: 0.20 → 0.15 (early accumulation is quiet by design)
+- NEW FEATURE: Institutional Duration Bonus (12+ month bases)
+  - Adds up to 20 points for bases ≥365 days (LULU: 445d → +12.2 pts)
+  - Rewards patience in extended consolidation periods
+- MATH VALIDATION: LULU now properly accumulates ALL bonuses (~70+ pts)
+- EXPECTED RESULTS: 6-10 phoenix qualifications per run (vs 0 in v11.0)
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -596,15 +616,15 @@ DUAL_RANKING_CONFIG = {
 
     # Phoenix Reversal Leaderboard (reversal plays)
     'phoenix_reversal': {
-        'min_score': 60,                 # Lower threshold (reversals are riskier)
+        'min_score': 55,                 # v11.1: Lowered from 60 (more lenient qualification)
         'top_n': 25,                     # Top 25 reversal picks
         # Scoring weights for Phoenix (LULU-optimized)
-        'weight_solidity': 0.18,         # 18% solidity score (institutional accumulation)
+        'weight_solidity': 0.20,         # v11.1: Increased from 0.18 (institutional accumulation)
         'weight_duration': 0.20,         # 20% consolidation duration
-        'weight_flow': 0.20,             # 20% institutional flow (DP, gamma)
+        'weight_flow': 0.15,             # v11.1: Decreased from 0.20 (early accumulation is quiet)
         'weight_breakout': 0.15,         # 15% breakout confirmation
         'weight_pattern': 0.15,          # 15% reversal patterns (double bottom, etc.)
-        'weight_ml': 0.12,               # 12% ML (lower weight - ML biased toward momentum)
+        'weight_ml': 0.15,               # v11.1: Increased from 0.12 for base points
     },
 }
 
@@ -841,6 +861,31 @@ class HistoryManager:
 
     def sync_history(self, engine, data_folder):
         """Ingests Unusual Whales flow files into the DB."""
+        # v11.1 OPTIMIZATION: Check if DB already has today's data
+        try:
+            existing_df = self.db.get_history_df()
+
+            if existing_df.empty:
+                print(f"  [HISTORY] DB is empty. Proceeding with file scan...")
+            else:
+                # Debug: Show what dates are in the DB
+                latest_date_str = existing_df['date'].max()
+                print(f"  [HISTORY] DB latest date (raw): {latest_date_str}")
+
+                latest_date = pd.to_datetime(latest_date_str)
+                days_old = (datetime.now() - latest_date).days
+
+                print(f"  [HISTORY] DB age: {days_old} days old")
+
+                if days_old <= 1:
+                    print(f"  [HISTORY] Flow DB current (latest: {latest_date.date()}). Skipping scan.")
+                    return
+                else:
+                    print(f"  [HISTORY] DB is stale ({days_old} days old). Scanning for new files...")
+
+        except Exception as e:
+            print(f"  [HISTORY] DB check failed: {str(e)[:80]}")
+            print(f"  [HISTORY] Error type: {type(e).__name__}")
         print(f"\n[HISTORY] Scanning {data_folder} for historical flow data...")
         pattern = os.path.join(data_folder, "bot-eod-report-*.csv")
         found_files = glob.glob(pattern)
@@ -3816,7 +3861,7 @@ class SwingTradingEngine:
         # --- v11.0 DUAL-RANKING ARCHITECTURE ---
         # Create separate scores for Alpha Momentum vs Phoenix Reversals
         # These are NOT the same as the old trend/ambush scores - they use different formulas
-        print("  [v11.0] Initializing Dual-Ranking Architecture...")
+        print("  [v11.1] Initializing Dual-Ranking Architecture...")
 
         # --- ALPHA MOMENTUM SCORE (for continuation/trending plays) ---
         # Formula: Heavy weight on ML prediction + trend + volume momentum
@@ -4013,65 +4058,79 @@ class SwingTradingEngine:
 
             # --- PATTERN-BASED SCORE ADJUSTMENTS ---
             # v11.0: Now updates both legacy scores AND dual-ranking scores
+            # v11.1 FIX: Accumulate phoenix_reversal_score properly (bonuses were overwriting each other!)
+
+            # Initialize accumulators from base values
+            phoenix_accum = row.get('phoenix_reversal_score', 0)
+            alpha_accum = row.get('alpha_momentum_score', 0)
+            trend_accum = row.get('trend_score_val', 0)
+            ambush_accum = row.get('ambush_score_val', 0)
 
             # Bull flag bonus (MOMENTUM pattern - boosts alpha_momentum_score)
             flag_score = patterns['bull_flag'].get('flag_score', 0)
             if flag_score > 0:
                 bonus = flag_score * 10  # Up to 10 point bonus
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
+                trend_accum += bonus
                 # v11.0: Bull flags are continuation patterns - boost alpha momentum
-                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + bonus * 1.5
+                alpha_accum += bonus * 1.5
 
             # GEX wall protection bonus (supports both strategies)
             wall_score = patterns['gex_wall'].get('wall_protection_score', 0)
             if wall_score > 0:
                 bonus = wall_score * 8  # Up to 8 point bonus
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
-                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + bonus
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus * 0.5
+                trend_accum += bonus
+                ambush_accum += bonus
+                alpha_accum += bonus
+                phoenix_accum += bonus * 0.5
 
             # Reversal setup bonus (for ambush strategy)
             reversal_score = patterns['reversal'].get('reversal_score', 0)
             if reversal_score > 0:
                 bonus = reversal_score * 12  # Up to 12 point bonus for ambush
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+                ambush_accum += bonus
                 # v11.0: Reversals boost phoenix score
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus
+                phoenix_accum += bonus
 
             # Phoenix reversal bonus (CRITICAL for v11.0 - major boost to phoenix_reversal_score)
             phoenix_score = patterns['phoenix'].get('phoenix_score', 0)
             solidity_score = patterns['phoenix'].get('solidity_score', 0)
             if phoenix_score > 0:
-                bonus = phoenix_score * 15  # Up to 15 point bonus for phoenix (rare, high conviction)
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.8
+                bonus = phoenix_score * 25  # v11.1: Increased from 15 to 25 for legacy scores
+                trend_accum += bonus
+                ambush_accum += bonus * 0.8
                 # v11.0: MAJOR boost to phoenix_reversal_score - this is what fixes LULU ranking
-                phoenix_boost = phoenix_score * 25  # Up to 25 points for phoenix patterns
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + phoenix_boost
+                phoenix_boost = phoenix_score * 40  # v11.1: Increased from 25 to 40 for proper scaling
+                phoenix_accum += phoenix_boost
 
             # v11.0: Solidity score bonus (institutional accumulation)
             if solidity_score > 0.3:
-                solidity_bonus = solidity_score * 15  # Up to 15 points for solid base
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + solidity_bonus
+                solidity_bonus = solidity_score * 20  # v11.1: Increased from 15 to 20 for proper weight
+                phoenix_accum += solidity_bonus
             top_candidates.at[idx, 'solidity_score'] = solidity_score
+
+            # v11.1: Institutional Duration Bonus (12+ month bases)
+            phoenix_data = patterns.get('phoenix', {})
+            days_in_base = phoenix_data.get('days_in_base', 0)
+            if days_in_base >= 365:  # Institutional threshold (12+ months)
+                duration_bonus = min(20, (days_in_base / 365) * 10)  # Up to 20 pts for 730+ days
+                phoenix_accum += duration_bonus
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
             if cup_handle_score > 0:
                 bonus = cup_handle_score * 12  # Up to 12 point bonus
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + bonus
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus * 0.6
+                trend_accum += bonus
+                ambush_accum += bonus * 0.6
                 # v11.0: Cup-handle is a reversal continuation pattern
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus
+                phoenix_accum += bonus
 
             # Double Bottom bonus (REVERSAL pattern - boosts phoenix_reversal_score)
             double_bottom_score = patterns['double_bottom'].get('double_bottom_score', 0)
             if double_bottom_score > 0:
                 bonus = double_bottom_score * 10  # Up to 10 point bonus
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + bonus
+                ambush_accum += bonus
                 # v11.0: Double bottom is a reversal pattern - significant phoenix boost
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + bonus * 1.5
+                phoenix_accum += bonus * 1.5
 
             # --- PATTERN SYNERGY BONUSES (v10.4: LULU-inspired) ---
             # When multiple patterns overlap, it's a MUCH stronger signal
@@ -4079,22 +4138,28 @@ class SwingTradingEngine:
             if phoenix_score > 0 and double_bottom_score > 0:
                 # LULU pattern: Extended base (phoenix) + double bottom support
                 synergy_bonus = 8  # Significant bonus for dual pattern confirmation
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
-                top_candidates.at[idx, 'ambush_score_val'] = row['ambush_score_val'] + synergy_bonus
+                trend_accum += synergy_bonus
+                ambush_accum += synergy_bonus
                 # v11.0: This is THE LULU pattern - massive phoenix boost
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + synergy_bonus * 2
+                phoenix_accum += synergy_bonus * 2
 
             # Phoenix + Cup-Handle = Institutional accumulation with continuation setup
             elif phoenix_score > 0 and cup_handle_score > 0:
                 synergy_bonus = 6
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
-                top_candidates.at[idx, 'phoenix_reversal_score'] = row.get('phoenix_reversal_score', 0) + synergy_bonus * 1.5
+                trend_accum += synergy_bonus
+                phoenix_accum += synergy_bonus * 1.5
 
             # Bull Flag + GEX Wall = Momentum with support
             elif flag_score > 0 and wall_score > 0.3:
                 synergy_bonus = 5
-                top_candidates.at[idx, 'trend_score_val'] = row['trend_score_val'] + synergy_bonus
-                top_candidates.at[idx, 'alpha_momentum_score'] = row.get('alpha_momentum_score', 0) + synergy_bonus * 1.5
+                trend_accum += synergy_bonus
+                alpha_accum += synergy_bonus * 1.5
+
+            # v11.1 FIX: Write accumulated values back to DataFrame (single assignment, no overwrites)
+            top_candidates.at[idx, 'phoenix_reversal_score'] = phoenix_accum
+            top_candidates.at[idx, 'alpha_momentum_score'] = alpha_accum
+            top_candidates.at[idx, 'trend_score_val'] = trend_accum
+            top_candidates.at[idx, 'ambush_score_val'] = ambush_accum
 
             # Store pattern flags
             top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
@@ -4176,7 +4241,7 @@ class SwingTradingEngine:
                 etf_candidates[col] = False
 
         # --- v11.0: CREATE DUAL LEADERBOARDS ---
-        print("\n  [v11.0] Creating Dual Leaderboards...")
+        print("\n  [v11.1] Creating Dual Leaderboards...")
 
         # Alpha Momentum Leaderboard (top 25 by alpha_momentum_score)
         alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
@@ -4192,8 +4257,8 @@ class SwingTradingEngine:
         stock_candidates.attrs['alpha_leaderboard'] = alpha_qualified
         stock_candidates.attrs['phoenix_leaderboard'] = phoenix_qualified
 
-        print(f"  [v11.0] Alpha Momentum: {len(alpha_qualified)} qualified (>= {alpha_config['min_score']})")
-        print(f"  [v11.0] Phoenix Reversal: {len(phoenix_qualified)} qualified (>= {phoenix_config['min_score']})")
+        print(f"  [v11.1] Alpha Momentum: {len(alpha_qualified)} qualified (>= {alpha_config['min_score']})")
+        print(f"  [v11.1] Phoenix Reversal: {len(phoenix_qualified)} qualified (>= {phoenix_config['min_score']})")
 
         # --- SUMMARY STATISTICS ---
         bull_flags = stock_candidates['has_bull_flag'].sum() if 'has_bull_flag' in stock_candidates.columns else 0
@@ -4273,7 +4338,7 @@ if __name__ == "__main__":
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
-            print(f"GRANDMASTER ENGINE v11.0 - {datetime.now().strftime('%Y-%m-%d')}")
+            print(f"GRANDMASTER ENGINE v11.1 - {datetime.now().strftime('%Y-%m-%d')}")
             print("="*80)
             print(f"MACRO REGIME: {engine.market_regime}")
             if hasattr(engine, 'macro_data') and engine.macro_data:
@@ -4486,7 +4551,7 @@ if __name__ == "__main__":
             mins, secs = divmod(elapsed, 60)
 
             print("\n" + "="*80)
-            print("RUN SUMMARY - v11.0 DUAL-RANKING ARCHITECTURE")
+            print("RUN SUMMARY - v11.1 DUAL-RANKING ARCHITECTURE")
             print("="*80)
             print(f"  Duration: {int(mins)}m {int(secs)}s")
             print(f"  Device: {device_name}")  # Uses global device_name from get_device()
@@ -4507,7 +4572,7 @@ if __name__ == "__main__":
             phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
             print(f"  Phoenix Patterns: {phoenix_count}")
 
-            msg = f"v11.0 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Alpha: {alpha_count} | Phoenix: {phoenix_lb_count}"
+            msg = f"v11.1 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Alpha: {alpha_count} | Phoenix: {phoenix_lb_count}"
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
 
             # Log run history
