@@ -973,6 +973,9 @@ class HistoryManager:
 
                 if days_old <= 1:
                     print(f"  [HISTORY] Flow DB current (latest: {latest_date.date()}). Skipping scan.")
+                    # FIX: Still sync prices even if flow data is current
+                    # Without this, price_df is empty → transformer can't train → nn_score = 0
+                    self.sync_prices()
                     return
                 else:
                     print(f"  [HISTORY] DB is stale ({days_old} days old). Scanning for new files...")
