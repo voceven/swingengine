@@ -232,6 +232,9 @@ Changelog v11.1 (Phoenix Calibration + Accumulation Fix):
   - Rewards patience in extended consolidation periods
 - MATH VALIDATION: LULU now properly accumulates ALL bonuses (~70+ pts)
 - EXPECTED RESULTS: 6-10 phoenix qualifications per run (vs 0 in v11.0)
+- RATIONALE: v11.0 detected patterns correctly but scoring was miscalibrated
+  - Perfect phoenix (1.0 score) + average ML (50) = only 31 pts (missed 60 threshold)
+  - v11.1 fixes: same pattern now scores 65+ pts with proper multipliers
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -4335,6 +4338,8 @@ if __name__ == "__main__":
                 stocks_df.at[idx, 'position_size'] = sizing['position_size']
                 stocks_df.at[idx, 'shares'] = sizing['shares']
                 stocks_df.at[idx, 'risk_tier'] = sizing['risk_tier']
+
+            engine.history_mgr.save_db()
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
