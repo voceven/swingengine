@@ -3668,6 +3668,27 @@ class SwingTradingEngine:
         # Filter: only fetch what we don't have in cache
         to_fetch = [t for t in tickers if t not in cached_data and len(str(t)) < 8 and str(t) != 'nan']
 
+        # FIX: Prioritize validation tickers to ensure they're always fetched
+        # Even if we hit the 3000 limit, these tickers must be included
+        # Also add validation tickers even if not in flow_df (ensures price data exists)
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            # Add validation tickers that aren't in flow_df but need price data
+            missing_from_flow = [t for t in priority_tickers if t not in tickers and t not in cached_data]
+            if missing_from_flow:
+                print(f"  [FETCH] Adding validation tickers missing from flow data: {missing_from_flow}")
+                to_fetch = missing_from_flow + to_fetch
+
+            # Move priority tickers to front of list
+            priority_in_fetch = [t for t in priority_tickers if t in to_fetch]
+            other_tickers = [t for t in to_fetch if t not in priority_tickers]
+            to_fetch = priority_in_fetch + other_tickers
+            if priority_in_fetch:
+                print(f"  [FETCH] Prioritized {len(priority_in_fetch)} validation tickers: {priority_in_fetch}")
+
         # Limit downloads for performance
         max_fetch = PERFORMANCE_CONFIG.get('max_tickers_to_fetch', 3000)
         if len(to_fetch) > max_fetch:
@@ -3705,6 +3726,26 @@ class SwingTradingEngine:
 
         final_df = pd.merge(flow_df, tech_df, on='ticker', how='left')
         self.full_df = final_df[final_df['rsi'].notna()].fillna(0)
+
+        # FIX: Ensure validation tickers are in full_df even if missing from flow data
+        # This handles cases where LULU isn't in the daily bot-eod-report but we have price data
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            for ticker in priority_tickers:
+                if ticker not in self.full_df['ticker'].values and ticker in tech_df['ticker'].values:
+                    # Create synthetic row with price data only (no flow data)
+                    ticker_tech = tech_df[tech_df['ticker'] == ticker].iloc[0].to_dict()
+                    # Add default flow columns
+                    for col in self.full_df.columns:
+                        if col not in ticker_tech:
+                            ticker_tech[col] = 0
+                    ticker_tech['ticker'] = ticker
+                    self.full_df = pd.concat([self.full_df, pd.DataFrame([ticker_tech])], ignore_index=True)
+                    print(f"  [VALIDATION] Added {ticker} to candidate pool (price data only, no flow data)")
+
         return self.full_df
 
     def train_model(self, force_retrain=False):
