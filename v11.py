@@ -747,8 +747,12 @@ MACRO_WEIGHTS = {
 # Advanced volatility analysis for better regime detection
 # Reference: @alshfaw analysis - 1.26 is historically bearish for SPY
 # Key levels: 1.20 (warning), 1.26 (danger), 1.30 (extreme complacency)
+#
+# IMPORTANT: VIX30D = ^VIX (standard VIX index measures 30-day implied volatility)
+# We use ^VIX as the VIX30D proxy per @alshfaw's VIX3M/VIX30D term structure analysis
+# Yahoo Finance ticker: ^VIX (there is no separate ^VIX30D ticker)
 VIX_TERM_STRUCTURE_CONFIG = {
-    # Term Structure Detection (VIX3M / VIX ratio)
+    # Term Structure Detection (VIX3M / VIX30D ratio) - per @alshfaw methodology
     # Normal contango (1.00-1.10): Healthy market, neutral
     # Mild contango (1.10-1.20): Low vol environment, slightly bullish
     # EXTREME contango (>1.20): COMPLACENCY WARNING - historically precedes corrections
@@ -1329,15 +1333,15 @@ class SwingTradingEngine:
             elif vix_curr > 25 and vix_z < 1.0: regime = "High Vol (New Normal)"
             else: regime = "Neutral"
 
-            # Store Data
+            # Store Data (note: 'vix' key = VIX30D per @alshfaw terminology)
             self.macro_data = {
-                'vix': vix_curr, 'vix_z': vix_z,
+                'vix': vix_curr, 'vix_z': vix_z,  # vix = VIX30D (^VIX = 30-day implied vol)
                 'tnx': tnx_curr, 'tnx_z': tnx_z,
                 'dxy': dxy_curr, 'dxy_z': dxy_z,
                 'spy_trend': spy_curr > spy_series.iloc[-20],
                 'adjustment': macro_adjustment,
                 'regime_details': regime_details,
-                # v11.2 Phase 2: VIX Term Structure data
+                # v11.2 Phase 2: VIX Term Structure data (VIX3M/VIX30D ratio)
                 'vix3m': vix3m_curr,
                 'term_structure_ratio': term_structure_ratio,
                 'term_structure': term_structure,
@@ -1347,8 +1351,9 @@ class SwingTradingEngine:
             self.market_regime = regime
 
             # v11.2 Phase 2: Enhanced output with term structure
-            print(f"  [MACRO] VIX: {vix_curr:.2f} ({vix_z:+.1f}σ) | TNX: {tnx_curr:.2f}% ({tnx_z:+.1f}σ) | DXY: {dxy_curr:.2f} ({dxy_z:+.1f}σ)")
-            print(f"  [MACRO] VIX3M: {vix3m_curr:.2f} | Term Structure: {term_structure.upper()} ({term_structure_ratio:.2f}) | VVIX: {vvix_curr:.0f}")
+            # Note: VIX30D = ^VIX (standard VIX measures 30-day implied vol) per @alshfaw terminology
+            print(f"  [MACRO] VIX30D: {vix_curr:.2f} ({vix_z:+.1f}σ) | TNX: {tnx_curr:.2f}% ({tnx_z:+.1f}σ) | DXY: {dxy_curr:.2f} ({dxy_z:+.1f}σ)")
+            print(f"  [MACRO] VIX3M/VIX30D: {term_structure_ratio:.2f} | Structure: {term_structure.upper()} | VVIX: {vvix_curr:.0f}")
             print(f"  [MACRO] Regime: {regime} | Adjustment: {macro_adjustment:+.1f}")
             return regime
 
