@@ -273,6 +273,19 @@ Changelog v11.2 Phase 2 (VIX Term Structure + VVIX Divergence):
   - Example: "VIX3M: 22.50 | Term Structure: CONTANGO (1.08) | VVIX: 95"
 - CONFIG: VIX_TERM_STRUCTURE_CONFIG with tunable thresholds
 - EXPECTED RESULTS: Better regime-aware position sizing during vol regime shifts
+
+Changelog v11.2 Phase 2.1 (Extreme Contango Fix - @alshfaw Analysis):
+- CRITICAL FIX: Extreme contango (>1.20) is now BEARISH, not bullish
+  - Reference: @alshfaw analysis - 1.26 historically precedes SPY corrections
+  - 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024
+- NEW INTERPRETATION:
+  - Normal (0.95-1.10): Neutral, no adjustment
+  - Mild contango (1.10-1.20): Healthy low vol, +2 points
+  - EXTREME contango (>1.20): COMPLACENCY WARNING, -4 points
+  - Backwardation (<0.95): Fear/panic, -5 points
+- NEW REGIME: "Complacency (Extreme Contango)" when ratio > 1.20
+- CURRENT STATUS (Dec 2025): VIX3M/VIX at 1.26 = EXTREME CONTANGO (bearish)
+- EXPECTED: Score adjustment now -4.0 instead of +3.0 (7 point swing)
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -732,13 +745,20 @@ MACRO_WEIGHTS = {
 
 # --- PHASE 2: VIX TERM STRUCTURE + VVIX DIVERGENCE ---
 # Advanced volatility analysis for better regime detection
+# Reference: @alshfaw analysis - 1.26 is historically bearish for SPY
+# Key levels: 1.20 (warning), 1.26 (danger), 1.30 (extreme complacency)
 VIX_TERM_STRUCTURE_CONFIG = {
-    # Term Structure Detection
-    # Contango (normal): VIX3M > VIX (futures higher than spot) - bullish
-    # Backwardation (fear): VIX > VIX3M (spot higher than futures) - bearish
-    'contango_threshold': 1.05,       # VIX3M/VIX > 1.05 = strong contango (bullish)
-    'backwardation_threshold': 0.95,  # VIX3M/VIX < 0.95 = backwardation (bearish)
-    'contango_bonus': 3.0,            # +3 points in strong contango
+    # Term Structure Detection (VIX3M / VIX ratio)
+    # Normal contango (1.00-1.10): Healthy market, neutral
+    # Mild contango (1.10-1.20): Low vol environment, slightly bullish
+    # EXTREME contango (>1.20): COMPLACENCY WARNING - historically precedes corrections
+    #   - 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024 (@alshfaw)
+    # Backwardation (<0.95): Fear/panic, imminent vol spike expected
+    'mild_contango_threshold': 1.10,  # VIX3M/VIX 1.10-1.20 = healthy low vol
+    'extreme_contango_threshold': 1.20,  # VIX3M/VIX > 1.20 = COMPLACENCY (bearish warning)
+    'backwardation_threshold': 0.95,  # VIX3M/VIX < 0.95 = backwardation (fear)
+    'mild_contango_bonus': 2.0,       # +2 points in healthy contango (1.10-1.20)
+    'extreme_contango_penalty': 4.0,  # -4 points when > 1.20 (complacency trap)
     'backwardation_penalty': 5.0,     # -5 points in backwardation (fear)
 
     # VVIX Divergence Detection
@@ -1239,22 +1259,31 @@ class SwingTradingEngine:
             # =========================================================================
             # v11.2 Phase 2: VIX TERM STRUCTURE ANALYSIS
             # =========================================================================
-            # Contango (VIX3M > VIX): Normal state, futures pricing higher vol later
-            # Backwardation (VIX > VIX3M): Fear state, expecting imminent vol spike
+            # Key insight from @alshfaw: 1.26 is historically BEARISH for SPY
+            # Extreme contango (>1.20) = complacency trap, precedes corrections
+            # Mild contango (1.10-1.20) = healthy low vol environment
+            # Backwardation (<0.95) = fear/panic, imminent vol spike
             term_structure_ratio = vix3m_curr / vix_curr if vix_curr > 0 else 1.0
             ts_config = VIX_TERM_STRUCTURE_CONFIG
 
-            if term_structure_ratio > ts_config['contango_threshold']:
-                # Strong contango - bullish signal
+            if term_structure_ratio > ts_config['extreme_contango_threshold']:
+                # EXTREME contango (>1.20) - COMPLACENCY WARNING
+                # 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024
+                term_structure = 'extreme_contango'
+                macro_adjustment -= ts_config['extreme_contango_penalty']
+                regime_details.append(f"⚠️ EXTREME Contango ({term_structure_ratio:.2f}) - Complacency Risk")
+            elif term_structure_ratio > ts_config['mild_contango_threshold']:
+                # Mild contango (1.10-1.20) - healthy low vol
                 term_structure = 'contango'
-                macro_adjustment += ts_config['contango_bonus']
+                macro_adjustment += ts_config['mild_contango_bonus']
                 regime_details.append(f"Contango ({term_structure_ratio:.2f})")
             elif term_structure_ratio < ts_config['backwardation_threshold']:
-                # Backwardation - bearish/fear signal
+                # Backwardation (<0.95) - bearish/fear signal
                 term_structure = 'backwardation'
                 macro_adjustment -= ts_config['backwardation_penalty']
                 regime_details.append(f"⚠️ Backwardation ({term_structure_ratio:.2f})")
             else:
+                # Normal (0.95-1.10) - neutral
                 term_structure = 'neutral'
 
             # =========================================================================
@@ -1287,6 +1316,7 @@ class SwingTradingEngine:
             # 4. Define Regime Label
             if vix_z > 3.0: regime = "Crisis (Extreme Vol)"
             elif term_structure == 'backwardation' and vix_z > 1.0: regime = "Fear (Backwardation)"
+            elif term_structure == 'extreme_contango': regime = "Complacency (Extreme Contango)"
             elif tnx_z > 3.0: regime = "Rate Shock"
             elif spy_curr > spy_series.iloc[-20]: regime = "Bull Trend"
             elif vix_curr > 25 and vix_z < 1.0: regime = "High Vol (New Normal)"
