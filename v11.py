@@ -747,8 +747,12 @@ MACRO_WEIGHTS = {
 # Advanced volatility analysis for better regime detection
 # Reference: @alshfaw analysis - 1.26 is historically bearish for SPY
 # Key levels: 1.20 (warning), 1.26 (danger), 1.30 (extreme complacency)
+#
+# IMPORTANT: VIX30D = ^VIX (standard VIX index measures 30-day implied volatility)
+# We use ^VIX as the VIX30D proxy per @alshfaw's VIX3M/VIX30D term structure analysis
+# Yahoo Finance ticker: ^VIX (there is no separate ^VIX30D ticker)
 VIX_TERM_STRUCTURE_CONFIG = {
-    # Term Structure Detection (VIX3M / VIX ratio)
+    # Term Structure Detection (VIX3M / VIX30D ratio) - per @alshfaw methodology
     # Normal contango (1.00-1.10): Healthy market, neutral
     # Mild contango (1.10-1.20): Low vol environment, slightly bullish
     # EXTREME contango (>1.20): COMPLACENCY WARNING - historically precedes corrections
@@ -909,6 +913,11 @@ class HistoryManager:
         self.local_db_path = os.path.abspath("titan.db")
         self.drive_db_path = os.path.join(base_dir, "titan.db")
 
+        # Debug: Show paths being used
+        print(f"  [TITAN] Base dir: {base_dir}")
+        print(f"  [TITAN] Local DB: {self.local_db_path}")
+        print(f"  [TITAN] Drive DB: {self.drive_db_path}")
+
         # Database Setup
         if os.path.exists(self.drive_db_path):
             if os.path.abspath(self.drive_db_path) != self.local_db_path:
@@ -917,7 +926,7 @@ class HistoryManager:
             else:
                 print(f"  [TITAN] Database already in place.")
         else:
-            print(f"  [TITAN] Creating new database.")
+            print(f"  [TITAN] Creating new database (no existing DB at Drive path).")
 
         self.db = TitanDB(self.local_db_path)
         self.log_file = os.path.join(base_dir, "processed_files_log.txt")
@@ -938,7 +947,9 @@ class HistoryManager:
         try:
             if os.path.abspath(self.drive_db_path) != self.local_db_path:
                 shutil.copy(self.local_db_path, self.drive_db_path)
-                print(f"  [TITAN] Database persisted to Drive.")
+                print(f"  [TITAN] Database persisted to Drive: {self.drive_db_path}")
+            else:
+                print(f"  [TITAN] Local and Drive paths are same - no copy needed.")
         except Exception as e:
             print(f"  [!] Failed to save DB to Drive: {e}")
 
@@ -1322,15 +1333,15 @@ class SwingTradingEngine:
             elif vix_curr > 25 and vix_z < 1.0: regime = "High Vol (New Normal)"
             else: regime = "Neutral"
 
-            # Store Data
+            # Store Data (note: 'vix' key = VIX30D per @alshfaw terminology)
             self.macro_data = {
-                'vix': vix_curr, 'vix_z': vix_z,
+                'vix': vix_curr, 'vix_z': vix_z,  # vix = VIX30D (^VIX = 30-day implied vol)
                 'tnx': tnx_curr, 'tnx_z': tnx_z,
                 'dxy': dxy_curr, 'dxy_z': dxy_z,
                 'spy_trend': spy_curr > spy_series.iloc[-20],
                 'adjustment': macro_adjustment,
                 'regime_details': regime_details,
-                # v11.2 Phase 2: VIX Term Structure data
+                # v11.2 Phase 2: VIX Term Structure data (VIX3M/VIX30D ratio)
                 'vix3m': vix3m_curr,
                 'term_structure_ratio': term_structure_ratio,
                 'term_structure': term_structure,
@@ -1340,8 +1351,9 @@ class SwingTradingEngine:
             self.market_regime = regime
 
             # v11.2 Phase 2: Enhanced output with term structure
-            print(f"  [MACRO] VIX: {vix_curr:.2f} ({vix_z:+.1f}σ) | TNX: {tnx_curr:.2f}% ({tnx_z:+.1f}σ) | DXY: {dxy_curr:.2f} ({dxy_z:+.1f}σ)")
-            print(f"  [MACRO] VIX3M: {vix3m_curr:.2f} | Term Structure: {term_structure.upper()} ({term_structure_ratio:.2f}) | VVIX: {vvix_curr:.0f}")
+            # Note: VIX30D = ^VIX (standard VIX measures 30-day implied vol) per @alshfaw terminology
+            print(f"  [MACRO] VIX30D: {vix_curr:.2f} ({vix_z:+.1f}σ) | TNX: {tnx_curr:.2f}% ({tnx_z:+.1f}σ) | DXY: {dxy_curr:.2f} ({dxy_z:+.1f}σ)")
+            print(f"  [MACRO] VIX3M/VIX30D: {term_structure_ratio:.2f} | Structure: {term_structure.upper()} | VVIX: {vvix_curr:.0f}")
             print(f"  [MACRO] Regime: {regime} | Adjustment: {macro_adjustment:+.1f}")
             return regime
 
@@ -3661,6 +3673,27 @@ class SwingTradingEngine:
         # Filter: only fetch what we don't have in cache
         to_fetch = [t for t in tickers if t not in cached_data and len(str(t)) < 8 and str(t) != 'nan']
 
+        # FIX: Prioritize validation tickers to ensure they're always fetched
+        # Even if we hit the 3000 limit, these tickers must be included
+        # Also add validation tickers even if not in flow_df (ensures price data exists)
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            # Add validation tickers that aren't in flow_df but need price data
+            missing_from_flow = [t for t in priority_tickers if t not in tickers and t not in cached_data]
+            if missing_from_flow:
+                print(f"  [FETCH] Adding validation tickers missing from flow data: {missing_from_flow}")
+                to_fetch = missing_from_flow + to_fetch
+
+            # Move priority tickers to front of list
+            priority_in_fetch = [t for t in priority_tickers if t in to_fetch]
+            other_tickers = [t for t in to_fetch if t not in priority_tickers]
+            to_fetch = priority_in_fetch + other_tickers
+            if priority_in_fetch:
+                print(f"  [FETCH] Prioritized {len(priority_in_fetch)} validation tickers: {priority_in_fetch}")
+
         # Limit downloads for performance
         max_fetch = PERFORMANCE_CONFIG.get('max_tickers_to_fetch', 3000)
         if len(to_fetch) > max_fetch:
@@ -3698,6 +3731,26 @@ class SwingTradingEngine:
 
         final_df = pd.merge(flow_df, tech_df, on='ticker', how='left')
         self.full_df = final_df[final_df['rsi'].notna()].fillna(0)
+
+        # FIX: Ensure validation tickers are in full_df even if missing from flow data
+        # This handles cases where LULU isn't in the daily bot-eod-report but we have price data
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            for ticker in priority_tickers:
+                if ticker not in self.full_df['ticker'].values and ticker in tech_df['ticker'].values:
+                    # Create synthetic row with price data only (no flow data)
+                    ticker_tech = tech_df[tech_df['ticker'] == ticker].iloc[0].to_dict()
+                    # Add default flow columns
+                    for col in self.full_df.columns:
+                        if col not in ticker_tech:
+                            ticker_tech[col] = 0
+                    ticker_tech['ticker'] = ticker
+                    self.full_df = pd.concat([self.full_df, pd.DataFrame([ticker_tech])], ignore_index=True)
+                    print(f"  [VALIDATION] Added {ticker} to candidate pool (price data only, no flow data)")
+
         return self.full_df
 
     def train_model(self, force_retrain=False):
@@ -4505,9 +4558,12 @@ if __name__ == "__main__":
             if os.path.exists(full): return full
         return None
 
-    engine = SwingTradingEngine()
+    # FIX: Pass Google Drive path as base_dir for database persistence
+    # Without this, DB defaults to /content/ which is ephemeral in Colab
     data_dir = "/content/drive/My Drive/colab"
     if not os.path.exists(data_dir): data_dir = os.getcwd()
+
+    engine = SwingTradingEngine(base_dir=data_dir)
     engine.history_mgr.sync_history(engine, data_dir)
 
     today_str = datetime.now().strftime('%Y-%m-%d')
@@ -4543,7 +4599,8 @@ if __name__ == "__main__":
                 stocks_df.at[idx, 'shares'] = sizing['shares']
                 stocks_df.at[idx, 'risk_tier'] = sizing['risk_tier']
 
-            engine.history_mgr.save_db()
+            # NOTE: save_db() is called at the end of the main block, not here
+            # Calling it twice would close the connection prematurely
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
@@ -4792,7 +4849,9 @@ if __name__ == "__main__":
             except:
                 pass
 
-            # Persist DB
+            # Persist DB to Google Drive
             engine.history_mgr.save_db()
     else:
         print("[CRITICAL] Missing data files. Please ensure Unusual Whales data is in the expected location.")
+        # Still save DB even if data files missing (preserves any synced history)
+        engine.history_mgr.save_db()
