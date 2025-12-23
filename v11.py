@@ -909,6 +909,11 @@ class HistoryManager:
         self.local_db_path = os.path.abspath("titan.db")
         self.drive_db_path = os.path.join(base_dir, "titan.db")
 
+        # Debug: Show paths being used
+        print(f"  [TITAN] Base dir: {base_dir}")
+        print(f"  [TITAN] Local DB: {self.local_db_path}")
+        print(f"  [TITAN] Drive DB: {self.drive_db_path}")
+
         # Database Setup
         if os.path.exists(self.drive_db_path):
             if os.path.abspath(self.drive_db_path) != self.local_db_path:
@@ -917,7 +922,7 @@ class HistoryManager:
             else:
                 print(f"  [TITAN] Database already in place.")
         else:
-            print(f"  [TITAN] Creating new database.")
+            print(f"  [TITAN] Creating new database (no existing DB at Drive path).")
 
         self.db = TitanDB(self.local_db_path)
         self.log_file = os.path.join(base_dir, "processed_files_log.txt")
@@ -938,7 +943,9 @@ class HistoryManager:
         try:
             if os.path.abspath(self.drive_db_path) != self.local_db_path:
                 shutil.copy(self.local_db_path, self.drive_db_path)
-                print(f"  [TITAN] Database persisted to Drive.")
+                print(f"  [TITAN] Database persisted to Drive: {self.drive_db_path}")
+            else:
+                print(f"  [TITAN] Local and Drive paths are same - no copy needed.")
         except Exception as e:
             print(f"  [!] Failed to save DB to Drive: {e}")
 
@@ -4505,9 +4512,12 @@ if __name__ == "__main__":
             if os.path.exists(full): return full
         return None
 
-    engine = SwingTradingEngine()
+    # FIX: Pass Google Drive path as base_dir for database persistence
+    # Without this, DB defaults to /content/ which is ephemeral in Colab
     data_dir = "/content/drive/My Drive/colab"
     if not os.path.exists(data_dir): data_dir = os.getcwd()
+
+    engine = SwingTradingEngine(base_dir=data_dir)
     engine.history_mgr.sync_history(engine, data_dir)
 
     today_str = datetime.now().strftime('%Y-%m-%d')
@@ -4543,7 +4553,8 @@ if __name__ == "__main__":
                 stocks_df.at[idx, 'shares'] = sizing['shares']
                 stocks_df.at[idx, 'risk_tier'] = sizing['risk_tier']
 
-            engine.history_mgr.save_db()
+            # NOTE: save_db() is called at the end of the main block, not here
+            # Calling it twice would close the connection prematurely
 
             # --- MACRO CONTEXT HEADER ---
             print("\n" + "="*80)
@@ -4792,7 +4803,9 @@ if __name__ == "__main__":
             except:
                 pass
 
-            # Persist DB
+            # Persist DB to Google Drive
             engine.history_mgr.save_db()
     else:
         print("[CRITICAL] Missing data files. Please ensure Unusual Whales data is in the expected location.")
+        # Still save DB even if data files missing (preserves any synced history)
+        engine.history_mgr.save_db()
