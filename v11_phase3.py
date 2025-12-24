@@ -79,8 +79,12 @@ warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# --- ALL CONFIGURATION DICTS (from previous sections) ---
+# Copy all config dicts from the previous file here...
+# [Signature Prints, Volume Profile, Market Regime, VIX Term Structure, 
+#  Dual Ranking, Solidity, Phoenix, Sector Map, etc.]
+
 # --- PHASE 3: SIGNATURE PRINTS CONFIGURATION ---
-# Institutional block trade detection for smart money tracking
 SIGNATURE_PRINTS_CONFIG = {
     'min_print_size': 50_000_000,      # $50M+ = institutional signature
     'mega_print_size': 100_000_000,    # $100M+ = activist/mega-fund level
@@ -91,7 +95,6 @@ SIGNATURE_PRINTS_CONFIG = {
 }
 
 # --- PHASE 3: VOLUME PROFILE CONFIGURATION ---
-# Point of Control (POC) and Value Area analysis for institutional levels
 VOLUME_PROFILE_CONFIG = {
     'lookback_days': 60,               # Analyze last 60 days of volume
     'num_bins': 50,                    # Price bins for volume distribution
@@ -101,7 +104,6 @@ VOLUME_PROFILE_CONFIG = {
 }
 
 # --- PHASE 3: MARKET REGIME ENHANCEMENTS ---
-# Expanded regime states with VIX term structure (Phase 2) + new conditions
 MARKET_REGIME_CONFIG = {
     # Regime State Definitions (expanded from Phase 2)
     'regimes': {
@@ -195,6 +197,18 @@ SECTOR_MAP = {
     'Real Estate': 'XLRE', 'Utilities': 'XLU'
 }
 
+PERFORMANCE_CONFIG = {
+    'catboost_trials': 25,
+    'catboost_max_iterations': 500,
+    'catboost_max_depth': 10,
+    'catboost_cv_folds': 5,
+    'model_cache_days': 7,
+    'transformer_epochs': 30,
+    'max_tickers_to_fetch': 3000,
+    'price_cache_days': 7,
+    'batch_size': 75
+}
+
 # Device detection (GPU/TPU/CPU)
 def get_device():
     """Detect and return the best available device: TPU > GPU > CPU"""
@@ -218,63 +232,88 @@ def get_device():
 
 device, device_name = get_device()
 
-# --- PHASE 3: SIGNATURE PRINTS DETECTOR ---
+# --- UTILITY FUNCTIONS ---
+def sanitize_ticker_for_alpaca(ticker):
+    """Clean tickers for Alpaca (remove indices, zombies, warrants, fix BRK.B)."""
+    t = str(ticker).upper().strip()
+    if t.startswith('^'): return None
+    if '+' in t: return None
+    if len(t) > 1 and t[-1].isdigit(): return None
+    if t == 'BRK-B': return 'BRK.B'
+    if t == 'BRK-A': return 'BRK.A'
+    if '-' in t: return t.replace('-', '.')
+    return t
+
+def fetch_alpaca_batch(tickers, start_date, end_date=None):
+    """Fetches historical bars using the modern alpaca-py SDK."""
+    if not tickers: return {}
+    valid_map = {}
+    clean_batch = []
+    for t in tickers:
+        clean_t = sanitize_ticker_for_alpaca(t)
+        if clean_t:
+            valid_map[clean_t] = t
+            clean_batch.append(clean_t)
+    if not clean_batch: return {}
+    
+    chunk_size = 200
+    all_data = {}
+    for i in range(0, len(clean_batch), chunk_size):
+        chunk = clean_batch[i:i + chunk_size]
+        try:
+            request_params = StockBarsRequest(
+                symbol_or_symbols=chunk,
+                timeframe=TimeFrame.Day,
+                start=start_date,
+                end=end_date,
+                adjustment='raw'
+            )
+            bars = alpaca_client.get_stock_bars(request_params)
+            if not bars.data: continue
+            df_batch = bars.df.reset_index()
+            for symbol, group in df_batch.groupby('symbol'):
+                original_ticker = valid_map.get(symbol, symbol)
+                df_formatted = group.rename(columns={
+                    'open': 'Open', 'high': 'High', 'low': 'Low',
+                    'close': 'Close', 'volume': 'Volume', 'timestamp': 'Date'
+                })
+                df_formatted['Date'] = pd.to_datetime(df_formatted['Date']).dt.date
+                df_formatted = df_formatted.set_index('Date')
+                cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                all_data[original_ticker] = df_formatted[cols]
+        except Exception as e:
+            print(f"    [!] Alpaca batch error: {str(e)[:50]}...")
+    return all_data
+
+# --- PHASE 3 FUNCTIONS (from previous section) ---
+
 def detect_signature_prints(df, ticker=None):
-    """
-    Phase 3: Detect institutional signature block trades.
-    
-    Signature prints are unusually large single trades ($50M+) that indicate
-    major institutional positioning. These are different from aggregated dark pool
-    volume - they're discrete events where a whale made a move.
-    
-    Args:
-        df: DataFrame with options flow data
-        ticker: Optional - filter for specific ticker
-    
-    Returns:
-        Dict mapping ticker -> list of signature print events
-    """
+    """Phase 3: Detect institutional signature block trades."""
     signature_prints = {}
-    
     if df is None or df.empty:
         return signature_prints
-    
     try:
-        # Filter for ticker if specified
         if ticker:
             df = df[df['ticker'] == ticker]
-        
-        # Look for large premium trades (single trade > $50M)
         if 'premium' in df.columns and 'ticker' in df.columns:
             min_print = SIGNATURE_PRINTS_CONFIG['min_print_size']
             mega_print = SIGNATURE_PRINTS_CONFIG['mega_print_size']
             ultra_print = SIGNATURE_PRINTS_CONFIG['ultra_print_size']
-            
-            # Find signature prints
             signature_mask = df['premium'].abs() >= min_print
             if signature_mask.any():
                 signature_df = df[signature_mask].copy()
-                
-                # Group by ticker
                 for t in signature_df['ticker'].unique():
                     ticker_prints = signature_df[signature_df['ticker'] == t]
-                    
-                    # Sort by premium size (largest first)
                     ticker_prints = ticker_prints.sort_values('premium', ascending=False)
-                    
-                    # Store print events with metadata
                     prints_list = []
                     for _, row in ticker_prints.iterrows():
                         premium = row['premium']
-                        
-                        # Classify print size
                         if premium >= ultra_print:
-                            size_class = 'ULTRA'  # $500M+ (Elliott/Icahn level)
+                            size_class = 'ULTRA'
                         elif premium >= mega_print:
-                            size_class = 'MEGA'   # $100M+ (activist level)
+                            size_class = 'MEGA'
                         else:
-                            size_class = 'SIGNATURE'  # $50M+ (institutional)
-                        
+                            size_class = 'SIGNATURE'
                         print_event = {
                             'premium': premium,
                             'size_class': size_class,
@@ -283,37 +322,18 @@ def detect_signature_prints(df, ticker=None):
                             'strike': row.get('strike', None),
                         }
                         prints_list.append(print_event)
-                    
                     signature_prints[t] = prints_list
-        
-        # Log findings
         if signature_prints:
             print(f"\n[SIGNATURE PRINTS] Detected {len(signature_prints)} tickers with institutional prints:")
-            for t, prints in list(signature_prints.items())[:5]:  # Show first 5
+            for t, prints in list(signature_prints.items())[:5]:
                 largest = prints[0]
                 print(f"  {t}: {len(prints)} prints, largest=${largest['premium']/1e6:.1f}M ({largest['size_class']})")
-        
     except Exception as e:
         print(f"  [!] Signature print detection error: {str(e)[:80]}")
-    
     return signature_prints
 
-# --- PHASE 3: VOLUME PROFILE ANALYZER ---
 def calculate_volume_profile(history_df, current_price):
-    """
-    Phase 3: Calculate volume profile to find Point of Control (POC) and Value Area.
-    
-    Volume Profile shows where the most trading activity occurred over a period.
-    POC = price level with highest volume (institutional accumulation level)
-    Value Area = price range containing 70% of volume
-    
-    Args:
-        history_df: Price history with OHLCV
-        current_price: Current stock price
-    
-    Returns:
-        Dict with POC, Value Area, and scoring
-    """
+    """Phase 3: Calculate volume profile to find Point of Control (POC) and Value Area."""
     result = {
         'poc_price': None,
         'value_area_high': None,
@@ -323,132 +343,77 @@ def calculate_volume_profile(history_df, current_price):
         'volume_profile_score': 0.0,
         'explanation': ''
     }
-    
     if history_df is None or len(history_df) < 30:
         result['explanation'] = 'Insufficient data for volume profile'
         return result
-    
     try:
-        # Get lookback period
         lookback = min(len(history_df), VOLUME_PROFILE_CONFIG['lookback_days'])
         df = history_df.iloc[-lookback:].copy()
-        
-        # Extract price and volume
         close = df['Close']
         volume = df['Volume']
-        
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
         if isinstance(volume, pd.DataFrame):
             volume = volume.iloc[:, 0]
-        
-        # Create price bins
         num_bins = VOLUME_PROFILE_CONFIG['num_bins']
         price_min = close.min()
         price_max = close.max()
-        
-        # Bin prices and aggregate volume
         bins = np.linspace(price_min, price_max, num_bins)
         df['price_bin'] = pd.cut(close, bins=bins, labels=bins[:-1], include_lowest=True)
-        
-        # Aggregate volume by price bin
         volume_by_price = df.groupby('price_bin', observed=True)['Volume'].sum().sort_values(ascending=False)
-        
-        # Find POC (Point of Control) - price with highest volume
         poc_bin = float(volume_by_price.index[0])
         result['poc_price'] = poc_bin
-        
-        # Calculate Value Area (70% of total volume)
         total_volume = volume.sum()
         value_area_volume = total_volume * VOLUME_PROFILE_CONFIG['value_area_pct']
-        
-        # Find price range containing value area
-        # Start from POC and expand outward
         sorted_bins = volume_by_price.sort_index()
         cumulative_vol = 0
         value_area_bins = []
-        
-        # Expand from POC
         poc_idx = sorted_bins.index.get_loc(volume_by_price.index[0])
         value_area_bins.append(poc_idx)
         cumulative_vol += volume_by_price.iloc[0]
-        
-        # Expand up and down alternately
         lower_idx = poc_idx - 1
         upper_idx = poc_idx + 1
-        
         while cumulative_vol < value_area_volume:
-            # Try lower
             if lower_idx >= 0:
                 cumulative_vol += sorted_bins.iloc[lower_idx]
                 value_area_bins.append(lower_idx)
                 lower_idx -= 1
-            
             if cumulative_vol >= value_area_volume:
                 break
-            
-            # Try upper
             if upper_idx < len(sorted_bins):
                 cumulative_vol += sorted_bins.iloc[upper_idx]
                 value_area_bins.append(upper_idx)
                 upper_idx += 1
-            
-            # Safety break
             if lower_idx < 0 and upper_idx >= len(sorted_bins):
                 break
-        
-        # Get value area bounds
         value_area_prices = sorted_bins.iloc[value_area_bins].index.to_numpy()
         result['value_area_low'] = float(value_area_prices.min())
         result['value_area_high'] = float(value_area_prices.max())
-        
-        # Check proximity to POC
         poc_proximity = abs(current_price - poc_bin) / current_price
         result['at_poc'] = poc_proximity <= VOLUME_PROFILE_CONFIG['poc_proximity_pct']
-        
-        # Check if in value area
         result['in_value_area'] = (result['value_area_low'] <= current_price <= result['value_area_high'])
-        
-        # Scoring
         if result['at_poc']:
-            result['volume_profile_score'] = 1.0  # Perfect score if at POC
+            result['volume_profile_score'] = 1.0
         elif result['in_value_area']:
-            # Score based on proximity to POC within value area
             va_range = result['value_area_high'] - result['value_area_low']
             distance_from_poc = abs(current_price - poc_bin)
-            normalized_distance = distance_from_poc / (va_range / 2)  # 0-1 scale
-            result['volume_profile_score'] = max(0.5, 1.0 - normalized_distance * 0.5)  # 0.5-1.0
+            normalized_distance = distance_from_poc / (va_range / 2)
+            result['volume_profile_score'] = max(0.5, 1.0 - normalized_distance * 0.5)
         else:
             result['volume_profile_score'] = 0.0
-        
-        # Explanation
         if result['at_poc']:
             result['explanation'] = f"At POC ${poc_bin:.2f} (institutional level)"
         elif result['in_value_area']:
             result['explanation'] = f"In Value Area ${result['value_area_low']:.2f}-${result['value_area_high']:.2f}"
         else:
             result['explanation'] = f"Outside Value Area (POC ${poc_bin:.2f})"
-        
     except Exception as e:
         result['explanation'] = f'Volume profile error: {str(e)[:50]}'
-    
     return result
 
-# --- PHASE 3: ENHANCED MARKET REGIME ---
 def get_market_regime_phase3():
-    """
-    Phase 3: Enhanced market regime detection with expanded states.
-    
-    Builds on Phase 2 VIX term structure analysis and adds:
-    - More nuanced regime states
-    - Regime-specific threshold adjustments
-    - Better handling of extreme conditions
-    
-    Returns:
-        Tuple of (regime_name, macro_data, adjustments)
-    """
+    """Phase 3: Enhanced market regime detection with expanded states."""
     print("\n[REGIME PHASE 3] Enhanced Market Regime Detection...")
-    
     default_macro = {
         'vix': 20.0, 'tnx': 4.0, 'dxy': 100.0,
         'spy_trend': True, 'spy_return': 0.0,
@@ -457,36 +422,26 @@ def get_market_regime_phase3():
         'vvix': 90.0, 'vvix_divergence': 'none',
         'regime_adjustments': {}
     }
-    
     try:
-        # Fetch data (same as Phase 2)
         tickers = ['^VIX', '^VIX3M', '^VVIX', '^TNX', 'DX-Y.NYB', 'SPY']
         data = yf.download(tickers, period="1y", progress=False, threads=False)
-        
         if isinstance(data.columns, pd.MultiIndex):
             close_df = data.xs('Close', axis=1, level=0)
         else:
             close_df = data['Close'] if 'Close' in data.columns else data
-        
-        # Extract series
         vix_series = close_df['^VIX'].dropna()
         tnx_series = close_df['^TNX'].dropna()
         dxy_series = close_df['DX-Y.NYB'].dropna()
         spy_series = close_df['SPY'].dropna()
         vix3m_series = close_df['^VIX3M'].dropna() if '^VIX3M' in close_df.columns else None
         vvix_series = close_df['^VVIX'].dropna() if '^VVIX' in close_df.columns else None
-        
-        # Current values
         vix_curr = float(vix_series.iloc[-1])
         tnx_curr = float(tnx_series.iloc[-1])
         dxy_curr = float(dxy_series.iloc[-1])
         spy_curr = float(spy_series.iloc[-1])
         vix3m_curr = float(vix3m_series.iloc[-1]) if vix3m_series is not None and len(vix3m_series) > 0 else vix_curr * 1.1
         vvix_curr = float(vvix_series.iloc[-1]) if vvix_series is not None and len(vvix_series) > 0 else 90.0
-        
-        # Calculate Z-scores
-        window = 126  # 6 months
-        
+        window = 126
         def calculate_z_score(series, current_val):
             if len(series) < window:
                 return 0.0
@@ -495,15 +450,11 @@ def get_market_regime_phase3():
             if rolling_std == 0:
                 return 0.0
             return (current_val - rolling_mean) / rolling_std
-        
         vix_z = calculate_z_score(vix_series, vix_curr)
         tnx_z = calculate_z_score(tnx_series, tnx_curr)
         dxy_z = calculate_z_score(dxy_series, dxy_curr)
-        
-        # VIX Term Structure
         term_structure_ratio = vix3m_curr / vix_curr if vix_curr > 0 else 1.0
         ts_config = VIX_TERM_STRUCTURE_CONFIG
-        
         if term_structure_ratio > ts_config['extreme_contango_threshold']:
             term_structure = 'extreme_contango'
         elif term_structure_ratio > ts_config['mild_contango_threshold']:
@@ -512,88 +463,63 @@ def get_market_regime_phase3():
             term_structure = 'backwardation'
         else:
             term_structure = 'neutral'
-        
-        # VVIX Divergence
         vvix_divergence = 'none'
         if vvix_series is not None and len(vvix_series) >= ts_config['vvix_divergence_lookback']:
             lookback = ts_config['vvix_divergence_lookback']
             vvix_change = (vvix_series.iloc[-1] - vvix_series.iloc[-lookback]) / vvix_series.iloc[-lookback]
             vix_change = (vix_series.iloc[-1] - vix_series.iloc[-lookback]) / vix_series.iloc[-lookback]
-            
             if vvix_change > 0.05 and vix_change < -0.02:
                 vvix_divergence = 'bearish'
             elif vvix_change < -0.05 and vix_change > 0.02:
                 vvix_divergence = 'bullish'
-        
-        # --- REGIME DETECTION (Priority Order) ---
         regime = None
         macro_adjustment = 0
         regime_details = []
         regime_adjustments = {}
-        
-        # 1. CRISIS (highest priority)
         if vix_z > 3.0:
             regime = 'CRISIS'
             macro_adjustment = MARKET_REGIME_CONFIG['regimes']['CRISIS']['penalty']
             regime_details.append(f"CRISIS: VIX +{vix_z:.1f}σ")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['CRISIS']
-        
-        # 2. FEAR_BACKWARDATION
         elif term_structure == 'backwardation' and vix_z > 1.0:
             regime = 'FEAR_BACKWARDATION'
             macro_adjustment = MARKET_REGIME_CONFIG['regimes']['FEAR_BACKWARDATION']['penalty']
             regime_details.append(f"Fear/Backwardation ({term_structure_ratio:.2f})")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['FEAR_BACKWARDATION']
-        
-        # 3. EXTREME_CONTANGO (complacency trap)
         elif term_structure == 'extreme_contango':
             regime = 'EXTREME_CONTANGO'
             macro_adjustment = MARKET_REGIME_CONFIG['regimes']['EXTREME_CONTANGO']['penalty']
             regime_details.append(f"⚠️ Extreme Contango ({term_structure_ratio:.2f})")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['EXTREME_CONTANGO']
-        
-        # 4. RATE_SHOCK
         elif tnx_z > 3.0:
             regime = 'RATE_SHOCK'
             macro_adjustment = MARKET_REGIME_CONFIG['regimes']['RATE_SHOCK']['penalty']
             regime_details.append(f"Rate Shock: TNX +{tnx_z:.1f}σ")
-            regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['NEUTRAL']  # Use neutral adjustments
-        
-        # 5. BULL_TREND
+            regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['NEUTRAL']
         elif spy_curr > spy_series.iloc[-20] and vix_curr < 20:
             regime = 'BULL_TREND'
             macro_adjustment = MARKET_REGIME_CONFIG['regimes']['BULL_TREND']['bonus']
             regime_details.append("Bull Trend")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['BULL_TREND']
-        
-        # 6. HIGH_VOL_NEW_NORMAL
         elif vix_curr > 25 and abs(vix_z) < 1.0:
             regime = 'HIGH_VOL_NEW_NORMAL'
             macro_adjustment = 0
             regime_details.append(f"High Vol (New Normal)")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['NEUTRAL']
-        
-        # 7. NEUTRAL (default)
         else:
             regime = 'NEUTRAL'
             macro_adjustment = 0
             regime_details.append("Neutral/Mixed")
             regime_adjustments = MARKET_REGIME_CONFIG['regime_adjustments']['NEUTRAL']
-        
-        # Add VIX term structure detail
         if term_structure == 'contango':
             regime_details.append(f"Contango ({term_structure_ratio:.2f})")
             macro_adjustment += ts_config['mild_contango_bonus']
-        
-        # Add VVIX divergence warnings
         if vvix_divergence == 'bearish':
             regime_details.append("⚠️ VVIX Divergence")
             macro_adjustment -= ts_config['vvix_divergence_penalty']
         elif vvix_divergence == 'bullish':
             regime_details.append("VVIX Convergence")
             macro_adjustment += ts_config['vvix_convergence_bonus']
-        
-        # Store full macro data
         macro_data = {
             'vix': vix_curr, 'vix_z': vix_z,
             'tnx': tnx_curr, 'tnx_z': tnx_z,
@@ -609,40 +535,160 @@ def get_market_regime_phase3():
             'regime': regime,
             'regime_adjustments': regime_adjustments
         }
-        
-        # Log
         print(f"  [REGIME] {regime} | VIX: {vix_curr:.1f} ({vix_z:+.1f}σ) | Term: {term_structure_ratio:.2f} | Adj: {macro_adjustment:+.1f}")
         print(f"  [REGIME] Thresholds: Phoenix {regime_adjustments.get('phoenix_threshold', 0.55):.2f}, RSI Expand {regime_adjustments.get('rsi_expand', 0):+d}")
-        
         return regime, macro_data, regime_adjustments
-        
     except Exception as e:
         print(f"  [REGIME] Fetch failed: {str(e)[:80]}")
         return 'NEUTRAL', default_macro, MARKET_REGIME_CONFIG['regime_adjustments']['NEUTRAL']
 
+# --- NEURAL NETWORK: SwingTransformer ---
+class SwingTransformer(nn.Module):
+    def __init__(self, input_size, d_model=128, nhead=4, num_layers=3, output_size=1, dropout=0.1):
+        super(SwingTransformer, self).__init__()
+        self.embedding = nn.Linear(input_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 10, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc1 = nn.Linear(d_model, 64)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(64, output_size)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.embedding(x)
+        if x.size(1) <= self.pos_encoder.size(1):
+            x = x + self.pos_encoder[:, :x.size(1), :]
+        x = self.transformer_encoder(x)
+        x = x.mean(dim=1)
+        x = self.fc1(x)
+        x = self.relu(x)
+        out = self.fc2(x)
+        out = self.sigmoid(out)
+        return out
+
+# --- DATABASE: TitanDB ---
+class TitanDB:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+        self.init_db()
+
+    def init_db(self):
+        self.conn = sqlite3.connect(self.db_path)
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS flow_history (
+                ticker TEXT,
+                date TEXT,
+                net_gamma REAL,
+                authentic_gamma REAL,
+                net_delta REAL,
+                open_interest REAL,
+                adj_iv REAL,
+                equity_type TEXT,
+                PRIMARY KEY (ticker, date)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                ticker TEXT,
+                date TEXT,
+                close REAL,
+                atr REAL,
+                PRIMARY KEY (ticker, date)
+            )
+        ''')
+        self.conn.commit()
+
+    def upsert_flow(self, df):
+        if df.empty: return
+        cols = ['ticker', 'date', 'net_gamma', 'authentic_gamma', 'net_delta', 'open_interest', 'adj_iv', 'equity_type']
+        valid_df = df[cols].copy()
+        valid_df['date'] = valid_df['date'].astype(str)
+        valid_df.to_sql('temp_flow', self.conn, if_exists='replace', index=False)
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO flow_history (ticker, date, net_gamma, authentic_gamma, net_delta, open_interest, adj_iv, equity_type)
+            SELECT ticker, date, net_gamma, authentic_gamma, net_delta, open_interest, adj_iv, equity_type FROM temp_flow
+        ''')
+        cursor.execute('DROP TABLE temp_flow')
+        self.conn.commit()
+
+    def upsert_prices(self, df):
+        if df.empty: return
+        cols = ['ticker', 'date', 'close', 'atr']
+        valid_df = df[cols].copy()
+        valid_df['date'] = valid_df['date'].astype(str)
+        valid_df.to_sql('temp_price', self.conn, if_exists='replace', index=False)
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO price_history (ticker, date, close, atr)
+            SELECT ticker, date, close, atr FROM temp_price
+        ''')
+        cursor.execute('DROP TABLE temp_price')
+        self.conn.commit()
+
+    def get_history_df(self):
+        return pd.read_sql("SELECT * FROM flow_history", self.conn)
+
+    def get_price_df(self):
+        return pd.read_sql("SELECT * FROM price_history", self.conn)
+
+    def close(self):
+        if self.conn: self.conn.close()
+
+# --- HISTORY MANAGER ---
+class HistoryManager:
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.local_db_path = os.path.abspath("titan.db")
+        self.drive_db_path = os.path.join(base_dir, "titan.db")
+        print(f"  [TITAN] Base dir: {base_dir}")
+        print(f"  [TITAN] Local DB: {self.local_db_path}")
+        print(f"  [TITAN] Drive DB: {self.drive_db_path}")
+        if os.path.exists(self.drive_db_path):
+            if os.path.abspath(self.drive_db_path) != self.local_db_path:
+                shutil.copy(self.drive_db_path, self.local_db_path)
+                print(f"  [TITAN] Loaded existing database from Drive.")
+            else:
+                print(f"  [TITAN] Database already in place.")
+        else:
+            print(f"  [TITAN] Creating new database (no existing DB at Drive path).")
+        self.db = TitanDB(self.local_db_path)
+        self.log_file = os.path.join(base_dir, "processed_files_log.txt")
+        self.processed_files = self._load_log()
+
+    def _load_log(self):
+        if not os.path.exists(self.log_file): return set()
+        with open(self.log_file, 'r') as f:
+            return set(line.strip() for line in f)
+
+    def _update_log(self, filename):
+        with open(self.log_file, 'a') as f:
+            f.write(f"{filename}\n")
+        self.processed_files.add(filename)
+
+    def save_db(self):
+        self.db.close()
+        try:
+            if os.path.abspath(self.drive_db_path) != self.local_db_path:
+                shutil.copy(self.local_db_path, self.drive_db_path)
+                print(f"  [TITAN] Database persisted to Drive: {self.drive_db_path}")
+            else:
+                print(f"  [TITAN] Local and Drive paths are same - no copy needed.")
+        except Exception as e:
+            print(f"  [!] Failed to save DB to Drive: {e}")
+
 print("""
 ╔═══════════════════════════════════════════════════════════════╗
-║  SwingEngine v11 Phase 3 - COMPLETE WORKING VERSION         ║
+║  SwingEngine v11 Phase 3 - Part 2/3 COMPLETE                ║
 ║                                                               ║
-║  ✓ All Phase 1-2 Features (Dual Ranking, Solidity, VIX)    ║
-║  ✓ Phase 3 Signature Prints Detection                       ║
-║  ✓ Phase 3 Volume Profile Integration                       ║
-║  ✓ Phase 3 Enhanced Market Regime Logic                     ║
-║  ✓ Phase 3 52-Week High Momentum Filter                     ║
+║  ✓ TitanDB (SQLite backbone)                                ║
+║  ✓ HistoryManager (data persistence)                        ║
+║  ✓ SwingTransformer (Hive Mind neural network)              ║
+║  ✓ All Phase 3 functions loaded                             ║
 ║                                                               ║
-║  Ready for production backtesting!                           ║
+║  Next: Part 3 will add SwingTradingEngine class!            ║
 ╚═══════════════════════════════════════════════════════════════╝
-
-⚠️  IMPORTANT: Replace ALPACA_API_KEY and ALPACA_SECRET_KEY above ⚠️
-
-This file contains ALL necessary code from v11.py plus Phase 3 enhancements.
-You can run it standalone by simply updating your Alpaca credentials.
-
-To use:
-1. Update ALPACA_API_KEY and ALPACA_SECRET_KEY (lines 50-51)
-2. Place your Unusual Whales bot-eod-report-*.csv files in data folder
-3. Run the full engine
-
-Phase 3 adds sophisticated institutional tracking and regime awareness
-that should significantly improve LULU-like phoenix detection.
 """)
