@@ -24,13 +24,48 @@ NOTE: This is a SIDE-BY-SIDE implementation with v11.py
       Your original v11.py remains untouched for fallback.
 """
 
-# Import original v11.py as base (inherits all existing functionality)
+# ============================================================================
+# COLAB-COMPATIBLE PATH SETUP
+# ============================================================================
 import sys
 import os
 
-# Add models directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Detect if running in Colab
+try:
+    from google.colab import drive
+    COLAB_ENV = True
+    
+    # Mount Drive if not already mounted
+    if not os.path.exists('/content/drive'):
+        drive.mount('/content/drive')
+    
+    # Set base directory to your Drive folder
+    BASE_DIR = '/content/drive/MyDrive/SwingEngine'
+    
+    # Add models directory to path
+    models_path = os.path.join(BASE_DIR, 'models')
+    if models_path not in sys.path:
+        sys.path.insert(0, models_path)
+    
+    # Change to base directory
+    os.chdir(BASE_DIR)
+    
+    print(f"[COLAB] Running from: {BASE_DIR}")
+    
+except ImportError:
+    # Running locally
+    COLAB_ENV = False
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+    
+    models_path = os.path.join(BASE_DIR, 'models')
+    if models_path not in sys.path:
+        sys.path.insert(0, models_path)
+    
+    print(f"[LOCAL] Running from: {BASE_DIR}")
 
+# ============================================================================
+# IMPORTS
+# ============================================================================
 from models.tcn import TemporalCNN
 from models.tabnet_model import TabNetModel
 
@@ -48,7 +83,6 @@ import pandas as pd
 # Note: All other functionality (HistoryManager, TitanDB, etc.) is imported
 # from your existing v11.py. This file ONLY modifies the ML ensemble.
 
-# We'll create a minimal version that focuses on Phase 3 changes
 print("""
 ================================================================================
 GRANDMASTER ENGINE v11 - PHASE 3: ML ENSEMBLE DIVERSITY
