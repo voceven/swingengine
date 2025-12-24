@@ -843,12 +843,12 @@ def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5
     Now: "Would a trade with ATR-based TP/SL have won?"
 
     Args:
-        price_df: DataFrame with columns [ticker, date, close, high, low]
+        price_df: DataFrame with columns [ticker, date, close, atr] (minimal schema)
         tickers: List of tickers to label
         holding_period: Max days to hold (vertical barrier)
         pt_multiplier: Take-profit = ATR * multiplier
         sl_multiplier: Stop-loss = ATR * multiplier
-        vol_lookback: Days for ATR calculation
+        vol_lookback: Days for ATR calculation (used if 'atr' not in df)
 
     Returns:
         DataFrame with [ticker, date, label, barrier_hit]
@@ -860,29 +860,30 @@ def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5
     price_df = price_df.copy()
     price_df['date'] = pd.to_datetime(price_df['date'])
 
+    # Check if ATR is pre-calculated or needs calculation
+    has_atr = 'atr' in price_df.columns
+    has_high_low = 'high' in price_df.columns and 'low' in price_df.columns
+
     for ticker in tickers:
         ticker_data = price_df[price_df['ticker'] == ticker].sort_values('date').reset_index(drop=True)
 
         if len(ticker_data) < vol_lookback + holding_period + 1:
             continue
 
-        # Calculate ATR for volatility-based barriers
-        ticker_data['tr'] = np.maximum(
-            ticker_data['high'] - ticker_data['low'],
-            np.maximum(
-                abs(ticker_data['high'] - ticker_data['close'].shift(1)),
-                abs(ticker_data['low'] - ticker_data['close'].shift(1))
-            )
-        )
-        ticker_data['atr'] = ticker_data['tr'].rolling(vol_lookback).mean()
+        # Use pre-calculated ATR if available, otherwise estimate from close
+        if has_atr and ticker_data['atr'].notna().any():
+            ticker_data['atr_use'] = ticker_data['atr']
+        else:
+            # Estimate ATR from close price changes
+            ticker_data['atr_use'] = ticker_data['close'].pct_change().abs().rolling(vol_lookback).mean() * ticker_data['close']
 
         # Generate labels for each potential entry point
         for i in range(vol_lookback, len(ticker_data) - holding_period):
             entry_date = ticker_data.loc[i, 'date']
             entry_price = ticker_data.loc[i, 'close']
-            atr = ticker_data.loc[i, 'atr']
+            atr = ticker_data.loc[i, 'atr_use']
 
-            if pd.isna(atr) or atr <= 0:
+            if pd.isna(atr) or atr <= 0 or pd.isna(entry_price):
                 continue
 
             # Set barriers
@@ -896,12 +897,15 @@ def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5
             sl_hit = None
 
             for j, row in future_slice.iterrows():
-                # Check if high touched take-profit
-                if row['high'] >= take_profit and tp_hit is None:
-                    tp_hit = j - i  # Days to TP
-                # Check if low touched stop-loss
-                if row['low'] <= stop_loss and sl_hit is None:
-                    sl_hit = j - i  # Days to SL
+                close_price = row['close']
+                if pd.isna(close_price):
+                    continue
+                # Approximate barrier touches using close price
+                # (Conservative: may miss intraday touches, but works with limited data)
+                if close_price >= take_profit and tp_hit is None:
+                    tp_hit = j - i
+                if close_price <= stop_loss and sl_hit is None:
+                    sl_hit = j - i
 
             # Determine label based on which barrier hit first
             if tp_hit is not None and (sl_hit is None or tp_hit <= sl_hit):
@@ -913,7 +917,7 @@ def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5
             else:
                 # Time expired - label by final return
                 final_price = future_slice['close'].iloc[-1] if len(future_slice) > 0 else entry_price
-                final_return = (final_price - entry_price) / entry_price
+                final_return = (final_price - entry_price) / entry_price if entry_price > 0 else 0
                 label = 1 if final_return > 0.01 else (-1 if final_return < -0.01 else 0)
                 barrier_hit = 'TIME'
 
@@ -937,7 +941,7 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
     actual temporal sequences showing how features evolved over time.
 
     Args:
-        price_df: DataFrame with [ticker, date, close, high, low, volume]
+        price_df: DataFrame with [ticker, date, close, atr] (minimal schema)
         feature_df: DataFrame with [ticker, ...features...] (current features)
         tickers: List of tickers
         seq_len: Sequence length (days of history per sample)
@@ -955,24 +959,18 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
     price_df = price_df.copy()
     price_df['date'] = pd.to_datetime(price_df['date'])
 
-    # Default features from price data
-    if feature_cols is None:
-        feature_cols = ['close', 'volume', 'rsi', 'volatility']
-
-    # Calculate technical features from price history
+    # Calculate technical features from price history (close-only features)
     for ticker in tickers:
         ticker_prices = price_df[price_df['ticker'] == ticker].sort_values('date').reset_index(drop=True)
 
         if len(ticker_prices) < seq_len + 6:  # Need seq_len + lookahead
             continue
 
-        # Calculate features from price data
+        # Calculate features from close price only (works with minimal price_history schema)
         ticker_prices['returns'] = ticker_prices['close'].pct_change()
         ticker_prices['volatility'] = ticker_prices['returns'].rolling(10).std()
-        ticker_prices['volume_ma'] = ticker_prices['volume'].rolling(10).mean()
-        ticker_prices['volume_ratio'] = ticker_prices['volume'] / (ticker_prices['volume_ma'] + 1)
 
-        # RSI calculation
+        # RSI calculation from close
         delta = ticker_prices['close'].diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -983,8 +981,16 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
         ticker_prices['momentum_5d'] = ticker_prices['close'].pct_change(5)
         ticker_prices['momentum_10d'] = ticker_prices['close'].pct_change(10)
 
+        # Use ATR if available, otherwise estimate from volatility
+        if 'atr' in ticker_prices.columns and ticker_prices['atr'].notna().any():
+            ticker_prices['atr_norm'] = ticker_prices['atr'] / ticker_prices['close']
+        else:
+            ticker_prices['atr_norm'] = ticker_prices['volatility'] * np.sqrt(10)  # Approximate
+
+        # Features: returns, volatility, RSI, momentum (no volume - not in price_history)
+        tcn_features = ['returns', 'volatility', 'rsi', 'momentum_5d', 'momentum_10d', 'atr_norm']
+
         # Normalize features
-        tcn_features = ['returns', 'volatility', 'volume_ratio', 'rsi', 'momentum_5d', 'momentum_10d']
         for col in tcn_features:
             if col in ticker_prices.columns:
                 mean = ticker_prices[col].mean()
@@ -4079,6 +4085,10 @@ class SwingTradingEngine:
 
         if should_use_cache:
             try:
+                # Set up device for TCN loading
+                import torch
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
                 # Load CatBoost (required)
                 catboost_cache = joblib.load(self.catboost_path)
                 self.catboost_model = catboost_cache['model']
@@ -4524,21 +4534,24 @@ class SwingTradingEngine:
                             tcn_preds.append(0.5)  # Default if no data
                             continue
 
-                        # Calculate temporal features
+                        # Calculate temporal features (close-only, no volume in price_history)
                         ticker_prices = ticker_prices.copy()
                         ticker_prices['returns'] = ticker_prices['close'].pct_change()
                         ticker_prices['volatility'] = ticker_prices['returns'].rolling(10).std()
-                        ticker_prices['volume_ma'] = ticker_prices['volume'].rolling(10).mean()
-                        ticker_prices['volume_ratio'] = ticker_prices['volume'] / (ticker_prices['volume_ma'] + 1)
                         delta = ticker_prices['close'].diff()
                         gain = delta.where(delta > 0, 0).rolling(14).mean()
                         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                         ticker_prices['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-10)))
                         ticker_prices['momentum_5d'] = ticker_prices['close'].pct_change(5)
                         ticker_prices['momentum_10d'] = ticker_prices['close'].pct_change(10)
+                        # Use ATR if available, otherwise estimate
+                        if 'atr' in ticker_prices.columns and ticker_prices['atr'].notna().any():
+                            ticker_prices['atr_norm'] = ticker_prices['atr'] / ticker_prices['close']
+                        else:
+                            ticker_prices['atr_norm'] = ticker_prices['volatility'] * np.sqrt(10)
 
-                        # Normalize and get sequence
-                        tcn_features = ['returns', 'volatility', 'volume_ratio', 'rsi', 'momentum_5d', 'momentum_10d']
+                        # Features must match training: returns, volatility, rsi, momentum, atr_norm
+                        tcn_features = ['returns', 'volatility', 'rsi', 'momentum_5d', 'momentum_10d', 'atr_norm']
                         seq_data = ticker_prices[tcn_features].tail(seq_len).values
                         if seq_data.shape[0] < seq_len or np.isnan(seq_data).any():
                             tcn_preds.append(0.5)
