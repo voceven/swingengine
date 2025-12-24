@@ -10,8 +10,8 @@ Original file is located at
 # -*- coding: utf-8 -*-
 """SwingEngine_v11_Grandmaster.py
 
-Swing Trading Engine - Version 11.3 (Grandmaster) - Phase 3: ML Ensemble Overhaul
-Phase 11.3: Dual-Ranking + Solidity Gate + Momentum Filter + VIX Term Structure + Diverse Ensemble
+Swing Trading Engine - Version 11.4 (Grandmaster) - Phase 4: Feature Engineering
+Phase 11.4: Triple-Barrier Labels + Real TCN Sequences + Enhanced Training
 
 Architecture:
 1. BACKBONE: SQLite Database (Scalable History).
@@ -89,6 +89,19 @@ Changelog v11.3 (Phase 3: ML Ensemble Overhaul - Architectural Diversity):
 - LOGGING: Detailed model weights and individual AUC scores for transparency
 - Expected runtime: 34min → 18-22min with GPU (first run trains all 3, subsequent runs load cache)
 - Expected AUC: 0.92 → 0.95+ with ensemble stacking
+
+Changelog v11.4 (Phase 4: Feature Engineering - Triple-Barrier + TCN Fix):
+- LABELS: Triple-Barrier Labeling replaces simple binary labels for realistic trade outcomes
+  - TP barrier: 1.5x ATR take-profit target
+  - SL barrier: 1.0x ATR stop-loss level
+  - TIME barrier: 5-day holding period max
+  - Labels reflect which barrier was hit first (TP=win, SL=loss)
+- TCN FIX: Real temporal sequences replace fake repeated snapshots
+  - Previous bug: Same feature vector repeated N times (no temporal info)
+  - Now: Actual day-by-day feature evolution (returns, volatility, RSI, momentum)
+  - Features: returns, volatility, volume_ratio, rsi, momentum_5d, momentum_10d
+- INFERENCE: TCN generates per-ticker sequences from price history
+- TARGET AUC: 0.92 → 0.94+ with proper labeling and real sequences
 
 Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
 - PHOENIX EXTENDED: Base duration extended from 250 days → 730 days (24 months)
@@ -818,6 +831,192 @@ RISK_TIER_MATRIX = {
         # >6% = high vol
     }
 }
+
+# --- PHASE 4: TRIPLE-BARRIER LABELING ---
+# Better training targets that reflect realistic trade outcomes
+# Based on Lopez de Prado's research: labels should match trading reality
+def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5, sl_multiplier=1.0, vol_lookback=20):
+    """
+    Generate triple-barrier labels for realistic trade outcome prediction.
+
+    Instead of: "Did price go up 2% in 5 days?" (ignores stop-loss)
+    Now: "Would a trade with ATR-based TP/SL have won?"
+
+    Args:
+        price_df: DataFrame with columns [ticker, date, close, high, low]
+        tickers: List of tickers to label
+        holding_period: Max days to hold (vertical barrier)
+        pt_multiplier: Take-profit = ATR * multiplier
+        sl_multiplier: Stop-loss = ATR * multiplier
+        vol_lookback: Days for ATR calculation
+
+    Returns:
+        DataFrame with [ticker, date, label, barrier_hit]
+        label: 1 (TP hit), -1 (SL hit), 0 (time expired neutral)
+    """
+    results = []
+
+    # Ensure date is datetime
+    price_df = price_df.copy()
+    price_df['date'] = pd.to_datetime(price_df['date'])
+
+    for ticker in tickers:
+        ticker_data = price_df[price_df['ticker'] == ticker].sort_values('date').reset_index(drop=True)
+
+        if len(ticker_data) < vol_lookback + holding_period + 1:
+            continue
+
+        # Calculate ATR for volatility-based barriers
+        ticker_data['tr'] = np.maximum(
+            ticker_data['high'] - ticker_data['low'],
+            np.maximum(
+                abs(ticker_data['high'] - ticker_data['close'].shift(1)),
+                abs(ticker_data['low'] - ticker_data['close'].shift(1))
+            )
+        )
+        ticker_data['atr'] = ticker_data['tr'].rolling(vol_lookback).mean()
+
+        # Generate labels for each potential entry point
+        for i in range(vol_lookback, len(ticker_data) - holding_period):
+            entry_date = ticker_data.loc[i, 'date']
+            entry_price = ticker_data.loc[i, 'close']
+            atr = ticker_data.loc[i, 'atr']
+
+            if pd.isna(atr) or atr <= 0:
+                continue
+
+            # Set barriers
+            take_profit = entry_price + (atr * pt_multiplier)
+            stop_loss = entry_price - (atr * sl_multiplier)
+
+            # Check future prices within holding period
+            future_slice = ticker_data.loc[i+1:i+holding_period]
+
+            tp_hit = None
+            sl_hit = None
+
+            for j, row in future_slice.iterrows():
+                # Check if high touched take-profit
+                if row['high'] >= take_profit and tp_hit is None:
+                    tp_hit = j - i  # Days to TP
+                # Check if low touched stop-loss
+                if row['low'] <= stop_loss and sl_hit is None:
+                    sl_hit = j - i  # Days to SL
+
+            # Determine label based on which barrier hit first
+            if tp_hit is not None and (sl_hit is None or tp_hit <= sl_hit):
+                label = 1
+                barrier_hit = 'TP'
+            elif sl_hit is not None:
+                label = -1
+                barrier_hit = 'SL'
+            else:
+                # Time expired - label by final return
+                final_price = future_slice['close'].iloc[-1] if len(future_slice) > 0 else entry_price
+                final_return = (final_price - entry_price) / entry_price
+                label = 1 if final_return > 0.01 else (-1 if final_return < -0.01 else 0)
+                barrier_hit = 'TIME'
+
+            results.append({
+                'ticker': ticker,
+                'date': entry_date,
+                'label': label,
+                'barrier_hit': barrier_hit,
+                'entry_price': entry_price,
+                'atr': atr
+            })
+
+    return pd.DataFrame(results)
+
+
+def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_cols=None):
+    """
+    Prepare real sequential data for TCN training.
+
+    Unlike the fake sequences (repeating same data N times), this creates
+    actual temporal sequences showing how features evolved over time.
+
+    Args:
+        price_df: DataFrame with [ticker, date, close, high, low, volume]
+        feature_df: DataFrame with [ticker, ...features...] (current features)
+        tickers: List of tickers
+        seq_len: Sequence length (days of history per sample)
+        feature_cols: List of feature columns to use
+
+    Returns:
+        X_seq: np.array of shape (n_samples, seq_len, n_features)
+        y_seq: np.array of labels
+        ticker_list: List of tickers for each sample
+    """
+    sequences = []
+    labels = []
+    ticker_list = []
+
+    price_df = price_df.copy()
+    price_df['date'] = pd.to_datetime(price_df['date'])
+
+    # Default features from price data
+    if feature_cols is None:
+        feature_cols = ['close', 'volume', 'rsi', 'volatility']
+
+    # Calculate technical features from price history
+    for ticker in tickers:
+        ticker_prices = price_df[price_df['ticker'] == ticker].sort_values('date').reset_index(drop=True)
+
+        if len(ticker_prices) < seq_len + 6:  # Need seq_len + lookahead
+            continue
+
+        # Calculate features from price data
+        ticker_prices['returns'] = ticker_prices['close'].pct_change()
+        ticker_prices['volatility'] = ticker_prices['returns'].rolling(10).std()
+        ticker_prices['volume_ma'] = ticker_prices['volume'].rolling(10).mean()
+        ticker_prices['volume_ratio'] = ticker_prices['volume'] / (ticker_prices['volume_ma'] + 1)
+
+        # RSI calculation
+        delta = ticker_prices['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / (loss + 1e-10)
+        ticker_prices['rsi'] = 100 - (100 / (1 + rs))
+
+        # Momentum features
+        ticker_prices['momentum_5d'] = ticker_prices['close'].pct_change(5)
+        ticker_prices['momentum_10d'] = ticker_prices['close'].pct_change(10)
+
+        # Normalize features
+        tcn_features = ['returns', 'volatility', 'volume_ratio', 'rsi', 'momentum_5d', 'momentum_10d']
+        for col in tcn_features:
+            if col in ticker_prices.columns:
+                mean = ticker_prices[col].mean()
+                std = ticker_prices[col].std() + 1e-10
+                ticker_prices[col] = (ticker_prices[col] - mean) / std
+
+        # Create sequences
+        for i in range(20, len(ticker_prices) - seq_len - 5):  # Start after warmup
+            seq_data = ticker_prices.loc[i:i+seq_len-1, tcn_features].values
+
+            if seq_data.shape[0] != seq_len or np.isnan(seq_data).any():
+                continue
+
+            # Label: 5-day forward return
+            future_price = ticker_prices.loc[i+seq_len+4, 'close'] if i+seq_len+4 < len(ticker_prices) else None
+            current_price = ticker_prices.loc[i+seq_len-1, 'close']
+
+            if future_price is None or current_price <= 0:
+                continue
+
+            forward_return = (future_price - current_price) / current_price
+            label = 1 if forward_return > 0.02 else 0
+
+            sequences.append(seq_data)
+            labels.append(label)
+            ticker_list.append(ticker)
+
+    if not sequences:
+        return None, None, None
+
+    return np.array(sequences), np.array(labels), ticker_list
+
 
 # --- NEURAL NETWORK ARCHITECTURE (TRANSFORMER v2) ---
 class SwingTransformer(nn.Module):
@@ -3892,11 +4091,12 @@ class SwingTradingEngine:
                     tabnet_cache = joblib.load(self.tabnet_path)
                     self.tabnet_model = tabnet_cache['model']
 
-                # Load TCN (optional) - reconstruct model and load state dict
+                # Load TCN (optional) - reconstruct model and load state dict with seq params
                 if os.path.exists(self.tcn_path):
                     tcn_cache = torch.load(self.tcn_path, map_location=device)
-                    input_size = tcn_cache.get('input_size', len(self.features_list))
-                    self.tcn_model = TCN(input_size=input_size, num_channels=[32, 32, 16]).to(device)
+                    self.tcn_n_features = tcn_cache.get('input_size', 6)
+                    self.tcn_seq_len = tcn_cache.get('seq_len', 10)
+                    self.tcn_model = TCN(input_size=self.tcn_n_features, num_channels=[32, 32, 16]).to(device)
                     self.tcn_model.load_state_dict(tcn_cache['model_state'])
                     self.tcn_model.eval()
 
@@ -3917,11 +4117,60 @@ class SwingTradingEngine:
             except Exception as e:
                 print(f"  [!] Cache load failed ({e}), Training from scratch...")
 
-        # --- PREPARE DATA ---
+        # --- PREPARE DATA WITH TRIPLE-BARRIER LABELS ---
         print("\n[3/4] Training Diverse Ensemble (CatBoost + TabNet + TCN + ElasticNet)...")
-        if 'lagged_return_5d' not in self.full_df.columns:
-            self.full_df['lagged_return_5d'] = 0.0
-        self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
+
+        # Phase 4: Triple-Barrier Labeling for realistic trade outcomes
+        use_triple_barrier = True
+        try:
+            price_df = self.history_mgr.db.get_price_df()
+            if not price_df.empty and 'ticker' in self.full_df.columns:
+                tickers = self.full_df['ticker'].unique().tolist()
+                print(f"  [LABELS] Generating Triple-Barrier labels for {len(tickers)} tickers...")
+
+                # Generate triple-barrier labels
+                tb_labels = triple_barrier_labels(
+                    price_df, tickers,
+                    holding_period=5,
+                    pt_multiplier=1.5,  # TP at 1.5x ATR
+                    sl_multiplier=1.0,  # SL at 1.0x ATR
+                    vol_lookback=20
+                )
+
+                if not tb_labels.empty:
+                    # Get latest label per ticker for current training
+                    latest_labels = tb_labels.sort_values('date').groupby('ticker').last().reset_index()
+                    # Convert -1 labels to 0 for binary classification
+                    latest_labels['target'] = (latest_labels['label'] == 1).astype(int)
+
+                    # Merge with full_df
+                    self.full_df = self.full_df.merge(
+                        latest_labels[['ticker', 'target']],
+                        on='ticker',
+                        how='left',
+                        suffixes=('_old', '')
+                    )
+                    self.full_df['target'] = self.full_df['target'].fillna(0).astype(int)
+
+                    # Stats
+                    tp_pct = (tb_labels['barrier_hit'] == 'TP').mean() * 100
+                    sl_pct = (tb_labels['barrier_hit'] == 'SL').mean() * 100
+                    time_pct = (tb_labels['barrier_hit'] == 'TIME').mean() * 100
+                    print(f"  [LABELS] Triple-Barrier stats: TP={tp_pct:.1f}% SL={sl_pct:.1f}% TIME={time_pct:.1f}%")
+                else:
+                    use_triple_barrier = False
+            else:
+                use_triple_barrier = False
+        except Exception as e:
+            print(f"  [!] Triple-Barrier labeling failed ({e}), using fallback")
+            use_triple_barrier = False
+
+        # Fallback to simple binary labels
+        if not use_triple_barrier:
+            print(f"  [LABELS] Using simple 5-day return labels (fallback)")
+            if 'lagged_return_5d' not in self.full_df.columns:
+                self.full_df['lagged_return_5d'] = 0.0
+            self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
 
         if self.full_df['target'].nunique() < 2: return
 
@@ -4043,26 +4292,53 @@ class SwingTradingEngine:
             print(f"  [TABNET] Not available, skipping (install: pip install pytorch-tabnet)")
 
         # 3. TCN (Temporal CNN for sequential patterns) - replaces XGBoost
+        # FIXED: Now uses REAL sequential data instead of fake repeated snapshots
         tcn_auc = 0.0
-        print(f"  [TCN] Training temporal convolutional network...")
+        self.tcn_seq_len = 10  # Store for inference
+        self.tcn_n_features = 6  # 6 temporal features
+        print(f"  [TCN] Training temporal convolutional network with REAL sequences...")
         try:
             device = torch.device('cuda' if has_gpu else 'cpu')
-            # TCN needs sequential data - reshape features as time series
-            # Use sliding window to create sequences (each sample = 10-step sequence)
-            seq_len = min(10, len(X_scaled) // 100)  # Adaptive sequence length
-            n_features = X_scaled.shape[1]
 
-            # Create sequential dataset from features (simulate temporal patterns)
-            X_seq = torch.FloatTensor(X_scaled).unsqueeze(1).repeat(1, seq_len, 1)
-            y_tensor = torch.FloatTensor(y.values if hasattr(y, 'values') else y).unsqueeze(1)
+            # Get price data for real sequence generation
+            price_df = self.history_mgr.db.get_price_df()
+            if price_df.empty:
+                raise ValueError("No price data available for TCN sequences")
+
+            # Get tickers from current data
+            tickers = self.full_df['ticker'].unique().tolist() if 'ticker' in self.full_df.columns else []
+            if not tickers:
+                raise ValueError("No tickers available for TCN sequences")
+
+            # Generate REAL sequential data (not fake repeated snapshots)
+            print(f"  [TCN] Building temporal sequences for {len(tickers)} tickers...")
+            X_seq_np, y_seq_np, tcn_tickers = prepare_tcn_sequences(
+                price_df, self.full_df, tickers,
+                seq_len=self.tcn_seq_len
+            )
+
+            if X_seq_np is None or len(X_seq_np) < 100:
+                raise ValueError(f"Insufficient sequence data: {len(X_seq_np) if X_seq_np is not None else 0} samples")
+
+            print(f"  [TCN] Created {len(X_seq_np)} real sequences (shape: {X_seq_np.shape})")
+            self.tcn_n_features = X_seq_np.shape[2]
+
+            # Convert to tensors
+            X_seq = torch.FloatTensor(X_seq_np)
+            y_tensor = torch.FloatTensor(y_seq_np).unsqueeze(1)
 
             # Train/val split
             split_idx = int(len(X_seq) * 0.8)
             X_train_tcn, X_val_tcn = X_seq[:split_idx], X_seq[split_idx:]
             y_train_tcn, y_val_tcn = y_tensor[:split_idx], y_tensor[split_idx:]
 
-            # Initialize TCN model
-            self.tcn_model = TCN(input_size=n_features, num_channels=[32, 32, 16], kernel_size=3, dropout=0.2).to(device)
+            # Initialize TCN model with correct feature size
+            self.tcn_model = TCN(
+                input_size=self.tcn_n_features,
+                num_channels=[32, 32, 16],
+                kernel_size=3,
+                dropout=0.2
+            ).to(device)
             optimizer = torch.optim.Adam(self.tcn_model.parameters(), lr=0.001)
             criterion = nn.BCELoss()
 
@@ -4092,7 +4368,7 @@ class SwingTradingEngine:
             with torch.no_grad():
                 tcn_preds = self.tcn_model(X_val_tcn.to(device)).cpu().numpy().flatten()
             tcn_auc = roc_auc_score(y_val_tcn.numpy().flatten(), tcn_preds)
-            print(f"  [TCN] AUC: {tcn_auc:.4f} (temporal pattern detection)")
+            print(f"  [TCN] AUC: {tcn_auc:.4f} (real temporal pattern detection)")
         except Exception as e:
             print(f"  [!] TCN training failed: {e}, using fallback")
             self.tcn_model = None
@@ -4180,10 +4456,14 @@ class SwingTradingEngine:
             if self.tabnet_model is not None:
                 joblib.dump({'model': self.tabnet_model, 'auc': tabnet_auc}, self.tabnet_path)
 
-            # TCN cache (if trained) - save as PyTorch state dict
+            # TCN cache (if trained) - save as PyTorch state dict with sequence params
             if self.tcn_model is not None:
-                torch.save({'model_state': self.tcn_model.state_dict(), 'auc': tcn_auc,
-                           'input_size': X_scaled.shape[1]}, self.tcn_path)
+                torch.save({
+                    'model_state': self.tcn_model.state_dict(),
+                    'auc': tcn_auc,
+                    'input_size': self.tcn_n_features,
+                    'seq_len': self.tcn_seq_len
+                }, self.tcn_path)
 
             # ElasticNet cache (if trained)
             if self.elasticnet_model is not None:
@@ -4228,13 +4508,55 @@ class SwingTradingEngine:
             if self.tabnet_model is not None:
                 preds_list.append(self.tabnet_model.predict_proba(X_scaled)[:, 1])
 
-            if self.tcn_model is not None:
-                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                seq_len = min(10, len(X_scaled) // 100) if len(X_scaled) > 100 else 1
-                X_seq = torch.FloatTensor(X_scaled).unsqueeze(1).repeat(1, max(seq_len, 1), 1)
-                self.tcn_model.eval()
-                with torch.no_grad():
-                    preds_list.append(self.tcn_model(X_seq.to(device)).cpu().numpy().flatten())
+            if self.tcn_model is not None and 'ticker' in self.full_df.columns:
+                # Generate real temporal sequences for TCN inference
+                try:
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    price_df = self.history_mgr.db.get_price_df()
+                    tickers = self.full_df['ticker'].tolist()
+                    seq_len = getattr(self, 'tcn_seq_len', 10)
+
+                    # Generate sequences for inference
+                    tcn_preds = []
+                    for ticker in tickers:
+                        ticker_prices = price_df[price_df['ticker'] == ticker].sort_values('date').tail(seq_len + 20)
+                        if len(ticker_prices) < seq_len:
+                            tcn_preds.append(0.5)  # Default if no data
+                            continue
+
+                        # Calculate temporal features
+                        ticker_prices = ticker_prices.copy()
+                        ticker_prices['returns'] = ticker_prices['close'].pct_change()
+                        ticker_prices['volatility'] = ticker_prices['returns'].rolling(10).std()
+                        ticker_prices['volume_ma'] = ticker_prices['volume'].rolling(10).mean()
+                        ticker_prices['volume_ratio'] = ticker_prices['volume'] / (ticker_prices['volume_ma'] + 1)
+                        delta = ticker_prices['close'].diff()
+                        gain = delta.where(delta > 0, 0).rolling(14).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                        ticker_prices['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-10)))
+                        ticker_prices['momentum_5d'] = ticker_prices['close'].pct_change(5)
+                        ticker_prices['momentum_10d'] = ticker_prices['close'].pct_change(10)
+
+                        # Normalize and get sequence
+                        tcn_features = ['returns', 'volatility', 'volume_ratio', 'rsi', 'momentum_5d', 'momentum_10d']
+                        seq_data = ticker_prices[tcn_features].tail(seq_len).values
+                        if seq_data.shape[0] < seq_len or np.isnan(seq_data).any():
+                            tcn_preds.append(0.5)
+                            continue
+
+                        # Normalize
+                        seq_data = (seq_data - np.nanmean(seq_data, axis=0)) / (np.nanstd(seq_data, axis=0) + 1e-10)
+                        seq_tensor = torch.FloatTensor(seq_data).unsqueeze(0).to(device)
+
+                        self.tcn_model.eval()
+                        with torch.no_grad():
+                            pred = self.tcn_model(seq_tensor).cpu().numpy().flatten()[0]
+                        tcn_preds.append(pred)
+
+                    preds_list.append(np.array(tcn_preds))
+                except Exception as e:
+                    print(f"  [!] TCN inference failed: {e}, skipping TCN predictions")
+                    # Don't add TCN to preds_list if it fails
 
             if self.elasticnet_model is not None:
                 preds_list.append(self.elasticnet_model.predict_proba(X_scaled)[:, 1])
