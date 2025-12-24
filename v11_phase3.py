@@ -24,102 +24,9 @@ NOTE: This is a SIDE-BY-SIDE implementation with v11.py
       Your original v11.py remains untouched for fallback.
 """
 
-# ============================================================================
-# STEP 1: Download models directory from GitHub if not present
-# ============================================================================
-import sys
-import os
-import subprocess
-
-# Check if models directory exists in current working directory
-models_dir = os.path.join(os.getcwd(), 'models')
-
-if not os.path.exists(models_dir):
-    print("[SETUP] Models directory not found. Downloading from GitHub...")
-    try:
-        # Clone just the models directory using sparse checkout
-        repo_url = "https://github.com/voceven/swingengine.git"
-        branch = "feature/phase3-ml-ensemble-diversity"
-        
-        # Create temporary directory for clone
-        temp_dir = "/tmp/swingengine_models"
-        if os.path.exists(temp_dir):
-            subprocess.run(["rm", "-rf", temp_dir], check=True)
-        
-        # Initialize git repo with sparse checkout
-        subprocess.run(["git", "init", temp_dir], check=True, capture_output=True)
-        subprocess.run(["git", "-C", temp_dir, "remote", "add", "origin", repo_url], check=True, capture_output=True)
-        subprocess.run(["git", "-C", temp_dir, "config", "core.sparseCheckout", "true"], check=True, capture_output=True)
-        
-        # Specify we only want models directory
-        sparse_file = os.path.join(temp_dir, ".git", "info", "sparse-checkout")
-        with open(sparse_file, "w") as f:
-            f.write("models/\n")
-        
-        # Pull only models directory
-        subprocess.run(["git", "-C", temp_dir, "pull", "origin", branch], check=True, capture_output=True)
-        
-        # Copy models directory to current working directory
-        subprocess.run(["cp", "-r", os.path.join(temp_dir, "models"), models_dir], check=True)
-        
-        # Cleanup
-        subprocess.run(["rm", "-rf", temp_dir], check=True)
-        
-        print(f"  [✓] Downloaded models directory to {models_dir}")
-        
-    except subprocess.CalledProcessError as e:
-        print(f"  [!] Git sparse checkout failed. Trying direct download...")
-        
-        # Fallback: Download individual files using raw GitHub URLs
-        os.makedirs(models_dir, exist_ok=True)
-        
-        model_files = [
-            "__init__.py",
-            "tcn.py",
-            "tabnet_model.py"
-        ]
-        
-        import urllib.request
-        base_url = f"https://raw.githubusercontent.com/voceven/swingengine/{branch}/models/"
-        
-        for filename in model_files:
-            try:
-                url = base_url + filename
-                dest = os.path.join(models_dir, filename)
-                urllib.request.urlretrieve(url, dest)
-                print(f"    Downloaded {filename}")
-            except Exception as download_error:
-                print(f"    [!] Failed to download {filename}: {download_error}")
-        
-        print(f"  [✓] Downloaded models to {models_dir}")
-
-else:
-    print(f"[SETUP] Models directory found at {models_dir}")
-
-# ============================================================================
-# STEP 2: Add models directory to Python path
-# ============================================================================
-if models_dir not in sys.path:
-    sys.path.insert(0, os.getcwd())  # Add parent directory so 'models' can be imported
-    print(f"[SETUP] Added {os.getcwd()} to Python path")
-
-# ============================================================================
-# STEP 3: Import model classes
-# ============================================================================
-try:
-    from models.tcn import TemporalCNN
-    from models.tabnet_model import TabNetModel
-    print("[SETUP] Successfully imported TCN and TabNet models")
-except ImportError as e:
-    print(f"[ERROR] Failed to import models: {e}")
-    print("[ERROR] Please ensure models/ directory contains tcn.py and tabnet_model.py")
-    raise
-
-# ============================================================================
-# STEP 4: Standard imports
-# ============================================================================
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from sklearn.linear_model import ElasticNet, LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -127,6 +34,7 @@ from sklearn.model_selection import train_test_split
 from catboost import CatBoostClassifier
 import joblib
 import pandas as pd
+import os
 
 print("""
 ================================================================================
@@ -147,7 +55,214 @@ Target AUC: 0.945-0.955 (from 0.929 baseline)
 ================================================================================
 """)
 
-# Phase 3: Updated Model Paths
+# ============================================================================
+# MODEL ARCHITECTURE 1: TEMPORAL CNN (TCN)
+# ============================================================================
+class TemporalBlock(nn.Module):
+    """Single temporal block with dilated causal convolutions."""
+    
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                              stride=stride, padding=padding, dilation=dilation)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                              stride=stride, padding=padding, dilation=dilation)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.net = nn.Sequential(self.conv1, self.relu1, self.dropout1,
+                                self.conv2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TemporalCNN(nn.Module):
+    """Temporal Convolutional Network for sequence pattern detection."""
+    
+    def __init__(self, num_inputs, num_channels=[32, 64, 128], kernel_size=3, dropout=0.2):
+        super(TemporalCNN, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            padding = (kernel_size - 1) * dilation_size
+            
+            layers.append(TemporalBlock(
+                in_channels, out_channels, kernel_size, stride=1,
+                dilation=dilation_size, padding=padding, dropout=dropout
+            ))
+        
+        self.network = nn.Sequential(*layers)
+        self.fc = nn.Linear(num_channels[-1], 1)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        # x shape: [batch, features, seq_len]
+        y = self.network(x)
+        # Global average pooling over sequence
+        y = y.mean(dim=2)
+        out = self.fc(y)
+        return self.sigmoid(out)
+    
+    def fit(self, X, y, epochs=50, batch_size=32, learning_rate=0.001, device='cpu', verbose=False):
+        """Train TCN model."""
+        self.to(device)
+        self.train()
+        
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1).to(device)
+        
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        criterion = nn.BCELoss()
+        
+        dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = self(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"      TCN Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(loader):.4f}")
+    
+    def predict_proba(self, X, device='cpu'):
+        """Get probability predictions."""
+        self.to(device)
+        self.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+            preds = self(X_tensor).cpu().numpy()
+        return np.column_stack([1 - preds, preds])  # [prob_class_0, prob_class_1]
+
+# ============================================================================
+# MODEL ARCHITECTURE 2: TABNET (Simplified)
+# ============================================================================
+class GLU(nn.Module):
+    """Gated Linear Unit."""
+    def __init__(self, input_dim, output_dim):
+        super(GLU, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim * 2)
+    
+    def forward(self, x):
+        x = self.fc(x)
+        return x[:, :x.size(1)//2] * torch.sigmoid(x[:, x.size(1)//2:])
+
+class FeatureTransformer(nn.Module):
+    """Feature transformer block with attention."""
+    def __init__(self, input_dim, output_dim, shared_dim, n_independent=2):
+        super(FeatureTransformer, self).__init__()
+        self.shared = nn.ModuleList([GLU(input_dim if i == 0 else output_dim, output_dim) 
+                                     for i in range(n_independent)])
+        self.bn = nn.BatchNorm1d(output_dim)
+    
+    def forward(self, x):
+        for layer in self.shared:
+            x = layer(x)
+        return self.bn(x)
+
+class TabNetModel(nn.Module):
+    """Simplified TabNet for feature interaction learning."""
+    
+    def __init__(self, input_dim, output_dim=1, n_d=64, n_a=64, n_steps=5, 
+                 gamma=1.3, virtual_batch_size=128):
+        super(TabNetModel, self).__init__()
+        self.input_dim = input_dim
+        self.n_steps = n_steps
+        self.n_d = n_d
+        self.n_a = n_a
+        
+        # Initial feature processing
+        self.initial_bn = nn.BatchNorm1d(input_dim)
+        
+        # Attention transformers for each step
+        self.attention_transformers = nn.ModuleList([
+            FeatureTransformer(input_dim, n_a, n_a) for _ in range(n_steps)
+        ])
+        
+        # Feature transformers for each step
+        self.feature_transformers = nn.ModuleList([
+            FeatureTransformer(input_dim, n_d + n_a, n_d) for _ in range(n_steps)
+        ])
+        
+        # Final classifier
+        self.fc = nn.Linear(n_d * n_steps, output_dim)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        x = self.initial_bn(x)
+        aggregated = []
+        
+        for step in range(self.n_steps):
+            # Attention mechanism
+            attention = self.attention_transformers[step](x)
+            
+            # Feature transformation
+            features = self.feature_transformers[step](x * torch.sigmoid(attention))
+            
+            # Split features
+            decision, attention_update = features[:, :self.n_d], features[:, self.n_d:]
+            aggregated.append(decision)
+        
+        # Aggregate all steps
+        out = torch.cat(aggregated, dim=1)
+        out = self.fc(out)
+        return self.sigmoid(out)
+    
+    def fit(self, X, y, epochs=100, batch_size=256, learning_rate=0.02, device='cpu', verbose=False):
+        """Train TabNet model."""
+        self.to(device)
+        self.train()
+        
+        X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1).to(device)
+        
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        criterion = nn.BCELoss()
+        
+        dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        for epoch in range(epochs):
+            epoch_loss = 0
+            for batch_X, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = self(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            
+            if verbose and (epoch + 1) % 20 == 0:
+                print(f"      TabNet Epoch {epoch+1}/{epochs}, Loss: {epoch_loss/len(loader):.4f}")
+    
+    def predict_proba(self, X, device='cpu'):
+        """Get probability predictions."""
+        self.to(device)
+        self.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+            preds = self(X_tensor).cpu().numpy()
+        return np.column_stack([1 - preds, preds])  # [prob_class_0, prob_class_1]
+
+# ============================================================================
+# PHASE 3 MODEL PATHS
+# ============================================================================
 PHASE3_MODEL_PATHS = {
     'catboost': 'phase3_catboost_v11.pkl',
     'tabnet': 'phase3_tabnet_v11.pth',
@@ -159,6 +274,9 @@ PHASE3_MODEL_PATHS = {
     'scaler_elastic': 'phase3_scaler_elastic.pkl'
 }
 
+# ============================================================================
+# FEATURE PREPARATION
+# ============================================================================
 def prepare_features_for_models(df, base_features):
     """
     Prepare feature sets for each model in the ensemble.
@@ -232,6 +350,9 @@ def prepare_features_for_models(df, base_features):
     
     return features
 
+# ============================================================================
+# ENSEMBLE TRAINING
+# ============================================================================
 def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     """
     Train Phase 3 ensemble: CatBoost + TabNet + TCN + ElasticNet.
@@ -322,20 +443,11 @@ def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     # =========================================================================
     print("  [3/4] Training TCN (Temporal Patterns)...")
     
-    # TCN requires sequences, not flat features
-    # For initial implementation, we'll use a sliding window approach
     tcn_features = feature_sets['tcn']
-    
-    # Create sequences from temporal features (window_size=10)
-    window_size = 10
-    X_tcn_sequences = []
-    y_tcn_sequences = []
-    
     X_tcn_raw = X_train[tcn_features].values
     
-    # Simple approach: Reshape as [batch, features, 1] for initial version
-    # TODO: In production, use actual time series data from TitanDB
-    X_tcn_formatted = X_tcn_raw[:, :, np.newaxis]  # [batch, features, seq_len=1]
+    # Reshape as [batch, features, seq_len=1] for initial version
+    X_tcn_formatted = X_tcn_raw[:, :, np.newaxis]
     
     # Scale
     scalers['tcn'] = StandardScaler()
@@ -376,17 +488,13 @@ def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     X_elastic_scaled = scalers['elasticnet'].fit_transform(X_elastic)
     
     models['elasticnet'] = ElasticNet(
-        alpha=0.01,  # L1 + L2 regularization strength
-        l1_ratio=0.5,  # 50/50 L1/L2 mix
+        alpha=0.01,
+        l1_ratio=0.5,
         max_iter=2000,
         random_state=42
     )
     
     models['elasticnet'].fit(X_elastic_scaled, y_train)
-    
-    # Convert to classifier-like predictions (0-1 range)
-    elastic_preds_train = models['elasticnet'].predict(X_elastic_scaled)
-    elastic_preds_train = np.clip(elastic_preds_train, 0, 1)  # Clamp to probability range
     
     print(f"    ElasticNet trained on {len(elastic_features)} core features")
     
@@ -415,7 +523,7 @@ def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     # Meta-features: predictions + disagreement signal
     pred_std = np.std([catboost_preds, tabnet_preds, tcn_preds, elastic_preds], axis=0)
     
-    # Add flow_factor if available (flow-aware meta-learning)
+    # Add flow_factor if available
     if 'flow_factor' in X_train.columns:
         flow_factor = X_train['flow_factor'].values
     else:
@@ -433,7 +541,7 @@ def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     
     # Train meta-learner
     models['meta_learner'] = LogisticRegression(
-        C=0.1,  # Regularization
+        C=0.1,
         class_weight='balanced',
         max_iter=1000,
         random_state=42
@@ -449,27 +557,26 @@ def train_phase3_ensemble(X_train, y_train, feature_sets, base_dir, device):
     
     return models, scalers, feature_sets
 
+# ============================================================================
+# MODEL PERSISTENCE
+# ============================================================================
 def save_phase3_models(models, scalers, feature_sets, base_dir):
     """Save all Phase 3 models and scalers."""
     print("\n[PHASE 3] Saving models and scalers...")
     
-    # Save PyTorch models
     torch.save(models['tabnet'].state_dict(), 
                os.path.join(base_dir, PHASE3_MODEL_PATHS['tabnet']))
     torch.save(models['tcn'].state_dict(),
                os.path.join(base_dir, PHASE3_MODEL_PATHS['tcn']))
     
-    # Save sklearn-compatible models
     joblib.dump(models['catboost'], os.path.join(base_dir, PHASE3_MODEL_PATHS['catboost']))
     joblib.dump(models['elasticnet'], os.path.join(base_dir, PHASE3_MODEL_PATHS['elasticnet']))
     joblib.dump(models['meta_learner'], os.path.join(base_dir, PHASE3_MODEL_PATHS['meta_learner']))
     
-    # Save scalers
     joblib.dump(scalers['tabnet'], os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_tabnet']))
     joblib.dump(scalers['tcn'], os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_tcn']))
     joblib.dump(scalers['elasticnet'], os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_elastic']))
     
-    # Save feature sets
     joblib.dump(feature_sets, os.path.join(base_dir, 'phase3_feature_sets.pkl'))
     
     print("  [✓] All Phase 3 models saved successfully")
@@ -480,13 +587,10 @@ def load_phase3_models(base_dir, device):
     scalers = {}
     
     try:
-        # Load feature sets
         feature_sets = joblib.load(os.path.join(base_dir, 'phase3_feature_sets.pkl'))
         
-        # Load CatBoost
         models['catboost'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['catboost']))
         
-        # Load TabNet
         tabnet_input_dim = len(feature_sets['tabnet'])
         models['tabnet'] = TabNetModel(input_dim=tabnet_input_dim, output_dim=1)
         models['tabnet'].load_state_dict(torch.load(
@@ -496,7 +600,6 @@ def load_phase3_models(base_dir, device):
         models['tabnet'].to(device)
         models['tabnet'].eval()
         
-        # Load TCN
         tcn_input_dim = len(feature_sets['tcn'])
         models['tcn'] = TemporalCNN(num_inputs=tcn_input_dim)
         models['tcn'].load_state_dict(torch.load(
@@ -506,13 +609,9 @@ def load_phase3_models(base_dir, device):
         models['tcn'].to(device)
         models['tcn'].eval()
         
-        # Load ElasticNet
         models['elasticnet'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['elasticnet']))
-        
-        # Load Meta-learner
         models['meta_learner'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['meta_learner']))
         
-        # Load Scalers
         scalers['tabnet'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_tabnet']))
         scalers['tcn'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_tcn']))
         scalers['elasticnet'] = joblib.load(os.path.join(base_dir, PHASE3_MODEL_PATHS['scaler_elastic']))
@@ -528,5 +627,4 @@ print("  - TCN: Temporal CNN for sequence patterns")
 print("  - TabNet: Self-attention for feature interactions")
 print("  - ElasticNet: Linear baseline for regime shifts")
 print("  - Meta-learner: Flow-aware ensemble combination")
-print("\nTo use: Replace ensemble training section in your v11.py with Phase 3 functions")
-print("Or: Import this file and call train_phase3_ensemble() directly")
+print("\nReady to use: Call train_phase3_ensemble() with your training data")
