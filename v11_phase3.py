@@ -25,20 +25,99 @@ NOTE: This is a SIDE-BY-SIDE implementation with v11.py
 """
 
 # ============================================================================
-# IMPORTS
+# STEP 1: Download models directory from GitHub if not present
 # ============================================================================
 import sys
 import os
+import subprocess
 
-# Add models directory to path (use current working directory)
-models_path = os.path.join(os.getcwd(), 'models')
-if models_path not in sys.path:
-    sys.path.insert(0, models_path)
+# Check if models directory exists in current working directory
+models_dir = os.path.join(os.getcwd(), 'models')
 
-from models.tcn import TemporalCNN
-from models.tabnet_model import TabNetModel
+if not os.path.exists(models_dir):
+    print("[SETUP] Models directory not found. Downloading from GitHub...")
+    try:
+        # Clone just the models directory using sparse checkout
+        repo_url = "https://github.com/voceven/swingengine.git"
+        branch = "feature/phase3-ml-ensemble-diversity"
+        
+        # Create temporary directory for clone
+        temp_dir = "/tmp/swingengine_models"
+        if os.path.exists(temp_dir):
+            subprocess.run(["rm", "-rf", temp_dir], check=True)
+        
+        # Initialize git repo with sparse checkout
+        subprocess.run(["git", "init", temp_dir], check=True, capture_output=True)
+        subprocess.run(["git", "-C", temp_dir, "remote", "add", "origin", repo_url], check=True, capture_output=True)
+        subprocess.run(["git", "-C", temp_dir, "config", "core.sparseCheckout", "true"], check=True, capture_output=True)
+        
+        # Specify we only want models directory
+        sparse_file = os.path.join(temp_dir, ".git", "info", "sparse-checkout")
+        with open(sparse_file, "w") as f:
+            f.write("models/\n")
+        
+        # Pull only models directory
+        subprocess.run(["git", "-C", temp_dir, "pull", "origin", branch], check=True, capture_output=True)
+        
+        # Copy models directory to current working directory
+        subprocess.run(["cp", "-r", os.path.join(temp_dir, "models"), models_dir], check=True)
+        
+        # Cleanup
+        subprocess.run(["rm", "-rf", temp_dir], check=True)
+        
+        print(f"  [✓] Downloaded models directory to {models_dir}")
+        
+    except subprocess.CalledProcessError as e:
+        print(f"  [!] Git sparse checkout failed. Trying direct download...")
+        
+        # Fallback: Download individual files using raw GitHub URLs
+        os.makedirs(models_dir, exist_ok=True)
+        
+        model_files = [
+            "__init__.py",
+            "tcn.py",
+            "tabnet_model.py"
+        ]
+        
+        import urllib.request
+        base_url = f"https://raw.githubusercontent.com/voceven/swingengine/{branch}/models/"
+        
+        for filename in model_files:
+            try:
+                url = base_url + filename
+                dest = os.path.join(models_dir, filename)
+                urllib.request.urlretrieve(url, dest)
+                print(f"    Downloaded {filename}")
+            except Exception as download_error:
+                print(f"    [!] Failed to download {filename}: {download_error}")
+        
+        print(f"  [✓] Downloaded models to {models_dir}")
 
-# Standard imports
+else:
+    print(f"[SETUP] Models directory found at {models_dir}")
+
+# ============================================================================
+# STEP 2: Add models directory to Python path
+# ============================================================================
+if models_dir not in sys.path:
+    sys.path.insert(0, os.getcwd())  # Add parent directory so 'models' can be imported
+    print(f"[SETUP] Added {os.getcwd()} to Python path")
+
+# ============================================================================
+# STEP 3: Import model classes
+# ============================================================================
+try:
+    from models.tcn import TemporalCNN
+    from models.tabnet_model import TabNetModel
+    print("[SETUP] Successfully imported TCN and TabNet models")
+except ImportError as e:
+    print(f"[ERROR] Failed to import models: {e}")
+    print("[ERROR] Please ensure models/ directory contains tcn.py and tabnet_model.py")
+    raise
+
+# ============================================================================
+# STEP 4: Standard imports
+# ============================================================================
 import torch
 import torch.nn as nn
 import numpy as np
@@ -48,9 +127,6 @@ from sklearn.model_selection import train_test_split
 from catboost import CatBoostClassifier
 import joblib
 import pandas as pd
-
-# Note: All other functionality (HistoryManager, TitanDB, etc.) is imported
-# from your existing v11.py. This file ONLY modifies the ML ensemble.
 
 print("""
 ================================================================================
