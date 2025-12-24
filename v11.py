@@ -933,7 +933,7 @@ def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5
     return pd.DataFrame(results)
 
 
-def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_cols=None):
+def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_cols=None, max_sequences=50000):
     """
     Prepare real sequential data for TCN training.
 
@@ -946,6 +946,7 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
         tickers: List of tickers
         seq_len: Sequence length (days of history per sample)
         feature_cols: List of feature columns to use
+        max_sequences: Maximum number of sequences to return (memory limit)
 
     Returns:
         X_seq: np.array of shape (n_samples, seq_len, n_features)
@@ -1020,6 +1021,14 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
 
     if not sequences:
         return None, None, None
+
+    # Memory limit: sample if too many sequences
+    if len(sequences) > max_sequences:
+        print(f"  [TCN] Sampling {max_sequences} from {len(sequences)} sequences (memory limit)")
+        indices = np.random.choice(len(sequences), max_sequences, replace=False)
+        sequences = [sequences[i] for i in indices]
+        labels = [labels[i] for i in indices]
+        ticker_list = [ticker_list[i] for i in indices]
 
     return np.array(sequences), np.array(labels), ticker_list
 
@@ -4103,7 +4112,7 @@ class SwingTradingEngine:
 
                 # Load TCN (optional) - reconstruct model and load state dict with seq params
                 if os.path.exists(self.tcn_path):
-                    tcn_cache = torch.load(self.tcn_path, map_location=device)
+                    tcn_cache = torch.load(self.tcn_path, map_location=device, weights_only=False)
                     self.tcn_n_features = tcn_cache.get('input_size', 6)
                     self.tcn_seq_len = tcn_cache.get('seq_len', 10)
                     self.tcn_model = TCN(input_size=self.tcn_n_features, num_channels=[32, 32, 16]).to(device)
@@ -4333,14 +4342,22 @@ class SwingTradingEngine:
             print(f"  [TCN] Created {len(X_seq_np)} real sequences (shape: {X_seq_np.shape})")
             self.tcn_n_features = X_seq_np.shape[2]
 
-            # Convert to tensors
-            X_seq = torch.FloatTensor(X_seq_np)
-            y_tensor = torch.FloatTensor(y_seq_np).unsqueeze(1)
+            # Train/val split (on numpy arrays to save memory)
+            split_idx = int(len(X_seq_np) * 0.8)
+            X_train_np, X_val_np = X_seq_np[:split_idx], X_seq_np[split_idx:]
+            y_train_np, y_val_np = y_seq_np[:split_idx], y_seq_np[split_idx:]
 
-            # Train/val split
-            split_idx = int(len(X_seq) * 0.8)
-            X_train_tcn, X_val_tcn = X_seq[:split_idx], X_seq[split_idx:]
-            y_train_tcn, y_val_tcn = y_tensor[:split_idx], y_tensor[split_idx:]
+            # Create DataLoader for memory-efficient batch training
+            from torch.utils.data import TensorDataset, DataLoader
+            train_dataset = TensorDataset(
+                torch.FloatTensor(X_train_np),
+                torch.FloatTensor(y_train_np).unsqueeze(1)
+            )
+            train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+
+            # Validation tensors (smaller, can fit in memory)
+            X_val_tcn = torch.FloatTensor(X_val_np)
+            y_val_tcn = torch.FloatTensor(y_val_np).unsqueeze(1)
 
             # Initialize TCN model with correct feature size
             self.tcn_model = TCN(
@@ -4352,15 +4369,19 @@ class SwingTradingEngine:
             optimizer = torch.optim.Adam(self.tcn_model.parameters(), lr=0.001)
             criterion = nn.BCELoss()
 
-            # Training loop with early stopping
+            # Training loop with early stopping and batch training
             best_val_loss, patience_counter = float('inf'), 0
             for epoch in range(50):
                 self.tcn_model.train()
-                optimizer.zero_grad()
-                outputs = self.tcn_model(X_train_tcn.to(device))
-                loss = criterion(outputs, y_train_tcn.to(device))
-                loss.backward()
-                optimizer.step()
+                epoch_loss = 0.0
+                for batch_X, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = self.tcn_model(batch_X.to(device))
+                    loss = criterion(outputs, batch_y.to(device))
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
+
                 # Validation
                 self.tcn_model.eval()
                 with torch.no_grad():
