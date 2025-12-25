@@ -320,6 +320,23 @@ Changelog v11.5.2 (Momentum Filter Fix - NVO Restoration):
   - 52w high proximity: Only penalize LOW solidity candidates near highs
   - 52w low distance: Only penalize LOW solidity candidates far from lows
 - EXPECTED: NVO restored to Phoenix Leaderboard alongside LULU
+
+Changelog v11.5.3 (Sector Momentum Filter - FCX/KGC Fix):
+- CRITICAL FIX: Sector momentum now penalizes phoenix regardless of solidity
+  - FCX/KGC (precious metals) have high solidity but XLB sector is at ATH
+  - This is sector BETA, not individual stock ALPHA
+  - High solidity in a hot sector = institutions chasing momentum, not finding value
+- NEW FILTER: Sector 52-week high proximity check
+  - Fetches 1-year data for all sector ETFs (XLK, XLF, XLV, XLB, etc.)
+  - If sector within 10% of ATH: Apply 60% phoenix penalty (sector beta)
+  - If sector within 15% of ATH: Apply 40% phoenix penalty (moderate)
+  - Boosts alpha_score instead (correct leaderboard placement)
+- EXAMPLES:
+  - FCX (Basic Materials/XLB): XLB at ATH → heavy penalty → moved to Alpha
+  - KGC (Basic Materials/XLB): XLB at ATH → heavy penalty → moved to Alpha
+  - NVO (Healthcare/XLV): XLV not at ATH → NO penalty → stays on Phoenix
+  - LULU (Consumer Cyclical/XLY): Sector-relative check passes → stays on Phoenix
+- EXPECTED: FCX/KGC filtered from Phoenix, NVO/LULU remain
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -1454,6 +1471,7 @@ class SwingTradingEngine:
 
         self.spy_metrics = {'return': 0.0, 'rsi': 50.0, 'trend': 0.0}
         self.sector_data = {}
+        self.sector_52w_data = {}  # v11.5.3: Sector ETF 52w high proximity for sector momentum filter
         self.market_breadth = 50.0
         self.market_regime = "Neutral"
         self.macro_data = {'vix': 20, 'tnx': 4.0, 'dxy': 100, 'spy_trend': True, 'spy_return': 0, 'adjustment': 0, 'regime_details': []}
@@ -2153,6 +2171,7 @@ class SwingTradingEngine:
         print("  [CONTEXT] Fetching Sector ETF History...")
         try:
             etfs = list(SECTOR_MAP.values()) + ['SPY']
+            # Fetch 1-month data for relative performance
             data = yf.download(etfs, period="1mo", progress=False)['Close']
             if isinstance(data, pd.Series): data = data.to_frame()
             for etf in etfs:
@@ -2161,7 +2180,26 @@ class SwingTradingEngine:
                     if len(series) > 1:
                         self.sector_data[etf] = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
                     else: self.sector_data[etf] = 0.0
-        except: pass
+
+            # v11.5.3: Fetch 1-year data for sector 52w high proximity
+            # Used to detect sector momentum (e.g., precious metals at ATH)
+            data_1y = yf.download(etfs, period="1y", progress=False)['Close']
+            if isinstance(data_1y, pd.Series): data_1y = data_1y.to_frame()
+            self.sector_52w_data = {}
+            for etf in etfs:
+                if etf in data_1y.columns:
+                    series = data_1y[etf].dropna()
+                    if len(series) > 20:
+                        high_52w = series.max()
+                        current = series.iloc[-1]
+                        pct_from_high = (high_52w - current) / high_52w if high_52w > 0 else 1.0
+                        self.sector_52w_data[etf] = {
+                            'high_52w': float(high_52w),
+                            'current': float(current),
+                            'pct_from_high': float(pct_from_high)
+                        }
+        except Exception as e:
+            pass
 
     # --- RESTORED BREADTH CALC ---
     def calculate_market_breadth(self, cached_data):
@@ -4943,6 +4981,41 @@ class SwingTradingEngine:
                 # Apply penalty
                 bottom_penalty = 0.70
                 phoenix_accum = phoenix_accum * bottom_penalty
+
+            # =========================================================================
+            # v11.5.3: SECTOR MOMENTUM FILTER - Distinguish individual reversals from sector beta
+            # =========================================================================
+            # A stock riding a sector at ATH is NOT a phoenix reversal - it's sector beta.
+            # Example: FCX/KGC (precious metals) have high solidity but XLB is at ATH.
+            # These are sector momentum plays, not individual stock reversals.
+            #
+            # True phoenix: Individual stock reversal while sector is neutral/weak
+            # Sector beta: Stock up because entire sector is ripping (not alpha)
+            #
+            # This filter applies REGARDLESS of solidity - high solidity in a hot sector
+            # just means institutions are chasing sector momentum, not finding value.
+            # =========================================================================
+            if phoenix_score > 0 and hasattr(self, 'sector_52w_data') and self.sector_52w_data:
+                ticker_sector = self.sector_map_local.get(ticker, 'Unknown')
+                sector_etf = SECTOR_MAP.get(ticker_sector)
+
+                if sector_etf and sector_etf in self.sector_52w_data:
+                    sector_info = self.sector_52w_data[sector_etf]
+                    sector_pct_from_high = sector_info.get('pct_from_high', 1.0)
+
+                    # If sector is within 10% of 52w high, apply heavy penalty
+                    # This catches FCX/KGC (XLB near ATH) but not NVO (XLV not at ATH)
+                    if sector_pct_from_high < 0.10:
+                        # Sector at ATH - this is sector momentum, not phoenix
+                        sector_penalty = 0.40  # Heavy 60% penalty
+                        phoenix_accum = phoenix_accum * sector_penalty
+                        # Boost alpha score - this belongs on momentum leaderboard
+                        alpha_accum = alpha_accum * 1.3
+                    elif sector_pct_from_high < 0.15:
+                        # Sector near high (10-15%) - moderate penalty
+                        sector_penalty = 0.60
+                        phoenix_accum = phoenix_accum * sector_penalty
+                        alpha_accum = alpha_accum * 1.15
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
