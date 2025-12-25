@@ -5073,46 +5073,69 @@ class SwingTradingEngine:
             # =========================================================================
             if phoenix_score > 0 and ticker in self.price_history_cache:
                 hist = self.price_history_cache[ticker]
-                close_col = 'Close' if 'Close' in hist.columns else 'close'
 
-                if close_col in hist.columns and len(hist) >= 126:  # Need 6+ months data
-                    # Calculate 3-month return (last ~63 trading days)
-                    return_3m = 0.0
-                    if len(hist) >= 63:
-                        price_3m_ago = hist[close_col].iloc[-63]
-                        current_px = hist[close_col].iloc[-1]
-                        return_3m = (current_px - price_3m_ago) / price_3m_ago if price_3m_ago > 0 else 0
+                # Handle both regular columns and MultiIndex columns (from yfinance)
+                close_col = None
+                if 'Close' in hist.columns:
+                    close_col = 'Close'
+                elif 'close' in hist.columns:
+                    close_col = 'close'
+                elif hasattr(hist.columns, 'get_level_values'):
+                    # MultiIndex columns - try to find Close
+                    level0 = hist.columns.get_level_values(0)
+                    if 'Close' in level0:
+                        close_col = 'Close'
 
-                    # Calculate 6-month return (last ~126 trading days)
-                    return_6m = 0.0
-                    if len(hist) >= 126:
-                        price_6m_ago = hist[close_col].iloc[-126]
-                        current_px = hist[close_col].iloc[-1]
-                        return_6m = (current_px - price_6m_ago) / price_6m_ago if price_6m_ago > 0 else 0
+                if close_col and len(hist) >= 126:  # Need 6+ months data
+                    # Get close prices, handling MultiIndex if needed
+                    try:
+                        if hasattr(hist.columns, 'nlevels') and hist.columns.nlevels > 1:
+                            close_series = hist[close_col].iloc[:, 0] if isinstance(hist[close_col], pd.DataFrame) else hist[close_col]
+                        else:
+                            close_series = hist[close_col]
 
-                    # Calculate "recency ratio" - what % of 6mo gains came in last 3mo?
-                    # High ratio (>60%) = gains are RECENT = early stage breakout
-                    # Low ratio (<40%) = gains spread over time = prolonged uptrend
-                    if return_6m > 0.15:  # Only check stocks with meaningful 6mo gains
-                        recency_ratio = return_3m / return_6m if return_6m > 0 else 0
+                        # Calculate 3-month return (last ~63 trading days)
+                        return_3m = 0.0
+                        if len(close_series) >= 63:
+                            price_3m_ago = float(close_series.iloc[-63])
+                            current_px = float(close_series.iloc[-1])
+                            return_3m = (current_px - price_3m_ago) / price_3m_ago if price_3m_ago > 0 else 0
 
-                        # Debug output for validation tickers
-                        if ENABLE_VALIDATION_MODE and ticker in (VALIDATION_SUITE.get('institutional_phoenix', []) +
-                                                                   VALIDATION_SUITE.get('negative_cases', [])):
+                        # Calculate 6-month return (last ~126 trading days)
+                        return_6m = 0.0
+                        if len(close_series) >= 126:
+                            price_6m_ago = float(close_series.iloc[-126])
+                            current_px = float(close_series.iloc[-1])
+                            return_6m = (current_px - price_6m_ago) / price_6m_ago if price_6m_ago > 0 else 0
+
+                        # Debug: Always show recency data for validation tickers
+                        is_validation_ticker = ticker in (VALIDATION_SUITE.get('institutional_phoenix', []) +
+                                                          VALIDATION_SUITE.get('negative_cases', []))
+                        if ENABLE_VALIDATION_MODE and is_validation_ticker:
+                            recency_ratio = return_3m / return_6m if return_6m > 0 else 0
                             print(f"  [RECENCY DEBUG] {ticker}: 3mo={return_3m:.1%}, 6mo={return_6m:.1%}, recency={recency_ratio:.1%}")
 
-                        # If recency ratio is LOW, gains are spread = prolonged uptrend = NOT early phoenix
-                        if recency_ratio < 0.40:
-                            # Gains spread over 6 months - this is a MATURE trend, not early reversal
-                            # Strong penalty - this catches FCX/KGC (rallying for months/years)
-                            recency_penalty = 0.35  # Heavy penalty for prolonged uptrends
-                            phoenix_accum = phoenix_accum * recency_penalty
-                            alpha_accum = alpha_accum * 1.3  # Boost momentum score instead
-                        elif recency_ratio < 0.55:
-                            # Moderate spread - partial penalty
-                            recency_penalty = 0.60
-                            phoenix_accum = phoenix_accum * recency_penalty
-                            alpha_accum = alpha_accum * 1.15
+                        # Calculate "recency ratio" - what % of 6mo gains came in last 3mo?
+                        # High ratio (>60%) = gains are RECENT = early stage breakout
+                        # Low ratio (<40%) = gains spread over time = prolonged uptrend
+                        if return_6m > 0.15:  # Only check stocks with meaningful 6mo gains
+                            recency_ratio = return_3m / return_6m if return_6m > 0 else 0
+
+                            # If recency ratio is LOW, gains are spread = prolonged uptrend = NOT early phoenix
+                            if recency_ratio < 0.40:
+                                # Gains spread over 6 months - this is a MATURE trend, not early reversal
+                                # Strong penalty - this catches FCX/KGC (rallying for months/years)
+                                recency_penalty = 0.35  # Heavy penalty for prolonged uptrends
+                                phoenix_accum = phoenix_accum * recency_penalty
+                                alpha_accum = alpha_accum * 1.3  # Boost momentum score instead
+                            elif recency_ratio < 0.55:
+                                # Moderate spread - partial penalty
+                                recency_penalty = 0.60
+                                phoenix_accum = phoenix_accum * recency_penalty
+                                alpha_accum = alpha_accum * 1.15
+                    except Exception as e:
+                        if ENABLE_VALIDATION_MODE and ticker in VALIDATION_SUITE.get('negative_cases', []):
+                            print(f"  [RECENCY ERROR] {ticker}: {e}")
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
