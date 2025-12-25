@@ -337,6 +337,26 @@ Changelog v11.5.3 (Sector Momentum Filter - FCX/KGC Fix):
   - NVO (Healthcare/XLV): XLV not at ATH → NO penalty → stays on Phoenix
   - LULU (Consumer Cyclical/XLY): Sector-relative check passes → stays on Phoenix
 - EXPECTED: FCX/KGC filtered from Phoenix, NVO/LULU remain
+- NOTE: v11.5.3 REPLACED by v11.5.4 - absolute ATH approach caused collateral damage
+
+Changelog v11.5.4 (Sector Beta Filter - Relative Performance):
+- REPLACED v11.5.3: Absolute sector ATH check was too broad
+  - Problem: In bullish market, multiple sectors near ATH → penalized valid phoenix too
+  - LULU dropped from 99.9 to 58.4 despite being true phoenix (XLY also near ATH)
+- NEW APPROACH: Stock vs Sector RELATIVE performance
+  - Compares stock's 6-month return to sector ETF's 6-month return
+  - True phoenix = stock OUTPERFORMING sector (individual alpha)
+  - Sector beta = stock just MATCHING sector (riding the wave)
+- PENALTY TIERS (based on relative performance):
+  - Underperforming sector (< -5%): 60% penalty - definitely not a leader
+  - Matching sector (-5% to 0%): 50% penalty - likely beta play
+  - Barely outperforming (0% to 5%): 30% penalty - mild concern
+  - Outperforming (> 5%): NO penalty - true individual alpha
+- EXAMPLES:
+  - LULU: If up 30% while XLY up 10% → 20% alpha → NO PENALTY → stays on Phoenix
+  - FCX: If up 25% while XLB up 25% → 0% alpha → PENALTY → moved to Alpha Momentum
+- DATA: Fetches 6-month returns for all sector ETFs (XLK, XLF, XLV, XLB, etc.)
+- EXPECTED: True individual reversals (LULU, NVO) pass; sector beta (FCX, KGC) filtered
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -1471,7 +1491,7 @@ class SwingTradingEngine:
 
         self.spy_metrics = {'return': 0.0, 'rsi': 50.0, 'trend': 0.0}
         self.sector_data = {}
-        self.sector_52w_data = {}  # v11.5.3: Sector ETF 52w high proximity for sector momentum filter
+        self.sector_6m_returns = {}  # v11.5.4: Sector ETF 6-month returns for relative performance filter
         self.market_breadth = 50.0
         self.market_regime = "Neutral"
         self.macro_data = {'vix': 20, 'tnx': 4.0, 'dxy': 100, 'spy_trend': True, 'spy_return': 0, 'adjustment': 0, 'regime_details': []}
@@ -2181,23 +2201,21 @@ class SwingTradingEngine:
                         self.sector_data[etf] = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
                     else: self.sector_data[etf] = 0.0
 
-            # v11.5.3: Fetch 1-year data for sector 52w high proximity
-            # Used to detect sector momentum (e.g., precious metals at ATH)
-            data_1y = yf.download(etfs, period="1y", progress=False)['Close']
-            if isinstance(data_1y, pd.Series): data_1y = data_1y.to_frame()
-            self.sector_52w_data = {}
+            # v11.5.4: Fetch 6-month data for sector relative performance filter
+            # Used to compare stock performance vs sector performance
+            # True phoenix = stock outperforming sector (individual alpha)
+            # Sector beta = stock just matching sector (riding the wave)
+            data_6m = yf.download(etfs, period="6mo", progress=False)['Close']
+            if isinstance(data_6m, pd.Series): data_6m = data_6m.to_frame()
+            self.sector_6m_returns = {}
             for etf in etfs:
-                if etf in data_1y.columns:
-                    series = data_1y[etf].dropna()
+                if etf in data_6m.columns:
+                    series = data_6m[etf].dropna()
                     if len(series) > 20:
-                        high_52w = series.max()
-                        current = series.iloc[-1]
-                        pct_from_high = (high_52w - current) / high_52w if high_52w > 0 else 1.0
-                        self.sector_52w_data[etf] = {
-                            'high_52w': float(high_52w),
-                            'current': float(current),
-                            'pct_from_high': float(pct_from_high)
-                        }
+                        start_price = series.iloc[0]
+                        current_price = series.iloc[-1]
+                        return_6m = (current_price - start_price) / start_price if start_price > 0 else 0.0
+                        self.sector_6m_returns[etf] = float(return_6m)
         except Exception as e:
             pass
 
@@ -4983,39 +5001,58 @@ class SwingTradingEngine:
                 phoenix_accum = phoenix_accum * bottom_penalty
 
             # =========================================================================
-            # v11.5.3: SECTOR MOMENTUM FILTER - Distinguish individual reversals from sector beta
+            # v11.5.4: SECTOR BETA FILTER - Stock vs Sector Relative Performance
             # =========================================================================
-            # A stock riding a sector at ATH is NOT a phoenix reversal - it's sector beta.
-            # Example: FCX/KGC (precious metals) have high solidity but XLB is at ATH.
-            # These are sector momentum plays, not individual stock reversals.
+            # True phoenix = stock OUTPERFORMING its sector (individual alpha)
+            # Sector beta = stock just MATCHING sector (riding the wave)
             #
-            # True phoenix: Individual stock reversal while sector is neutral/weak
-            # Sector beta: Stock up because entire sector is ripping (not alpha)
+            # Example:
+            # - LULU/NVO: Up 30% while sector up 10% → 20% outperformance → TRUE PHOENIX
+            # - FCX/KGC: Up 25% while XLB up 25% → 0% outperformance → SECTOR BETA
             #
-            # This filter applies REGARDLESS of solidity - high solidity in a hot sector
-            # just means institutions are chasing sector momentum, not finding value.
+            # This is the correct filter because:
+            # - It doesn't penalize all stocks when sectors are strong
+            # - It specifically catches stocks just riding sector momentum
+            # - True reversals should show INDIVIDUAL strength, not sector correlation
             # =========================================================================
-            if phoenix_score > 0 and hasattr(self, 'sector_52w_data') and self.sector_52w_data:
+            if phoenix_score > 0 and hasattr(self, 'sector_6m_returns') and self.sector_6m_returns:
                 ticker_sector = self.sector_map_local.get(ticker, 'Unknown')
                 sector_etf = SECTOR_MAP.get(ticker_sector)
 
-                if sector_etf and sector_etf in self.sector_52w_data:
-                    sector_info = self.sector_52w_data[sector_etf]
-                    sector_pct_from_high = sector_info.get('pct_from_high', 1.0)
+                if sector_etf and sector_etf in self.sector_6m_returns:
+                    sector_return = self.sector_6m_returns[sector_etf]
 
-                    # If sector is within 10% of 52w high, apply heavy penalty
-                    # This catches FCX/KGC (XLB near ATH) but not NVO (XLV not at ATH)
-                    if sector_pct_from_high < 0.10:
-                        # Sector at ATH - this is sector momentum, not phoenix
-                        sector_penalty = 0.40  # Heavy 60% penalty
-                        phoenix_accum = phoenix_accum * sector_penalty
+                    # Calculate stock's 6-month return from price history
+                    # Use the cached price history from pattern analysis
+                    stock_return = 0.0
+                    if ticker in self.price_history_cache:
+                        hist = self.price_history_cache[ticker]
+                        if len(hist) >= 126:  # ~6 months of trading days
+                            close_col = 'Close' if 'Close' in hist.columns else 'close'
+                            if close_col in hist.columns:
+                                start_price = hist[close_col].iloc[-126]
+                                current_price = hist[close_col].iloc[-1]
+                                stock_return = (current_price - start_price) / start_price if start_price > 0 else 0.0
+
+                    # Calculate relative performance (alpha over sector)
+                    relative_performance = stock_return - sector_return
+
+                    # If stock is UNDERPERFORMING or BARELY MATCHING sector, penalize
+                    # This catches FCX/KGC (matching XLB) but not LULU/NVO (outperforming)
+                    if relative_performance < 0.05:  # Less than 5% outperformance
+                        # Stock is just riding sector momentum - this is beta, not alpha
+                        if relative_performance < -0.05:
+                            # Stock underperforming sector - definitely not a leader
+                            sector_beta_penalty = 0.40  # Heavy penalty
+                        elif relative_performance < 0.0:
+                            # Stock matching sector - likely beta play
+                            sector_beta_penalty = 0.50
+                        else:
+                            # Stock barely outperforming (0-5%) - mild penalty
+                            sector_beta_penalty = 0.70
+                        phoenix_accum = phoenix_accum * sector_beta_penalty
                         # Boost alpha score - this belongs on momentum leaderboard
-                        alpha_accum = alpha_accum * 1.3
-                    elif sector_pct_from_high < 0.15:
-                        # Sector near high (10-15%) - moderate penalty
-                        sector_penalty = 0.60
-                        phoenix_accum = phoenix_accum * sector_penalty
-                        alpha_accum = alpha_accum * 1.15
+                        alpha_accum = alpha_accum * 1.2
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
