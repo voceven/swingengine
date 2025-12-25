@@ -5054,6 +5054,66 @@ class SwingTradingEngine:
                         # Boost alpha score - this belongs on momentum leaderboard
                         alpha_accum = alpha_accum * 1.2
 
+            # =========================================================================
+            # v11.5.5: REVERSAL RECENCY FILTER - Detect Early vs Late Stage Reversal
+            # =========================================================================
+            # Core insight: True phoenix = RECENT breakout from extended base
+            # False positive = Prolonged uptrend (been rallying for months/years)
+            #
+            # Detection method: Compare 3-month vs 6-month returns
+            # - "Flat then pop" pattern: 6mo ≈ 3mo returns (gains are RECENT) → TRUE PHOENIX
+            # - "Up and up" pattern: 6mo >> 3mo returns (gains spread out) → PROLONGED TREND
+            #
+            # Example:
+            # - LULU: 6mo=+40%, 3mo=+35% → 35/40=87.5% recency → early stage ✓
+            # - FCX:  6mo=+50%, 3mo=+15% → 15/50=30% recency → prolonged trend ✗
+            #
+            # This filter addresses user feedback: "FCX and KGC are not remotely near
+            # the early stage of phoenix reversal - they have been going up for months/years"
+            # =========================================================================
+            if phoenix_score > 0 and ticker in self.price_history_cache:
+                hist = self.price_history_cache[ticker]
+                close_col = 'Close' if 'Close' in hist.columns else 'close'
+
+                if close_col in hist.columns and len(hist) >= 126:  # Need 6+ months data
+                    # Calculate 3-month return (last ~63 trading days)
+                    return_3m = 0.0
+                    if len(hist) >= 63:
+                        price_3m_ago = hist[close_col].iloc[-63]
+                        current_px = hist[close_col].iloc[-1]
+                        return_3m = (current_px - price_3m_ago) / price_3m_ago if price_3m_ago > 0 else 0
+
+                    # Calculate 6-month return (last ~126 trading days)
+                    return_6m = 0.0
+                    if len(hist) >= 126:
+                        price_6m_ago = hist[close_col].iloc[-126]
+                        current_px = hist[close_col].iloc[-1]
+                        return_6m = (current_px - price_6m_ago) / price_6m_ago if price_6m_ago > 0 else 0
+
+                    # Calculate "recency ratio" - what % of 6mo gains came in last 3mo?
+                    # High ratio (>60%) = gains are RECENT = early stage breakout
+                    # Low ratio (<40%) = gains spread over time = prolonged uptrend
+                    if return_6m > 0.15:  # Only check stocks with meaningful 6mo gains
+                        recency_ratio = return_3m / return_6m if return_6m > 0 else 0
+
+                        # Debug output for validation tickers
+                        if ENABLE_VALIDATION_MODE and ticker in (VALIDATION_SUITE.get('institutional_phoenix', []) +
+                                                                   VALIDATION_SUITE.get('negative_cases', [])):
+                            print(f"  [RECENCY DEBUG] {ticker}: 3mo={return_3m:.1%}, 6mo={return_6m:.1%}, recency={recency_ratio:.1%}")
+
+                        # If recency ratio is LOW, gains are spread = prolonged uptrend = NOT early phoenix
+                        if recency_ratio < 0.40:
+                            # Gains spread over 6 months - this is a MATURE trend, not early reversal
+                            # Strong penalty - this catches FCX/KGC (rallying for months/years)
+                            recency_penalty = 0.35  # Heavy penalty for prolonged uptrends
+                            phoenix_accum = phoenix_accum * recency_penalty
+                            alpha_accum = alpha_accum * 1.3  # Boost momentum score instead
+                        elif recency_ratio < 0.55:
+                            # Moderate spread - partial penalty
+                            recency_penalty = 0.60
+                            phoenix_accum = phoenix_accum * recency_penalty
+                            alpha_accum = alpha_accum * 1.15
+
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
             if cup_handle_score > 0:
