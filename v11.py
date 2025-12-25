@@ -2123,6 +2123,17 @@ class SwingTradingEngine:
             if not self.full_df.empty:
                 self.full_df = pd.merge(self.full_df, nn_df, on='ticker', how='left').fillna(0)
 
+        # --- GPU MEMORY CLEANUP (v11.5.1) ---
+        # Free GPU memory after Hive Mind training to prevent OOM during ensemble training
+        try:
+            del X_tensor, y_tensor
+            if X_infer_tensor is not None:
+                del X_infer_tensor
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass  # Variables may not exist if training was skipped
+
     # --- RESTORED SECTOR FETCH ---
     def fetch_sector_history(self):
         print("  [CONTEXT] Fetching Sector ETF History...")
@@ -4157,6 +4168,12 @@ class SwingTradingEngine:
                 print(f"  [!] Cache load failed ({e}), Training from scratch...")
 
         # --- PREPARE DATA WITH TRIPLE-BARRIER LABELS ---
+        # GPU MEMORY SAFEGUARD (v11.5.1): Clear any residual GPU memory before ensemble training
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
         print("\n[3/4] Training Diverse Ensemble (CatBoost + TabNet + TCN + ElasticNet)...")
 
         # Phase 4: Triple-Barrier Labeling for realistic trade outcomes
@@ -4330,6 +4347,13 @@ class SwingTradingEngine:
         else:
             print(f"  [TABNET] Not available, skipping (install: pip install pytorch-tabnet)")
 
+        # GPU MEMORY CLEANUP after TabNet (v11.5.1): Free memory before TCN
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
+
         # 3. TCN (Temporal CNN for sequential patterns) - replaces XGBoost
         # FIXED: Now uses REAL sequential data instead of fake repeated snapshots
         tcn_auc = 0.0
@@ -4432,6 +4456,13 @@ class SwingTradingEngine:
         except Exception as e:
             print(f"  [!] TCN training failed: {e}, using fallback")
             self.tcn_model = None
+
+        # GPU MEMORY CLEANUP after TCN (v11.5.1): Free memory before meta-learner
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
 
         # 4. ElasticNet (Linear regularized baseline) - sanity check
         elasticnet_auc = 0.0
