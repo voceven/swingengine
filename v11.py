@@ -749,15 +749,16 @@ VALIDATION_SUITE = {
     # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
     'institutional_phoenix': [
         'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
-        # Add other confirmed institutional phoenix patterns here
+        'NVO',   # Novo Nordisk - pharma turnaround, institutional accumulation, true reversal
     ],
     # Optional: Add other pattern types for comprehensive testing
     'speculative_phoenix': [
         # 'ABC',  # Example: 200-day base, moderate drawdown
     ],
-    # Known false positives to test filtering
+    # Known false positives to test filtering (sector momentum dressed as phoenix)
     'negative_cases': [
-        # Tickers that look like phoenix but aren't (tests specificity)
+        'FCX',   # Freeport-McMoRan - precious metals sector at ATH, sector beta not phoenix
+        'KGC',   # Kinross Gold - precious metals sector at ATH, sector beta not phoenix
     ]
 }
 
