@@ -4465,16 +4465,13 @@ class SwingTradingEngine:
             preds_list.append(tabnet_preds)
             model_names.append('TN')
 
-        # TCN predictions (if available) - need to reshape for sequential input
+        # TCN predictions - SKIP in meta-learner training
+        # TCN uses 6 temporal features from price history, not X_scaled's 15 features
+        # TCN is used during inference when we have real price history available
+        # Including it in meta-learner would require re-generating sequences for ALL tickers
+        # which is memory-intensive and defeats the purpose of the sampled training
         if self.tcn_model is not None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            seq_len = min(10, len(X_scaled) // 100)
-            X_seq = torch.FloatTensor(X_scaled).unsqueeze(1).repeat(1, seq_len, 1)
-            self.tcn_model.eval()
-            with torch.no_grad():
-                tcn_preds = self.tcn_model(X_seq.to(device)).cpu().numpy().flatten()
-            preds_list.append(tcn_preds)
-            model_names.append('TCN')
+            print(f"  [TCN] Skipping in meta-learner (uses separate temporal features during inference)")
 
         # ElasticNet predictions (if available)
         if self.elasticnet_model is not None:
@@ -4568,58 +4565,10 @@ class SwingTradingEngine:
             if self.tabnet_model is not None:
                 preds_list.append(self.tabnet_model.predict_proba(X_scaled)[:, 1])
 
-            if self.tcn_model is not None and 'ticker' in self.full_df.columns:
-                # Generate real temporal sequences for TCN inference
-                try:
-                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-                    price_df = self.history_mgr.db.get_price_df()
-                    tickers = self.full_df['ticker'].tolist()
-                    seq_len = getattr(self, 'tcn_seq_len', 10)
-
-                    # Generate sequences for inference
-                    tcn_preds = []
-                    for ticker in tickers:
-                        ticker_prices = price_df[price_df['ticker'] == ticker].sort_values('date').tail(seq_len + 20)
-                        if len(ticker_prices) < seq_len:
-                            tcn_preds.append(0.5)  # Default if no data
-                            continue
-
-                        # Calculate temporal features (close-only, no volume in price_history)
-                        ticker_prices = ticker_prices.copy()
-                        ticker_prices['returns'] = ticker_prices['close'].pct_change()
-                        ticker_prices['volatility'] = ticker_prices['returns'].rolling(10).std()
-                        delta = ticker_prices['close'].diff()
-                        gain = delta.where(delta > 0, 0).rolling(14).mean()
-                        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                        ticker_prices['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-10)))
-                        ticker_prices['momentum_5d'] = ticker_prices['close'].pct_change(5)
-                        ticker_prices['momentum_10d'] = ticker_prices['close'].pct_change(10)
-                        # Use ATR if available, otherwise estimate
-                        if 'atr' in ticker_prices.columns and ticker_prices['atr'].notna().any():
-                            ticker_prices['atr_norm'] = ticker_prices['atr'] / ticker_prices['close']
-                        else:
-                            ticker_prices['atr_norm'] = ticker_prices['volatility'] * np.sqrt(10)
-
-                        # Features must match training: returns, volatility, rsi, momentum, atr_norm
-                        tcn_features = ['returns', 'volatility', 'rsi', 'momentum_5d', 'momentum_10d', 'atr_norm']
-                        seq_data = ticker_prices[tcn_features].tail(seq_len).values
-                        if seq_data.shape[0] < seq_len or np.isnan(seq_data).any():
-                            tcn_preds.append(0.5)
-                            continue
-
-                        # Normalize
-                        seq_data = (seq_data - np.nanmean(seq_data, axis=0)) / (np.nanstd(seq_data, axis=0) + 1e-10)
-                        seq_tensor = torch.FloatTensor(seq_data).unsqueeze(0).to(device)
-
-                        self.tcn_model.eval()
-                        with torch.no_grad():
-                            pred = self.tcn_model(seq_tensor).cpu().numpy().flatten()[0]
-                        tcn_preds.append(pred)
-
-                    preds_list.append(np.array(tcn_preds))
-                except Exception as e:
-                    print(f"  [!] TCN inference failed: {e}, skipping TCN predictions")
-                    # Don't add TCN to preds_list if it fails
+            # TCN is NOT included in meta-learner ensemble
+            # It uses different features (6 temporal vs 15 tabular) and was trained separately
+            # The meta-learner expects [CB, TN, EN] predictions only
+            # TCN could be used as a standalone signal boost in the future if needed
 
             if self.elasticnet_model is not None:
                 preds_list.append(self.elasticnet_model.predict_proba(X_scaled)[:, 1])
