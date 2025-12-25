@@ -4349,6 +4349,15 @@ class SwingTradingEngine:
             if not tickers:
                 raise ValueError("No tickers available for TCN sequences")
 
+            # v11.5 FIX: Sample tickers BEFORE sequence generation to prevent OOM
+            # Each ticker generates ~350 sequences on average, so for 50K limit we need ~140 tickers
+            max_tickers_for_tcn = 150  # ~52K sequences max
+            if len(tickers) > max_tickers_for_tcn:
+                import random
+                random.seed(42)  # Reproducibility
+                tickers = random.sample(tickers, max_tickers_for_tcn)
+                print(f"  [TCN] Sampled {max_tickers_for_tcn} tickers for memory efficiency")
+
             # Generate REAL sequential data (not fake repeated snapshots)
             print(f"  [TCN] Building temporal sequences for {len(tickers)} tickers...")
             X_seq_np, y_seq_np, tcn_tickers = prepare_tcn_sequences(
