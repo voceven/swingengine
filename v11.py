@@ -5071,6 +5071,15 @@ class SwingTradingEngine:
             # This filter addresses user feedback: "FCX and KGC are not remotely near
             # the early stage of phoenix reversal - they have been going up for months/years"
             # =========================================================================
+            all_validation_tickers = (VALIDATION_SUITE.get('institutional_phoenix', []) +
+                                      VALIDATION_SUITE.get('negative_cases', []))
+            is_validation_ticker = ticker in all_validation_tickers
+
+            # Debug: Confirm we reach this section for validation tickers
+            if ENABLE_VALIDATION_MODE and is_validation_ticker:
+                in_cache = ticker in self.price_history_cache
+                print(f"  [RECENCY CHECK] {ticker}: phoenix_score={phoenix_score:.2f}, in_cache={in_cache}")
+
             if phoenix_score > 0 and ticker in self.price_history_cache:
                 hist = self.price_history_cache[ticker]
 
