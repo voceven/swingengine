@@ -2264,6 +2264,22 @@ class SwingTradingEngine:
             flag_ok = flag_range <= BULL_FLAG_CONFIG['flag_max_range']
             is_flag = pole_ok and flag_ok  # Don't require volume declining
 
+            # v11.5 FIX: Check if breakout already occurred (stale flag detection)
+            # If current price is >5% above flag high, the breakout already happened
+            current_price = close.iloc[-1]
+            breakout_threshold = 1.05  # 5% above flag range = breakout occurred
+            breakout_already_happened = current_price > flag_high * breakout_threshold
+
+            if breakout_already_happened and is_flag:
+                is_flag = False  # Invalidate stale flags
+                breakout_pct = ((current_price / flag_high) - 1) * 100
+                result['is_flag'] = False
+                result['pole_gain'] = pole_gain
+                result['flag_range'] = flag_range
+                result['flag_score'] = 0.1  # Minimal score for tracking
+                result['explanation'] = f"Flag breakout already occurred (+{breakout_pct:.1f}% above flag)"
+                return result
+
             result['pole_gain'] = pole_gain
             result['flag_range'] = flag_range
             result['is_flag'] = is_flag
@@ -2983,9 +2999,13 @@ class SwingTradingEngine:
             # True phoenix reversals emerge from bases, not from stocks already near highs
             week_52_period = min(len(close), 252)
             high_52w = close.iloc[-week_52_period:].max()
+            low_52w = close.iloc[-week_52_period:].min()
             pct_from_52w_high = (high_52w - current_price) / high_52w if high_52w > 0 else 0
+            pct_from_52w_low = (current_price - low_52w) / low_52w if low_52w > 0 else 0
             result['high_52w'] = float(high_52w)
+            result['low_52w'] = float(low_52w)
             result['pct_from_52w_high'] = float(pct_from_52w_high)
+            result['pct_from_52w_low'] = float(pct_from_52w_low)
 
             # v10.8.1: FIX - Look at FULL lookback period, not just min_days
             # Previous bug: Only looked at last 60 days, making institutional phoenix (365+) impossible
@@ -4882,22 +4902,37 @@ class SwingTradingEngine:
                 ambush_accum = ambush_accum * 0.7
 
             # =========================================================================
-            # v11.2: MOMENTUM FILTER - Distinguish breakouts from momentum plays
+            # v11.5: MOMENTUM FILTER - Distinguish reversals from momentum plays
             # =========================================================================
             # True phoenix reversals emerge from extended consolidation BASES, not
             # from stocks already trading near their 52-week highs.
             #
-            # If a stock is within 10% of its 52-week high, it's likely momentum,
-            # not a reversal from accumulation. Apply additional penalty.
+            # Two-pronged check:
+            # 1. Near 52w high (within 20%) = likely momentum, penalize phoenix
+            # 2. Far from 52w low (>50% above) = not a true "bottom" reversal
             # =========================================================================
             pct_from_52w_high = phoenix_data.get('pct_from_52w_high', 0)
-            if phoenix_score > 0 and pct_from_52w_high < 0.10:
-                # Stock is within 10% of 52-week high - likely momentum, not reversal
-                # Apply 50% penalty to phoenix score
-                momentum_penalty = 0.50
+            pct_from_52w_low = phoenix_data.get('pct_from_52w_low', 0)
+
+            # Check 1: Near 52-week high (tightened from 10% to 20%)
+            if phoenix_score > 0 and pct_from_52w_high < 0.20:
+                # Stock is within 20% of 52-week high - likely momentum, not reversal
+                # Apply graduated penalty: closer to high = stronger penalty
+                if pct_from_52w_high < 0.10:
+                    momentum_penalty = 0.40  # Very close to high - strong penalty
+                else:
+                    momentum_penalty = 0.60  # 10-20% from high - moderate penalty
                 phoenix_accum = phoenix_accum * momentum_penalty
                 # Boost alpha score instead - this is a momentum play
                 alpha_accum = alpha_accum * 1.2
+
+            # Check 2: Too far from 52-week low = not a true bottom reversal
+            # True reversals should be <50% above their 52w low (still in "value" zone)
+            if phoenix_score > 0 and pct_from_52w_low > 0.50:
+                # Stock is >50% above 52w low - it's had a major run already
+                # Apply penalty - this is momentum dressed as a phoenix
+                bottom_penalty = 0.70
+                phoenix_accum = phoenix_accum * bottom_penalty
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
@@ -5305,9 +5340,10 @@ if __name__ == "__main__":
                 print(f"STRATEGY 5: PHOENIX REVERSAL (6-12 Month Base Breakouts)")
                 print("Logic: Extended consolidation + Volume surge + RSI 50-70 + Breakout")
                 print("="*80)
-                phoenix_display = ['ticker', 'trend_score_val', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
+                # v11.5 FIX: Sort by phoenix_score (not trend_score_val) for true reversal ranking
+                phoenix_display = ['ticker', 'phoenix_score', 'solidity_score', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
                 phoenix_display = [c for c in phoenix_display if c in phoenix_df.columns]
-                phoenix_sorted = phoenix_df.sort_values('trend_score_val', ascending=False).head(5)
+                phoenix_sorted = phoenix_df.sort_values('phoenix_score', ascending=False).head(5)
                 print(phoenix_sorted[phoenix_display].to_string(index=False))
 
                 # Show explanations for phoenix candidates
