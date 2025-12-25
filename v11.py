@@ -307,6 +307,19 @@ Changelog v11.2 Phase 2.1 (Extreme Contango Fix - @alshfaw Analysis):
 - NEW REGIME: "Complacency (Extreme Contango)" when ratio > 1.20
 - CURRENT STATUS (Dec 2025): VIX3M/VIX at 1.26 = EXTREME CONTANGO (bearish)
 - EXPECTED: Score adjustment now -4.0 instead of +3.0 (7 point swing)
+
+Changelog v11.5.2 (Momentum Filter Fix - NVO Restoration):
+- CRITICAL FIX: High solidity now BYPASSES momentum penalty
+  - NVO (solidity 0.70) was incorrectly filtered despite valid institutional accumulation
+  - Root cause: Momentum filter penalized ALL stocks near 52w high, including valid breakouts
+- NEW LOGIC: Solidity gate on momentum filter
+  - Only penalize if solidity < 0.55 (weak accumulation signal)
+  - High solidity (>= 0.55) = institutional conviction validates breakout thesis
+  - Example: NVO with 0.70 solidity now PASSES, MU with 0.40 solidity still FILTERED
+- AFFECTED CHECKS:
+  - 52w high proximity: Only penalize LOW solidity candidates near highs
+  - 52w low distance: Only penalize LOW solidity candidates far from lows
+- EXPECTED: NVO restored to Phoenix Leaderboard alongside LULU
 """
 
 !pip uninstall -y alpaca-trade-api
@@ -4891,21 +4904,28 @@ class SwingTradingEngine:
                 ambush_accum = ambush_accum * 0.7
 
             # =========================================================================
-            # v11.5: MOMENTUM FILTER - Distinguish reversals from momentum plays
+            # v11.5.2: MOMENTUM FILTER - Distinguish reversals from momentum plays
             # =========================================================================
             # True phoenix reversals emerge from extended consolidation BASES, not
             # from stocks already trading near their 52-week highs.
             #
-            # Two-pronged check:
-            # 1. Near 52w high (within 20%) = likely momentum, penalize phoenix
-            # 2. Far from 52w low (>50% above) = not a true "bottom" reversal
+            # CRITICAL FIX (v11.5.2): High solidity BYPASSES momentum penalty
+            # - NVO (solidity 0.70) was incorrectly filtered despite valid accumulation
+            # - High solidity = institutional conviction validates the breakout thesis
+            # - Only penalize LOW solidity candidates near highs (e.g., MU at 0.40)
+            #
+            # Two-pronged check (with solidity gate):
+            # 1. Near 52w high (within 20%) + LOW solidity = likely momentum, penalize
+            # 2. Far from 52w low (>50% above) + LOW solidity = not a true reversal
             # =========================================================================
             pct_from_52w_high = phoenix_data.get('pct_from_52w_high', 0)
             pct_from_52w_low = phoenix_data.get('pct_from_52w_low', 0)
+            solidity_threshold = 0.55  # Match SOLIDITY_CONFIG base_threshold
 
-            # Check 1: Near 52-week high (tightened from 10% to 20%)
-            if phoenix_score > 0 and pct_from_52w_high < 0.20:
-                # Stock is within 20% of 52-week high - likely momentum, not reversal
+            # Check 1: Near 52-week high (only penalize LOW solidity candidates)
+            # High solidity (>= 0.55) = institutional accumulation validates breakout
+            if phoenix_score > 0 and pct_from_52w_high < 0.20 and solidity_score < solidity_threshold:
+                # LOW solidity + near high = likely momentum play, not phoenix
                 # Apply graduated penalty: closer to high = stronger penalty
                 if pct_from_52w_high < 0.10:
                     momentum_penalty = 0.40  # Very close to high - strong penalty
@@ -4915,11 +4935,11 @@ class SwingTradingEngine:
                 # Boost alpha score instead - this is a momentum play
                 alpha_accum = alpha_accum * 1.2
 
-            # Check 2: Too far from 52-week low = not a true bottom reversal
-            # True reversals should be <50% above their 52w low (still in "value" zone)
-            if phoenix_score > 0 and pct_from_52w_low > 0.50:
-                # Stock is >50% above 52w low - it's had a major run already
-                # Apply penalty - this is momentum dressed as a phoenix
+            # Check 2: Too far from 52-week low (only penalize LOW solidity candidates)
+            # High solidity + price recovery = working thesis, not false positive
+            if phoenix_score > 0 and pct_from_52w_low > 0.50 and solidity_score < solidity_threshold:
+                # LOW solidity + far from low = momentum dressed as phoenix
+                # Apply penalty
                 bottom_penalty = 0.70
                 phoenix_accum = phoenix_accum * bottom_penalty
 
