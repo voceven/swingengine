@@ -383,6 +383,21 @@ import random
 import requests
 from datetime import datetime, timedelta
 
+# =============================================================================
+# ENGINE MODULES (v11.5 Modular Architecture)
+# =============================================================================
+# Import configuration from module - can be updated independently
+# Config changes only require updating engine/config.py (~250 lines)
+from engine.config import (
+    SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
+    REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
+    MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
+    VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
+    POSITION_SIZING_CONFIG, RISK_TIER_MATRIX
+)
+# Neural network architectures from module
+from engine.neural import SwingTransformer, TemporalBlock, TCN
+
 ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
 ALPACA_SECRET_KEY = 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK'
 
@@ -643,245 +658,13 @@ def get_device():
 
 device, device_name = get_device()
 
-SECTOR_MAP = {
-    'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
-    'Consumer Cyclical': 'XLY', 'Industrials': 'XLI', 'Communication Services': 'XLC',
-    'Consumer Defensive': 'XLP', 'Energy': 'XLE', 'Basic Materials': 'XLB',
-    'Real Estate': 'XLRE', 'Utilities': 'XLU'
-}
-
-# --- PHASE 9 CONFIGURATION ---
-# Pattern Detection Thresholds (CALIBRATED v9.5+ - production ready)
-BULL_FLAG_CONFIG = {
-    'pole_min_gain': 0.05,        # 5% minimum pole gain
-    'pole_days': 12,              # Days to measure pole
-    'flag_max_range': 0.15,       # 15% max consolidation (was 12%, catches BFLY now)
-    'flag_days': 10,              # Days of consolidation
-    'volume_decline_ratio': 0.95  # Very relaxed - 95% still counts
-}
-
-GEX_WALL_CONFIG = {
-    'min_support_gamma': 50_000,     # Lowered to 50K for more wall detection
-    'min_resist_gamma': -50_000,     # Raised to -50K for more resistance walls
-    'proximity_pct': 0.10            # 10% proximity - walls up to 10% away count
-}
-
-# Phoenix Reversal Configuration (Extended for Institutional Patterns)
-# v10.4: Supports both speculative (2-10 months) and institutional (12-24 months) phoenix patterns
-# v10.8.1: Fixed consolidation threshold (10% too strict for deep drawdown recoveries)
-PHOENIX_CONFIG = {
-    'min_base_days': 60,           # Minimum consolidation period (2 months)
-    'max_base_days': 730,          # Extended to 24 months for institutional phoenix (was 250)
-    'institutional_threshold': 365,  # 12+ months = institutional phoenix (LULU-like patterns)
-    'volume_surge_threshold': 1.5, # Volume must exceed 1.5x average
-    'rsi_min': 50,                 # RSI must be between 50-70 (not oversold, not overbought)
-    'rsi_max': 70,
-    'max_drawdown_pct': 0.70,      # Extended to 70% for deep corrections (was 0.35, LULU had 60%)
-    'min_consolidation_pct': 0.15, # v10.8.1: Increased from 0.10 to 0.15 (VCP standard)
-    'breakout_threshold': 0.03     # Breakout must be at least 3% move
-}
-
-REVERSAL_CONFIG = {
-    'lookback_days': 45,          # 45 day lookback for downtrend
-    'min_days_below_sma': 15,     # Lowered to 15 days - even more lenient
-    'dp_proximity_pct': 0.10      # 10% proximity for DP support
-}
-
-# --- v11.0 SMART GATEKEEPER CONFIGURATION ---
-# Dollar-volume liquidity thresholds by market cap tier
-# Filters illiquid stocks before expensive pattern analysis
-GATEKEEPER_CONFIG = {
-    # Dollar-volume thresholds (price × volume)
-    'large_cap_threshold': 5_000_000,    # $5M daily dollar-volume for large caps
-    'mid_cap_threshold': 2_000_000,      # $2M for mid caps
-    'small_cap_threshold': 1_000_000,    # $1M for small caps
-
-    # Market cap classification ($B)
-    'large_cap_min': 10_000_000_000,     # $10B+ = large cap
-    'mid_cap_min': 2_000_000_000,        # $2B-$10B = mid cap
-    # Below $2B = small cap
-
-    # Dark Pool Bypass: High DP inflow bypasses liquidity filter
-    'dp_bypass_threshold': 500_000,      # $500K+ DP inflow = allow through
-
-    # Bid-Ask Spread: Max spread for tradeable executions
-    'max_spread_pct': 0.005,             # 0.5% max spread
-
-    # Options Liquidity (for options traders)
-    'min_options_oi': 500,               # Minimum 500 contracts open interest
-}
-
-# --- v11.0 SOLIDITY SCORE CONFIGURATION ---
-# Detects institutional accumulation during retail exhaustion
-# Key insight: High DP activity + narrow price range + declining volume = smart money loading
-SOLIDITY_CONFIG = {
-    # Consolidation Parameters
-    'fib_retracement': 0.382,            # 38.2% Fibonacci level (institutional standard)
-    'min_consolidation_days': 20,        # 20+ days of tight range required
-    'max_consolidation_range': 0.382,    # Price range within 38.2% of base
-
-    # Volume Decline Detection
-    'volume_decline_ratio': 0.70,        # Recent volume < 70% of average = declining
-    'volume_lookback_days': 50,          # Compare recent 5d vs 50d average
-
-    # Institutional Flow Thresholds
-    'min_dp_total': 10_000_000,          # $10M+ dark pool activity
-    'signature_print_bonus': 0.10,       # +10% score for signature prints
-
-    # Scoring Weights
-    'weight_in_phoenix': 0.18,           # 18% of final Phoenix score (15-20% range)
-    'base_threshold': 0.55,              # v11.2: Raised from 0.50 - institutional accumulation must be clear
-}
-
-# --- v11.0 DUAL-RANKING CONFIGURATION ---
-# Separate Alpha Momentum and Phoenix Reversal leaderboards
-DUAL_RANKING_CONFIG = {
-    # Alpha Momentum Leaderboard (continuation plays)
-    'alpha_momentum': {
-        'min_score': 75,                 # Minimum score to qualify
-        'top_n': 25,                     # Top 25 momentum picks
-        # Scoring weights for Alpha Momentum
-        'weight_trend': 0.30,            # 30% trend/price action
-        'weight_ml': 0.25,               # 25% ML ensemble prediction
-        'weight_neural': 0.15,           # 15% Hive Mind neural score
-        'weight_volume': 0.15,           # 15% volume momentum
-        'weight_pattern': 0.15,          # 15% bull flag/continuation patterns
-    },
-
-    # Phoenix Reversal Leaderboard (reversal plays)
-    'phoenix_reversal': {
-        'min_score': 55,                 # v11.2: Lowered from 60 (more lenient qualification)
-        'top_n': 25,                     # Top 25 reversal picks
-        # Scoring weights for Phoenix (LULU-optimized)
-        'weight_solidity': 0.20,         # v11.2: Increased from 0.18 (institutional accumulation)
-        'weight_duration': 0.20,         # 20% consolidation duration
-        'weight_flow': 0.15,             # v11.2: Decreased from 0.20 (early accumulation is quiet)
-        'weight_breakout': 0.15,         # 15% breakout confirmation
-        'weight_pattern': 0.15,          # 15% reversal patterns (double bottom, etc.)
-        'weight_ml': 0.15,               # v11.2: Increased from 0.12 for base points
-    },
-}
-
-# Sector Capping (Risk Management)
-MAX_PICKS_PER_SECTOR = 3
-
-# Performance Tuning
-PERFORMANCE_CONFIG = {
-    'catboost_trials': 25,        # Increased from 15 for better AUC (v10.1.1)
-    'catboost_max_iterations': 500,  # Increased from 300 for better AUC (v10.1.1)
-    'catboost_max_depth': 10,     # Increased from 8 for better AUC (v10.1.1)
-    'catboost_cv_folds': 5,       # Increased from 3 for better AUC (v10.1.1)
-    'model_cache_days': 7,        # Model cache duration (invalidated on regime change)
-    'transformer_epochs': 30,     # Reduced from 50 for faster training
-    'max_tickers_to_fetch': 3000, # Limit ticker downloads for speed
-    'price_cache_days': 7,        # Refresh price cache weekly
-    'batch_size': 75              # Batch size for yfinance downloads
-}
-
-# v10.6: Validation Suite Configuration (Module Level)
-# Force-include known institutional phoenix patterns to validate detection
-ENABLE_VALIDATION_MODE = True  # Change to False once validated
-
-VALIDATION_SUITE = {
-    # Institutional Phoenix (12-24 month bases, activist/turnaround plays)
-    'institutional_phoenix': [
-        'LULU',  # Elliott $1B stake, 730d base, 60% drawdown, double bottom
-        'NVO',   # Novo Nordisk - pharma turnaround, institutional accumulation, true reversal
-    ],
-    # Optional: Add other pattern types for comprehensive testing
-    'speculative_phoenix': [
-        # 'ABC',  # Example: 200-day base, moderate drawdown
-    ],
-    # Known false positives to test filtering (sector momentum dressed as phoenix)
-    'negative_cases': [
-        'FCX',   # Freeport-McMoRan - precious metals sector at ATH, sector beta not phoenix
-        'KGC',   # Kinross Gold - precious metals sector at ATH, sector beta not phoenix
-    ]
-}
-
-# # Macro Score Weights (how much macro conditions affect individual scores)
-# MACRO_WEIGHTS = {
-#     'vix_penalty_threshold': 25,      # VIX above this penalizes scores
-#     'vix_penalty_per_point': 0.5,     # Score penalty per VIX point above threshold
-#     'tnx_penalty_threshold': 4.5,     # 10Y yield above this penalizes growth stocks
-#     'tnx_penalty_per_point': 2.0,     # Score penalty per yield point above threshold
-#     'dxy_strength_threshold': 104,    # DXY above this indicates strong dollar
-#     'dxy_penalty_per_point': 0.3      # Score penalty per DXY point above threshold
-# }
-
-# v10.10: Dynamic Macro Weights (Z-Score Based)
-MACRO_WEIGHTS = {
-    # VIX: Penalty if 2.0 std devs above 6-month average
-    'vix_z_threshold': 2.0,
-    'vix_penalty_per_sigma': 2.0,  # -2 points for every sigma above 2.0
-
-    # TNX: Penalty if 2.0 std devs above 6-month average (Rate Shock)
-    'tnx_z_threshold': 2.0,
-    'tnx_penalty_per_sigma': 3.0,  # Rates shocks are deadly for swings
-
-    # DXY: Penalty if 2.0 std devs above 6-month average (Dollar Spike)
-    'dxy_z_threshold': 2.0,
-    'dxy_penalty_per_sigma': 1.5
-}
-
-# --- PHASE 2: VIX TERM STRUCTURE + VVIX DIVERGENCE ---
-# Advanced volatility analysis for better regime detection
-# Reference: @alshfaw analysis - 1.26 is historically bearish for SPY
-# Key levels: 1.20 (warning), 1.26 (danger), 1.30 (extreme complacency)
-#
-# IMPORTANT: VIX30D = ^VIX (standard VIX index measures 30-day implied volatility)
-# We use ^VIX as the VIX30D proxy per @alshfaw's VIX3M/VIX30D term structure analysis
-# Yahoo Finance ticker: ^VIX (there is no separate ^VIX30D ticker)
-VIX_TERM_STRUCTURE_CONFIG = {
-    # Term Structure Detection (VIX3M / VIX30D ratio) - per @alshfaw methodology
-    # Normal contango (1.00-1.10): Healthy market, neutral
-    # Mild contango (1.10-1.20): Low vol environment, slightly bullish
-    # EXTREME contango (>1.20): COMPLACENCY WARNING - historically precedes corrections
-    #   - 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024 (@alshfaw)
-    # Backwardation (<0.95): Fear/panic, imminent vol spike expected
-    'mild_contango_threshold': 1.10,  # VIX3M/VIX 1.10-1.20 = healthy low vol
-    'extreme_contango_threshold': 1.20,  # VIX3M/VIX > 1.20 = COMPLACENCY (bearish warning)
-    'backwardation_threshold': 0.95,  # VIX3M/VIX < 0.95 = backwardation (fear)
-    'mild_contango_bonus': 2.0,       # +2 points in healthy contango (1.10-1.20)
-    'extreme_contango_penalty': 4.0,  # -4 points when > 1.20 (complacency trap)
-    'backwardation_penalty': 5.0,     # -5 points in backwardation (fear)
-
-    # VVIX Divergence Detection
-    # VVIX = volatility of VIX (fear of fear)
-    # VVIX rising + VIX falling = vol spike incoming (bearish)
-    # VVIX falling + VIX rising = vol spike fading (bullish)
-    'vvix_high_threshold': 110,       # VVIX > 110 = elevated vol-of-vol
-    'vvix_low_threshold': 85,         # VVIX < 85 = complacency
-    'vvix_divergence_lookback': 5,    # Days to check for divergence
-    'vvix_divergence_penalty': 4.0,   # Penalty when VVIX diverges bearishly
-    'vvix_convergence_bonus': 2.0,    # Bonus when VVIX converges bullishly
-}
-
-# --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
-# Kelly Formula: Position = (Edge * P(win) - P(loss)) / Vol_Risk
-# Capped at 0.25 * Kelly for safety (quarter-Kelly)
-POSITION_SIZING_CONFIG = {
-    'kelly_fraction': 0.25,           # Quarter-Kelly for safety
-    'max_position_pct': 0.10,         # Max 10% of portfolio per position
-    'min_position_pct': 0.01,         # Min 1% of portfolio per position
-    'default_win_rate': 0.55,         # Conservative default win rate
-    'default_edge': 0.10,             # Conservative default edge (10%)
-}
-
-# Risk Tier Matrix: Vol buckets determine position multipliers
-RISK_TIER_MATRIX = {
-    # nn_score ranges -> vol_bucket -> position multiplier
-    'score_tiers': {
-        (95, 100): {'<5%': 1.0, '5-6%': 0.75, '>6%': 0.50},   # Highest conviction
-        (85, 94):  {'<5%': 0.75, '5-6%': 0.50, '>6%': 0.35},  # High conviction
-        (70, 84):  {'<5%': 0.50, '5-6%': 0.35, '>6%': 0.20},  # Medium conviction
-    },
-    'vol_thresholds': {
-        'low': 0.05,    # <5% ATR/Price = low vol
-        'medium': 0.06, # 5-6% ATR/Price = medium vol
-        # >6% = high vol
-    }
-}
+# =============================================================================
+# CONFIGURATION - Now imported from engine/config.py
+# =============================================================================
+# All config constants (SECTOR_MAP, PHOENIX_CONFIG, DUAL_RANKING_CONFIG, etc.)
+# are now imported from engine.config at the top of this file.
+# To modify configuration, edit: engine/config.py (~250 lines)
+# This enables faster iteration - only copy config.py to Colab for config changes.
 
 # --- PHASE 4: TRIPLE-BARRIER LABELING ---
 # Better training targets that reflect realistic trade outcomes
@@ -1084,85 +867,11 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
     return np.array(sequences), np.array(labels), ticker_list
 
 
-# --- NEURAL NETWORK ARCHITECTURE (TRANSFORMER v2) ---
-class SwingTransformer(nn.Module):
-    def __init__(self, input_size, d_model=128, nhead=4, num_layers=3, output_size=1, dropout=0.1):
-        super(SwingTransformer, self).__init__()
-        self.embedding = nn.Linear(input_size, d_model)
-        self.pos_encoder = nn.Parameter(torch.zeros(1, 10, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc1 = nn.Linear(d_model, 64)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(64, output_size)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        x = self.embedding(x)
-        if x.size(1) <= self.pos_encoder.size(1):
-            x = x + self.pos_encoder[:, :x.size(1), :]
-        x = self.transformer_encoder(x)
-        x = x.mean(dim=1)
-        x = self.fc1(x)
-        x = self.relu(x)
-        out = self.fc2(x)
-        out = self.sigmoid(out)
-        return out
-
-# --- PHASE 3: TEMPORAL CONVOLUTIONAL NETWORK (TCN) ---
-# Replaces XGBoost for architectural diversity
-# TCN advantages: variable-length sequences, dilated convolutions for long-range patterns
-# Used for detecting multi-day accumulation patterns (e.g., LULU 446-day base)
-class TemporalBlock(nn.Module):
-    """Single temporal block with dilated causal convolution + residual connection"""
-    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
-        super(TemporalBlock, self).__init__()
-        padding = (kernel_size - 1) * dilation  # Causal padding
-        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
-        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
-        self.dropout = nn.Dropout(dropout)
-        self.relu = nn.ReLU()
-        # Residual connection (downsample if dimensions differ)
-        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
-        self.init_weights()
-
-    def init_weights(self):
-        self.conv1.weight.data.normal_(0, 0.01)
-        self.conv2.weight.data.normal_(0, 0.01)
-
-    def forward(self, x):
-        # Causal convolution: trim future values
-        out = self.conv1(x)[:, :, :x.size(2)]
-        out = self.relu(self.dropout(out))
-        out = self.conv2(out)[:, :, :x.size(2)]
-        out = self.relu(self.dropout(out))
-        # Residual
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
-
-class TCN(nn.Module):
-    """Temporal Convolutional Network for sequential pattern detection"""
-    def __init__(self, input_size, num_channels=[32, 32, 16], kernel_size=3, dropout=0.2):
-        super(TCN, self).__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation = 2 ** i  # Exponential dilation for large receptive field
-            in_channels = input_size if i == 0 else num_channels[i-1]
-            out_channels = num_channels[i]
-            layers.append(TemporalBlock(in_channels, out_channels, kernel_size, dilation, dropout))
-        self.network = nn.Sequential(*layers)
-        self.fc = nn.Linear(num_channels[-1], 1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # x: (batch, seq_len, features) -> (batch, features, seq_len) for Conv1d
-        x = x.transpose(1, 2)
-        out = self.network(x)
-        # Global average pooling over time dimension
-        out = out.mean(dim=2)
-        out = self.fc(out)
-        return self.sigmoid(out)
+# =============================================================================
+# NEURAL NETWORKS - Now imported from engine/neural.py
+# =============================================================================
+# SwingTransformer, TemporalBlock, TCN are now imported from engine.neural
+# To modify neural architectures, edit: engine/neural.py (~150 lines)
 
 # --- TITAN DATABASE MANAGER (SQLITE BACKBONE) ---
 class TitanDB:
