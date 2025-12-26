@@ -414,6 +414,9 @@ from .utils import (get_device, configure_yfinance_session, YF_SESSION, is_weeke
     install_requirements, ALPACA_AVAILABLE)
 from .data_loader import TitanDB, HistoryManager
 from .data_prep import triple_barrier_labels, prepare_tcn_sequences
+from .patterns import (detect_bull_flag, find_gex_walls, detect_downtrend_reversal,
+    calculate_flow_factor, calculate_solidity_score, detect_phoenix_reversal,
+    detect_cup_and_handle, detect_double_bottom, apply_smart_gatekeeper)
 ''')
         print(f"  [BOOTSTRAP] Created {init_path}")
 
@@ -714,6 +717,308 @@ def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_col
 ''')
         print(f"  [BOOTSTRAP] Created {prep_path}")
 
+    # Bootstrap engine/patterns.py
+    patterns_path = os.path.join(engine_dir, 'patterns.py')
+    if not _is_valid_py(patterns_path):
+        with open(patterns_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+"""Pattern Detection Functions for Swing Trading Engine v12"""
+import numpy as np, pandas as pd, math
+from .config import (BULL_FLAG_CONFIG, GEX_WALL_CONFIG, REVERSAL_CONFIG, PHOENIX_CONFIG,
+    SOLIDITY_CONFIG, GATEKEEPER_CONFIG, ENABLE_VALIDATION_MODE, VALIDATION_SUITE)
+
+def detect_bull_flag(history_df, config=None):
+    if config is None: config = BULL_FLAG_CONFIG
+    result = {'is_flag': False, 'flag_score': 0.0, 'pole_gain': 0.0, 'flag_range': 0.0, 'explanation': ''}
+    lookback = config['pole_days'] + config['flag_days'] + 5
+    if history_df is None or len(history_df) < lookback:
+        result['explanation'] = 'Insufficient history'; return result
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        volume = history_df.get('Volume')
+        if isinstance(volume, pd.DataFrame): volume = volume.iloc[:, 0]
+        close, volume = close.iloc[-lookback:], volume.iloc[-lookback:] if volume is not None else None
+        pole_gain = (close.iloc[config['pole_days']] - close.iloc[0]) / close.iloc[0] if close.iloc[0] > 0 else 0
+        flag_seg = close.iloc[-config['flag_days']:]
+        flag_range = (flag_seg.max() - flag_seg.min()) / flag_seg.mean() if flag_seg.mean() > 0 else 1
+        vol_declining = True
+        if volume is not None and len(volume) >= lookback:
+            pv, fv = volume.iloc[:config['pole_days']].mean(), volume.iloc[-config['flag_days']:].mean()
+            vol_declining = (fv/pv) < config['volume_decline_ratio'] if pv > 0 else True
+        is_flag = pole_gain >= config['pole_min_gain'] and flag_range <= config['flag_max_range']
+        if is_flag and close.iloc[-1] > flag_seg.max() * 1.05:
+            is_flag = False; result['explanation'] = f"Flag breakout already occurred"
+            return {**result, 'pole_gain': pole_gain, 'flag_range': flag_range, 'flag_score': 0.1}
+        result.update({'pole_gain': pole_gain, 'flag_range': flag_range, 'is_flag': is_flag})
+        if is_flag:
+            score = min(1.0, (pole_gain/0.15)*0.4 + (1 - flag_range/config['flag_max_range'])*0.4) + (0.2 if vol_declining else 0)
+            result['flag_score'], result['explanation'] = score, f"BULL FLAG: {pole_gain*100:.1f}% pole, {flag_range*100:.1f}% range"
+        else: result['explanation'] = 'No bull flag pattern'
+    except Exception as e: result['explanation'] = f'Pattern error: {str(e)[:30]}'
+    return result
+
+def find_gex_walls(ticker, current_price, strike_gamma_data=None, dp_support_levels=None, bot_df=None):
+    result = {'support_wall': None, 'resistance_wall': None, 'wall_protection_score': 0.0, 'explanation': ''}
+    if current_price is None or current_price <= 0: result['explanation'] = 'Invalid price'; return result
+    if strike_gamma_data and ticker in strike_gamma_data and strike_gamma_data[ticker]:
+        try:
+            sg = strike_gamma_data[ticker]
+            sup = {k: v for k, v in sg.items() if k < current_price and v > GEX_WALL_CONFIG['min_support_gamma']}
+            if sup:
+                best = max(sup.keys(), key=lambda x: sup[x])
+                result['support_wall'], prox = float(best), (current_price - best) / current_price
+                if prox <= GEX_WALL_CONFIG['proximity_pct']: result['wall_protection_score'] = min(1.0, sup[best]/250000)
+            res = {k: v for k, v in sg.items() if k > current_price and v < GEX_WALL_CONFIG['min_resist_gamma']}
+            if res: result['resistance_wall'] = float(min(res.keys(), key=lambda x: res[x]))
+            exp = []
+            if result['support_wall']: exp.append(f"GEX support ${result['support_wall']:.0f}")
+            if result['resistance_wall']: exp.append(f"GEX resist ${result['resistance_wall']:.0f}")
+            result['explanation'] = " | ".join(exp) if exp else "No GEX walls"; return result
+        except: pass
+    if dp_support_levels and ticker in dp_support_levels:
+        levels = [p for p in dp_support_levels[ticker] if p < current_price]
+        if levels:
+            best = max(levels); prox = (current_price - best) / current_price
+            if prox <= GEX_WALL_CONFIG['proximity_pct']:
+                result['support_wall'], result['wall_protection_score'] = best, 0.5
+                result['explanation'] = f"DP support ${best:.2f}"; return result
+    result['explanation'] = 'No wall data'; return result
+
+def detect_downtrend_reversal(ticker, history_df, dp_support_levels=None):
+    result = {'is_reversal': False, 'reversal_score': 0.0, 'days_below_sma': 0, 'has_dp_support': False, 'explanation': ''}
+    lb = REVERSAL_CONFIG['lookback_days']
+    if history_df is None or len(history_df) < lb: result['explanation'] = 'Insufficient history'; return result
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        sma50 = close.rolling(50).mean()
+        days_below = (close.iloc[-lb:] < sma50.iloc[-lb:]).sum()
+        result['days_below_sma'] = int(days_below)
+        is_dt = days_below >= REVERSAL_CONFIG['min_days_below_sma']
+        cp = float(close.iloc[-1]); has_dp = False; dp_lv = None
+        if dp_support_levels and ticker in dp_support_levels:
+            nearby = [p for p in dp_support_levels[ticker] if abs(p-cp)/cp < REVERSAL_CONFIG['dp_proximity_pct']]
+            if nearby: has_dp, dp_lv = True, max(nearby)
+        result['has_dp_support'] = has_dp
+        result['is_reversal'] = is_dt and has_dp
+        if result['is_reversal']:
+            result['reversal_score'] = 0.8; result['explanation'] = f"REVERSAL: {days_below}d downtrend + DP ${dp_lv:.0f}"
+        elif is_dt: result['reversal_score'] = 0.2; result['explanation'] = f"Downtrend ({days_below}d) no support"
+        else: result['explanation'] = 'Not in downtrend'
+    except Exception as e: result['explanation'] = f'Error: {str(e)[:30]}'
+    return result
+
+def calculate_flow_factor(ticker, volume_ratio, full_df=None, signature_prints=None):
+    fd = {'volume_component': 0.0, 'dp_component': 0.0, 'signature_component': 0.0, 'options_component': 0.0, 'raw_dp_total': 0.0, 'has_signature': False}
+    try:
+        if volume_ratio >= 4.0: fd['volume_component'] = 0.25
+        elif volume_ratio >= 2.5: fd['volume_component'] = 0.20
+        elif volume_ratio >= 1.5: fd['volume_component'] = 0.15
+        elif volume_ratio >= 1.0: fd['volume_component'] = 0.05 + (volume_ratio - 1.0) * 0.10
+        td = None
+        if full_df is not None and not full_df.empty:
+            tr = full_df[full_df['ticker'] == ticker]
+            if not tr.empty: td = tr.iloc[0]
+        if td is not None and 'dp_total' in td:
+            dp = float(td.get('dp_total', 0)); fd['raw_dp_total'] = dp
+            if dp >= 1e9: fd['dp_component'] = 0.35
+            elif dp >= 5e8: fd['dp_component'] = 0.30
+            elif dp >= 1e8: fd['dp_component'] = 0.25
+            elif dp >= 5e7: fd['dp_component'] = 0.20
+            elif dp >= 1e7: fd['dp_component'] = 0.12
+            elif dp >= 1e6: fd['dp_component'] = 0.05
+        if signature_prints and ticker in signature_prints:
+            fd['has_signature'] = True; fd['signature_component'] = min(0.20, 0.10 + len(signature_prints[ticker])*0.05 if isinstance(signature_prints[ticker], list) else 0.15)
+        elif td is not None:
+            dm = float(td.get('dp_max', td.get('dp_total', 0)))
+            if dm >= 5e7: fd['signature_component'], fd['has_signature'] = 0.15, True
+            elif dm >= 1e7: fd['signature_component'] = 0.08
+        if td is not None:
+            ng, nd = float(td.get('net_gamma', 0)), float(td.get('net_delta', 0))
+            if ng > 0 and nd > 0: fd['options_component'] = 0.20 * (min(1, abs(ng)/1e6) + min(1, abs(nd)/5e6)) / 2
+            elif ng > 0 or nd > 0: fd['options_component'] = 0.08
+        return min(1.0, fd['volume_component'] + fd['dp_component'] + fd['signature_component'] + fd['options_component']), fd
+    except: return 0.0, fd
+
+def calculate_solidity_score(ticker, history_df, full_df=None, dp_support_levels=None):
+    r = {'solidity_score': 0.0, 'consolidation_quality': 0.0, 'volume_decline': 0.0, 'institutional_flow': 0.0, 'duration_score': 0.0, 'is_solid': False, 'explanation': ''}
+    if history_df is None or len(history_df) < SOLIDITY_CONFIG['min_consolidation_days']: r['explanation'] = 'Insufficient history'; return r
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        volume = history_df['Volume'].iloc[:, 0] if isinstance(history_df['Volume'], pd.DataFrame) else history_df['Volume']
+        rc = close.iloc[-min(len(close), 60):]
+        pr = (rc.max() - rc.min()) / rc.min() if rc.min() > 0 else 1.0
+        fib = SOLIDITY_CONFIG['max_consolidation_range']
+        r['consolidation_quality'] = 0.30 if pr <= fib*0.5 else (0.25 if pr <= fib else (0.15 if pr <= fib*1.5 else 0.0))
+        vl = SOLIDITY_CONFIG['volume_lookback_days']
+        if len(volume) >= vl:
+            vr = volume.iloc[-5:].mean() / (volume.iloc[-vl:].mean() + 1e-9)
+            r['volume_decline'] = 0.25 if vr <= SOLIDITY_CONFIG['volume_decline_ratio']*0.5 else (0.20 if vr <= SOLIDITY_CONFIG['volume_decline_ratio'] else (0.10 if vr <= 1.0 else 0.0))
+        dp_t = 0; has_sig = False
+        if full_df is not None and not full_df.empty:
+            td = full_df[full_df['ticker'] == ticker]
+            if not td.empty: dp_t = td.iloc[0].get('dp_total', 0)
+        if dp_support_levels and ticker in dp_support_levels: has_sig = len(dp_support_levels[ticker]) > 0
+        mdp = SOLIDITY_CONFIG['min_dp_total']
+        if dp_t >= mdp*5: r['institutional_flow'] = 0.25
+        elif dp_t >= mdp*2: r['institutional_flow'] = 0.20
+        elif dp_t >= mdp: r['institutional_flow'] = 0.15
+        elif has_sig: r['institutional_flow'] = 0.10
+        if has_sig and r['institutional_flow'] > 0: r['institutional_flow'] = min(0.25, r['institutional_flow'] + SOLIDITY_CONFIG['signature_print_bonus'])
+        sma20 = close.rolling(20).mean(); dic = 0
+        if len(sma20.dropna()) > 0:
+            dic = (abs(close - sma20) / sma20 < 0.10).iloc[-60:].sum()
+            md = SOLIDITY_CONFIG['min_consolidation_days']
+            r['duration_score'] = 0.20 if dic >= md*2 else (0.15 if dic >= md*1.5 else (0.10 if dic >= md else 0.0))
+        ts = r['consolidation_quality'] + r['volume_decline'] + r['institutional_flow'] + r['duration_score']
+        r['solidity_score'], r['is_solid'] = ts, ts >= SOLIDITY_CONFIG['base_threshold']
+        r['explanation'] = f"SOLID: {ts:.2f}" if r['is_solid'] else f"Not solid: {ts:.2f}"
+    except Exception as e: r['explanation'] = f'Error: {str(e)[:30]}'
+    return r
+
+def detect_phoenix_reversal(ticker, history_df, full_df=None, dp_support_levels=None, signature_prints=None):
+    r = {'is_phoenix': False, 'phoenix_score': 0.0, 'base_duration': 0, 'volume_ratio': 0.0, 'rsi': 0.0, 'explanation': ''}
+    min_d, max_d = PHOENIX_CONFIG['min_base_days'], PHOENIX_CONFIG['max_base_days']
+    if history_df is None or len(history_df) < min_d: r['explanation'] = 'Insufficient history'; return r
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        volume = history_df['Volume'].iloc[:, 0] if isinstance(history_df['Volume'], pd.DataFrame) else history_df['Volume']
+        cp = float(close.iloc[-1]); lb = min(len(close), max_d)
+        bp = close.iloc[-lb:]; bh, bl, br = bp.max(), bp.min(), (bp.max() - bp.min()) / bp.min()
+        w52 = min(len(close), 252)
+        r['high_52w'], r['low_52w'] = float(close.iloc[-w52:].max()), float(close.iloc[-w52:].min())
+        r['pct_from_52w_high'] = (r['high_52w'] - cp) / r['high_52w'] if r['high_52w'] > 0 else 0
+        sma50 = close.rolling(50).mean()
+        fs, fc = sma50.iloc[-lb:] if len(sma50) >= lb else sma50, close.iloc[-lb:] if len(close) >= lb else close
+        av50 = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+        av5 = volume.iloc[-5:].mean(); vr = av5 / (av50 + 1)
+        ff, fd = calculate_flow_factor(ticker, vr, full_df, signature_prints)
+        r['flow_factor'], r['volume_ratio'] = ff, float(vr)
+        ct = min(0.30, PHOENIX_CONFIG['min_consolidation_pct'] + min(0.10, br*0.15) + ff*0.05)
+        dib = ((abs(fc - fs) / fs) < ct).sum(); r['base_duration'] = int(dib)
+        delta = close.diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + gain / (loss + 1e-9))); cr = float(rsi.iloc[-1]); r['rsi'] = cr
+        rmin, rmax = max(40, PHOENIX_CONFIG['rsi_min'] - ff*10), min(85, PHOENIX_CONFIG['rsi_max'] + ff*15)
+        r['rsi_range'] = f"{rmin:.0f}-{rmax:.0f}"
+        nb = cp >= bl * (1 + br * 0.7); rb = (cp - bl) / bl >= PHOENIX_CONFIG['breakout_threshold']
+        md = (bh - bl) / bh
+        hdp = False; dps = 0.0
+        if dp_support_levels and ticker in dp_support_levels:
+            ns = [p for p in dp_support_levels[ticker] if abs(p - cp) / cp < 0.15]
+            hdp = len(ns) > 0; dps = min(len(ns) / 3.0, 1.0)
+        inst = PHOENIX_CONFIG.get('institutional_threshold', 365)
+        bds = 0.0
+        if min_d <= dib <= max_d:
+            if 90 <= dib <= 180: bds = 0.25
+            elif 60 <= dib < 90: bds = 0.15 + (dib - 60) / 30 * 0.10
+            elif 180 < dib < inst: bds = 0.20
+            elif inst <= dib <= 730: bds = 0.25 if dib <= 550 else 0.23
+        vs = 0.25 if vr >= 3.0 else (0.20 if vr >= 2.0 else (0.10 + (vr - 1.5)/0.5*0.10 if vr >= 1.5 else (0.05 if vr >= 1.2 else 0.0)))
+        ssmin, ssmax = max(45, 55 - ff*10), min(80, 65 + ff*15)
+        rs = 0.0
+        if ssmin <= cr <= ssmax: rs = 0.20 if 55 <= cr <= 65 else (0.18 if 50 <= cr <= 70 else 0.15 + ff*0.05)
+        elif rmin <= cr <= rmax: rs = 0.08 + ff*0.04 if cr < ssmin else max(0.05, 0.15 - min(0.10, (cr-70)*0.01) + ff*0.12)
+        elif 70 < cr <= 85 and ff >= 0.3: rs = 0.05 + ff*0.08
+        bks = 0.0
+        if rb: bks = 0.15 if (cp-bl)/bl >= 0.10 else (0.12 if (cp-bl)/bl >= 0.05 else 0.08)
+        elif nb: bks = 0.10
+        dds = 0.10 if md <= 0.20 else (0.08 if md <= 0.35 else (0.07 if md <= 0.50 else (0.10 if md <= 0.70 and dib >= inst else (0.05 if md <= 0.70 else -0.05))))
+        dps2 = 0.10 + dps*0.05 if hdp else 0.0
+        if full_df is not None and not full_df.empty:
+            tr = full_df[full_df['ticker'] == ticker]
+            if not tr.empty and 'dp_total' in tr.iloc[0]:
+                dpt = tr.iloc[0]['dp_total']
+                if dpt > 5e7: dps2 += min(0.15, math.log10(dpt/5e7)*0.10)
+                if dpt > 5e8: dps2 += 0.10
+        fb = 0.15 if ff >= 0.7 else (0.10 if ff >= 0.5 else (0.05 if ff >= 0.3 else 0.0))
+        sol = calculate_solidity_score(ticker, history_df, full_df, dp_support_levels)
+        sc = sol.get('solidity_score', 0) * SOLIDITY_CONFIG['weight_in_phoenix']
+        r['solidity_score'], r['solidity_details'] = sol.get('solidity_score', 0), sol
+        comp = bds + vs + rs + bks + dds + dps2 + fb + sc
+        thr = max(0.45, 0.60 - ff*0.15)
+        r['is_phoenix'], r['phoenix_score'], r['threshold'] = comp >= thr, comp, thr
+        if r['is_phoenix']:
+            parts = []
+            if bds >= 0.20: parts.append(f"{dib}d base")
+            if vs >= 0.15: parts.append(f"{vr:.1f}x vol")
+            if rs >= 0.10: parts.append(f"RSI {cr:.0f}")
+            if fb >= 0.05: parts.append(f"Flow {ff:.2f}")
+            r['explanation'] = f"PHOENIX: {comp:.2f} | " + ", ".join(parts)
+        else:
+            r['explanation'] = f"Near-phoenix: {comp:.2f}/{thr:.2f}"
+    except Exception as e: r['explanation'] = f'Error: {str(e)[:30]}'
+    return r
+
+def detect_cup_and_handle(history_df):
+    r = {'is_cup_handle': False, 'cup_handle_score': 0.0, 'explanation': ''}
+    if history_df is None or len(history_df) < 60: r['explanation'] = 'Insufficient history'; return r
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        volume = history_df['Volume'].iloc[:, 0] if isinstance(history_df['Volume'], pd.DataFrame) else history_df['Volume']
+        cup = close.iloc[-min(len(close), 60):]
+        lrh, cl, rrh = cup.iloc[:20].max(), cup.iloc[10:40].min(), cup.iloc[-20:].max()
+        cp = float(close.iloc[-1]); cd = (lrh - cl) / lrh; rec = (rrh - cl) / (lrh - cl) if lrh > cl else 0
+        hp = close.iloc[-15:]; hh, hl = hp.max(), hp.min(); hd = (hh - hl) / hh
+        vd = volume.iloc[-15:].mean() < volume.iloc[-30:-15].mean()
+        sc = 0.0
+        if 0.15 <= cd <= 0.50 and rec >= 0.80: sc += 0.40
+        elif 0.10 <= cd <= 0.55 and rec >= 0.70: sc += 0.25
+        if 0.05 <= hd <= 0.15 and vd: sc += 0.30
+        elif 0.05 <= hd <= 0.20: sc += 0.15
+        if cp >= hh * 1.02: sc += 0.30
+        elif cp >= hh * 0.98: sc += 0.15
+        r['is_cup_handle'], r['cup_handle_score'] = sc >= 0.60, sc
+        r['explanation'] = f"Cup-Handle: {sc:.2f}" if sc >= 0.60 else f"Not cup-handle: {sc:.2f}"
+    except Exception as e: r['explanation'] = f'Error: {str(e)[:30]}'
+    return r
+
+def detect_double_bottom(history_df):
+    r = {'is_double_bottom': False, 'double_bottom_score': 0.0, 'explanation': ''}
+    if history_df is None or len(history_df) < 60: r['explanation'] = 'Insufficient history'; return r
+    try:
+        close = history_df['Close'].iloc[:, 0] if isinstance(history_df['Close'], pd.DataFrame) else history_df['Close']
+        pp = close.iloc[-min(len(close), 60):]
+        from scipy.signal import argrelextrema
+        lmi = argrelextrema(pp.values, np.less, order=5)[0]
+        if len(lmi) < 2: r['explanation'] = 'No double bottom'; return r
+        fi, si = lmi[-2], lmi[-1]; fl, sl = pp.iloc[fi], pp.iloc[si]
+        db = si - fi; rh = pp.iloc[fi:si].max(); bh = (rh - fl) / fl; ls = abs(sl - fl) / fl
+        cp = float(close.iloc[-1]); sc = 0.0
+        if ls <= 0.02: sc += 0.35
+        elif ls <= 0.05: sc += 0.25
+        elif ls <= 0.08: sc += 0.15
+        if 20 <= db <= 60: sc += 0.25
+        elif 15 <= db < 20 or 60 < db <= 80: sc += 0.15
+        if bh >= 0.15: sc += 0.20
+        elif bh >= 0.10: sc += 0.15
+        if cp >= rh * 1.03: sc += 0.20
+        elif cp >= rh: sc += 0.10
+        r['is_double_bottom'], r['double_bottom_score'] = sc >= 0.60, sc
+        r['explanation'] = f"Double-Bottom: {sc:.2f}" if sc >= 0.60 else f"Not double-bottom: {sc:.2f}"
+    except Exception as e: r['explanation'] = f'Error: {str(e)[:30]}'
+    return r
+
+def apply_smart_gatekeeper(df, config=None):
+    if config is None: config = GATEKEEPER_CONFIG
+    if df.empty: return df
+    print("\\n[GATEKEEPER] Applying liquidity filter...")
+    df = df.copy()
+    if 'current_price' in df.columns and 'avg_volume' in df.columns:
+        df['dollar_volume'] = df['current_price'] * df['avg_volume']
+    elif 'current_price' in df.columns: df['dollar_volume'] = df['current_price'] * 1e6
+    else: return df
+    passed_liq, passed_dp, rejected = [], [], []
+    for idx, row in df.iterrows():
+        mc = row.get('market_cap', 0)
+        thr = config['large_cap_threshold'] if mc >= config['large_cap_min'] else (config['mid_cap_threshold'] if mc >= config['mid_cap_min'] else config['small_cap_threshold'])
+        if row.get('dp_total', 0) >= config['dp_bypass_threshold']: passed_dp.append(idx)
+        elif row.get('dollar_volume', 0) >= thr: passed_liq.append(idx)
+        else: rejected.append(row.get('ticker', 'Unk'))
+    print(f"  [GATEKEEPER] Passed: {len(passed_liq)}, DP bypass: {len(passed_dp)}, Rejected: {len(rejected)}")
+    return df.loc[passed_liq + passed_dp].copy()
+''')
+        print(f"  [BOOTSTRAP] Created {patterns_path}")
+
     # Add to path
     if COLAB_BASE not in sys.path:
         sys.path.insert(0, COLAB_BASE)
@@ -736,6 +1041,16 @@ from engine import (
     sanitize_ticker_for_alpaca, fetch_alpaca_batch,
     TitanDB, HistoryManager,
     triple_barrier_labels, prepare_tcn_sequences,
+    # Pattern detection functions (v12 modular)
+    detect_bull_flag as _detect_bull_flag,
+    find_gex_walls as _find_gex_walls,
+    detect_downtrend_reversal as _detect_downtrend_reversal,
+    calculate_flow_factor as _calculate_flow_factor,
+    calculate_solidity_score as _calculate_solidity_score,
+    detect_phoenix_reversal as _detect_phoenix_reversal,
+    detect_cup_and_handle as _detect_cup_and_handle,
+    detect_double_bottom as _detect_double_bottom,
+    apply_smart_gatekeeper as _apply_smart_gatekeeper,
 )
 
 ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
@@ -1622,1356 +1937,46 @@ class SwingTradingEngine:
             except: pass
         return False
 
-    # --- PHASE 9: PATTERN DETECTION METHODS ---
+    # --- PHASE 9: PATTERN DETECTION METHODS (v12 Modular - Thin Wrappers) ---
+    # Full implementations moved to engine/patterns.py (~800 lines saved)
 
     def detect_bull_flag(self, ticker, history_df, debug=False):
-        """
-        Detect bull flag pattern: strong upward move (pole) followed by consolidation (flag).
-
-        Bull flag criteria:
-        1. Strong upward move (pole): gain in first N days
-        2. Consolidation (flag): tight range in recent days
-        3. Volume declining during flag phase (optional)
-
-        Returns dict with pattern detection results and explanation.
-        """
-        result = {
-            'is_flag': False,
-            'flag_score': 0.0,
-            'pole_gain': 0.0,
-            'flag_range': 0.0,
-            'explanation': ''
-        }
-
-        lookback = BULL_FLAG_CONFIG['pole_days'] + BULL_FLAG_CONFIG['flag_days'] + 5
-
-        if history_df is None or len(history_df) < lookback:
-            result['explanation'] = 'Insufficient price history for pattern detection'
-            return result
-
-        try:
-            close = history_df['Close']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-
-            volume = history_df['Volume'] if 'Volume' in history_df.columns else None
-            if isinstance(volume, pd.DataFrame) and volume is not None:
-                volume = volume.iloc[:, 0]
-
-            # Use last N days of data
-            close = close.iloc[-lookback:]
-            if volume is not None:
-                volume = volume.iloc[-lookback:]
-
-            pole_days = BULL_FLAG_CONFIG['pole_days']
-            flag_days = BULL_FLAG_CONFIG['flag_days']
-
-            # Pole phase: first segment of the lookback
-            pole_start = close.iloc[0]
-            pole_end = close.iloc[pole_days]
-            pole_gain = (pole_end - pole_start) / pole_start if pole_start > 0 else 0
-
-            # Flag phase: last segment (consolidation)
-            flag_segment = close.iloc[-flag_days:]
-            flag_high = flag_segment.max()
-            flag_low = flag_segment.min()
-            flag_range = (flag_high - flag_low) / flag_segment.mean() if flag_segment.mean() > 0 else 1
-
-            # Volume analysis (optional - don't require it)
-            volume_declining = True  # Default to True if no volume data
-            volume_ratio = 1.0
-            if volume is not None and len(volume) >= lookback:
-                pole_volume = volume.iloc[:pole_days].mean()
-                flag_volume = volume.iloc[-flag_days:].mean()
-                if pole_volume > 0:
-                    volume_ratio = flag_volume / pole_volume
-                    volume_declining = volume_ratio < BULL_FLAG_CONFIG['volume_decline_ratio']
-
-            # Check if pattern matches (volume declining is BONUS, not required)
-            pole_ok = pole_gain >= BULL_FLAG_CONFIG['pole_min_gain']
-            flag_ok = flag_range <= BULL_FLAG_CONFIG['flag_max_range']
-            is_flag = pole_ok and flag_ok  # Don't require volume declining
-
-            # v11.5 FIX: Check if breakout already occurred (stale flag detection)
-            # If current price is >5% above flag high, the breakout already happened
-            current_price = close.iloc[-1]
-            breakout_threshold = 1.05  # 5% above flag range = breakout occurred
-            breakout_already_happened = current_price > flag_high * breakout_threshold
-
-            if breakout_already_happened and is_flag:
-                is_flag = False  # Invalidate stale flags
-                breakout_pct = ((current_price / flag_high) - 1) * 100
-                result['is_flag'] = False
-                result['pole_gain'] = pole_gain
-                result['flag_range'] = flag_range
-                result['flag_score'] = 0.1  # Minimal score for tracking
-                result['explanation'] = f"Flag breakout already occurred (+{breakout_pct:.1f}% above flag)"
-                return result
-
-            result['pole_gain'] = pole_gain
-            result['flag_range'] = flag_range
-            result['is_flag'] = is_flag
-
-            if is_flag:
-                # Score calculation: higher pole gain and tighter flag = better
-                base_score = min(1.0, (pole_gain / 0.15) * 0.4 + (1 - flag_range / BULL_FLAG_CONFIG['flag_max_range']) * 0.4)
-                if volume_declining:
-                    base_score += 0.2  # Bonus for volume confirmation
-                result['flag_score'] = base_score
-                result['explanation'] = f"BULL FLAG: {pole_gain*100:.1f}% pole, {flag_range*100:.1f}% range"
-                if volume_declining:
-                    result['explanation'] += " +vol"
-            elif pole_ok and not flag_ok:
-                # Pole qualified but consolidation too wide
-                result['flag_score'] = 0.25
-                result['explanation'] = f"Flag forming: {pole_gain*100:.1f}% pole, range {flag_range*100:.1f}% (need <{BULL_FLAG_CONFIG['flag_max_range']*100:.0f}%)"
-            elif pole_gain > 0.04:
-                # Weak pole but showing momentum
-                result['flag_score'] = 0.15
-                result['explanation'] = f"Weak momentum: {pole_gain*100:.1f}% move"
-            else:
-                result['explanation'] = 'No bull flag pattern'
-
-        except Exception as e:
-            result['explanation'] = f'Pattern detection error: {str(e)[:50]}'
-
-        return result
+        """Detect bull flag pattern. See engine/patterns.py for full implementation."""
+        return _detect_bull_flag(history_df)
 
     def find_gex_walls(self, ticker, current_price, bot_df=None):
-        """
-        Find gamma exposure (GEX) walls that could act as support/resistance.
-
-        GEX walls are strike prices with concentrated gamma that create
-        "magnetic" levels where market makers' hedging activity provides support or resistance.
-
-        Returns dict with wall levels and explanation.
-        """
-        result = {
-            'support_wall': None,
-            'resistance_wall': None,
-            'wall_protection_score': 0.0,
-            'explanation': ''
-        }
-
-        if current_price is None or current_price <= 0:
-            result['explanation'] = 'Invalid price data'
-            return result
-
-        # PRIORITY 1: Use cached strike-level gamma data
-        if ticker in self.strike_gamma_data and self.strike_gamma_data[ticker]:
-            try:
-                strike_gamma = self.strike_gamma_data[ticker]  # dict: {strike: gamma}
-
-                # Support walls: strikes below price with large positive gamma
-                support_candidates = {k: v for k, v in strike_gamma.items()
-                                     if k < current_price and v > GEX_WALL_CONFIG['min_support_gamma']}
-
-                if support_candidates:
-                    best_strike = max(support_candidates.keys(), key=lambda x: support_candidates[x])
-                    result['support_wall'] = float(best_strike)
-                    support_gamma = support_candidates[best_strike]
-                    proximity = (current_price - best_strike) / current_price
-
-                    if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
-                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
-
-                # Resistance walls: strikes above price with large negative gamma
-                resist_candidates = {k: v for k, v in strike_gamma.items()
-                                    if k > current_price and v < GEX_WALL_CONFIG['min_resist_gamma']}
-
-                if resist_candidates:
-                    best_resist = min(resist_candidates.keys(), key=lambda x: resist_candidates[x])
-                    result['resistance_wall'] = float(best_resist)
-
-                # Build explanation
-                explanations = []
-                if result['support_wall']:
-                    support_dist = (current_price - result['support_wall']) / current_price * 100
-                    gamma_val = support_candidates.get(result['support_wall'], 0)
-                    explanations.append(f"GEX support ${result['support_wall']:.0f} ({support_dist:.1f}% below, {gamma_val/1000:.0f}K gamma)")
-                if result['resistance_wall']:
-                    resist_dist = (result['resistance_wall'] - current_price) / current_price * 100
-                    explanations.append(f"GEX resist ${result['resistance_wall']:.0f} ({resist_dist:.1f}% above)")
-
-                result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
-                return result
-
-            except Exception as e:
-                result['explanation'] = f'GEX cache error: {str(e)[:30]}'
-
-        # PRIORITY 2: Check if we have strike-level data in bot_df
-        if bot_df is not None and not bot_df.empty and 'strike' in bot_df.columns:
-            try:
-                ticker_data = bot_df[bot_df['ticker'] == ticker] if 'ticker' in bot_df.columns else bot_df
-
-                if ticker_data.empty or 'net_gamma' not in ticker_data.columns:
-                    result['explanation'] = 'No gamma data for strike analysis'
-                    return result
-
-                # Aggregate gamma by strike
-                strike_gamma = ticker_data.groupby('strike')['net_gamma'].sum()
-
-                # Support walls: strikes below price with large positive gamma
-                support_mask = (strike_gamma.index < current_price) & (strike_gamma > GEX_WALL_CONFIG['min_support_gamma'])
-                support_candidates = strike_gamma[support_mask]
-
-                if not support_candidates.empty:
-                    result['support_wall'] = float(support_candidates.idxmax())
-                    support_gamma = support_candidates.max()
-                    proximity = (current_price - result['support_wall']) / current_price
-
-                    if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
-                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
-
-                # Resistance walls: strikes above price with large negative gamma
-                resist_mask = (strike_gamma.index > current_price) & (strike_gamma < GEX_WALL_CONFIG['min_resist_gamma'])
-                resist_candidates = strike_gamma[resist_mask]
-
-                if not resist_candidates.empty:
-                    result['resistance_wall'] = float(resist_candidates.idxmin())
-
-                # Build explanation
-                explanations = []
-                if result['support_wall']:
-                    support_dist = (current_price - result['support_wall']) / current_price * 100
-                    explanations.append(f"GEX support at ${result['support_wall']:.2f} ({support_dist:.1f}% below)")
-                if result['resistance_wall']:
-                    resist_dist = (result['resistance_wall'] - current_price) / current_price * 100
-                    explanations.append(f"GEX resistance at ${result['resistance_wall']:.2f} ({resist_dist:.1f}% above)")
-
-                result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
-                return result
-
-            except Exception as e:
-                result['explanation'] = f'GEX analysis error: {str(e)[:50]}'
-
-        # PRIORITY 3: Fallback to dark pool support levels
-        if ticker in self.dp_support_levels:
-            dp_levels = self.dp_support_levels[ticker]
-            support_levels = [p for p in dp_levels if p < current_price]
-            if support_levels:
-                best_support = max(support_levels)
-                proximity = (current_price - best_support) / current_price
-                if proximity <= GEX_WALL_CONFIG['proximity_pct']:
-                    result['support_wall'] = best_support
-                    result['wall_protection_score'] = 0.5  # DP support is less reliable than GEX
-                    result['explanation'] = f"DP support at ${best_support:.2f} ({proximity*100:.1f}% below)"
-                else:
-                    result['explanation'] = f"DP support at ${best_support:.2f} (too far: {proximity*100:.1f}%)"
-            else:
-                result['explanation'] = 'No support levels detected'
-        else:
-            result['explanation'] = 'No strike-level or DP data available'
-
-        return result
+        """Find GEX walls. See engine/patterns.py for full implementation."""
+        return _find_gex_walls(ticker, current_price, self.strike_gamma_data, self.dp_support_levels, bot_df)
 
     def detect_downtrend_reversal(self, ticker, history_df):
-        """
-        Detect potential reversal setup: months-long downtrend with dark pool support at bottom.
-
-        Criteria:
-        1. Extended downtrend: price below 50 SMA for 35+ of last 60 days
-        2. Dark pool accumulation near current price levels
-        3. RSI showing potential bullish divergence
-
-        Returns dict with reversal detection results and explanation.
-        """
-        result = {
-            'is_reversal': False,
-            'reversal_score': 0.0,
-            'days_below_sma': 0,
-            'has_dp_support': False,
-            'explanation': ''
-        }
-
-        lookback = REVERSAL_CONFIG['lookback_days']
-
-        if history_df is None or len(history_df) < lookback:
-            result['explanation'] = 'Insufficient history for reversal analysis'
-            return result
-
-        try:
-            close = history_df['Close']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-
-            # Calculate SMA50
-            sma50 = close.rolling(50).mean()
-
-            # Count days below SMA50 in lookback period
-            recent_close = close.iloc[-lookback:]
-            recent_sma = sma50.iloc[-lookback:]
-            days_below = (recent_close < recent_sma).sum()
-            result['days_below_sma'] = int(days_below)
-
-            is_downtrend = days_below >= REVERSAL_CONFIG['min_days_below_sma']
-
-            # Check for dark pool support at current levels
-            current_price = float(close.iloc[-1])
-            has_dp_support = False
-            dp_level = None
-
-            if ticker in self.dp_support_levels:
-                dp_levels = self.dp_support_levels[ticker]
-                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < REVERSAL_CONFIG['dp_proximity_pct']]
-                if nearby_support:
-                    has_dp_support = True
-                    dp_level = max(nearby_support)
-
-            result['has_dp_support'] = has_dp_support
-
-            # Check for RSI bullish divergence (price making lower lows, RSI making higher lows)
-            has_divergence = False
-            if len(close) > 20:
-                # Simple divergence check
-                delta = close.diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / (loss + 1e-9)
-                rsi = 100 - (100 / (1 + rs))
-
-                # Compare first half vs second half of recent period
-                price_trend = close.iloc[-10:].mean() < close.iloc[-20:-10].mean()  # Price declining
-                rsi_trend = rsi.iloc[-10:].mean() > rsi.iloc[-20:-10].mean()  # RSI rising
-                has_divergence = price_trend and rsi_trend
-
-            # Determine if reversal setup is present
-            is_reversal = is_downtrend and (has_dp_support or has_divergence)
-            result['is_reversal'] = is_reversal
-
-            if is_reversal:
-                score_components = []
-                base_score = 0.5
-
-                if has_dp_support:
-                    base_score += 0.3
-                    score_components.append(f"DP support at ${dp_level:.2f}")
-                if has_divergence:
-                    base_score += 0.2
-                    score_components.append("RSI bullish divergence")
-
-                result['reversal_score'] = min(1.0, base_score)
-                result['explanation'] = f"REVERSAL SETUP: {days_below}/{lookback} days in downtrend, " + ", ".join(score_components)
-            elif is_downtrend:
-                result['reversal_score'] = 0.2
-                result['explanation'] = f"Downtrend ({days_below}/{lookback} days below SMA50) but no support confirmation"
-            else:
-                result['explanation'] = 'Not in extended downtrend'
-
-        except Exception as e:
-            result['explanation'] = f'Reversal detection error: {str(e)[:50]}'
-
-        return result
+        """Detect reversal setup. See engine/patterns.py for full implementation."""
+        return _detect_downtrend_reversal(ticker, history_df, self.dp_support_levels)
 
     def calculate_flow_factor(self, ticker, volume_ratio=1.0):
-        """
-        v10.7: Calculate Flow Factor (0.0 to 1.0) for dynamic threshold adjustment.
-
-        High institutional flow earns "forgiveness points" that expand trading thresholds.
-        A stock with massive buying (like LULU with Elliott $1B stake) can exceed normal
-        RSI limits and still qualify for phoenix detection.
-
-        Components:
-        1. Volume Intensity (0-0.25): Recent volume vs 50-day average
-        2. Dark Pool Activity (0-0.35): Total DP accumulation (log-scaled for mega-prints)
-        3. Institutional Signature (0-0.20): Presence of signature block trades
-        4. Net Options Flow (0-0.20): Gamma/delta positioning from options
-
-        Returns:
-            flow_factor (float): 0.0 (no flow) to 1.0 (maximum institutional conviction)
-            flow_details (dict): Breakdown of components for debugging
-        """
-        import math
-
-        flow_factor = 0.0
-        flow_details = {
-            'volume_component': 0.0,
-            'dp_component': 0.0,
-            'signature_component': 0.0,
-            'options_component': 0.0,
-            'raw_dp_total': 0.0,
-            'has_signature': False
-        }
-
-        try:
-            # Component 1: Volume Intensity (0-0.25)
-            # Higher volume = more institutional interest
-            if volume_ratio >= 1.0:
-                if volume_ratio >= 4.0:
-                    flow_details['volume_component'] = 0.25  # Exceptional volume
-                elif volume_ratio >= 2.5:
-                    flow_details['volume_component'] = 0.20
-                elif volume_ratio >= 1.5:
-                    flow_details['volume_component'] = 0.15
-                else:
-                    flow_details['volume_component'] = 0.05 + (volume_ratio - 1.0) * 0.10
-
-            # Component 2: Dark Pool Activity (0-0.35)
-            # Log-scaled to handle mega-prints like Elliott's $1B LULU stake
-            ticker_data = None
-            if hasattr(self, 'full_df') and not self.full_df.empty:
-                ticker_rows = self.full_df[self.full_df['ticker'] == ticker]
-                if not ticker_rows.empty:
-                    ticker_data = ticker_rows.iloc[0]
-
-            if ticker_data is not None and 'dp_total' in ticker_data:
-                dp_total = float(ticker_data.get('dp_total', 0))
-                flow_details['raw_dp_total'] = dp_total
-
-                if dp_total > 0:
-                    # Log-scaled scoring (prevents single mega-print from dominating)
-                    # $1M = baseline, $10M = moderate, $100M = strong, $1B = exceptional
-                    if dp_total >= 1_000_000_000:  # $1B+ (Elliott/activist level)
-                        flow_details['dp_component'] = 0.35
-                    elif dp_total >= 500_000_000:  # $500M+
-                        flow_details['dp_component'] = 0.30
-                    elif dp_total >= 100_000_000:  # $100M+
-                        flow_details['dp_component'] = 0.25
-                    elif dp_total >= 50_000_000:   # $50M+
-                        flow_details['dp_component'] = 0.20
-                    elif dp_total >= 10_000_000:   # $10M+
-                        flow_details['dp_component'] = 0.12
-                    elif dp_total >= 1_000_000:    # $1M+
-                        flow_details['dp_component'] = 0.05
-
-            # Component 3: Institutional Signature Prints (0-0.20)
-            # Check for signature block trades (large single prints)
-            if hasattr(self, 'signature_prints') and ticker in self.signature_prints:
-                flow_details['has_signature'] = True
-                sig_count = len(self.signature_prints[ticker]) if isinstance(self.signature_prints[ticker], list) else 1
-                flow_details['signature_component'] = min(0.20, 0.10 + sig_count * 0.05)
-            elif ticker_data is not None:
-                # Fallback: Check for large single-day DP prints
-                dp_max = float(ticker_data.get('dp_max', ticker_data.get('dp_total', 0)))
-                if dp_max >= 50_000_000:  # Single $50M+ print
-                    flow_details['signature_component'] = 0.15
-                    flow_details['has_signature'] = True
-                elif dp_max >= 10_000_000:  # Single $10M+ print
-                    flow_details['signature_component'] = 0.08
-
-            # Component 4: Net Options Flow (0-0.20)
-            # Bullish gamma/delta positioning indicates institutional conviction
-            if ticker_data is not None:
-                net_gamma = float(ticker_data.get('net_gamma', 0))
-                net_delta = float(ticker_data.get('net_delta', 0))
-
-                # Positive gamma + positive delta = bullish institutional positioning
-                if net_gamma > 0 and net_delta > 0:
-                    # Scale by magnitude
-                    gamma_strength = min(1.0, abs(net_gamma) / 1000000)  # $1M gamma = max
-                    delta_strength = min(1.0, abs(net_delta) / 5000000)  # $5M delta = max
-                    flow_details['options_component'] = 0.20 * (gamma_strength + delta_strength) / 2
-                elif net_gamma > 0 or net_delta > 0:
-                    # Partially bullish
-                    flow_details['options_component'] = 0.08
-
-            # Calculate total flow factor (capped at 1.0)
-            flow_factor = min(1.0,
-                flow_details['volume_component'] +
-                flow_details['dp_component'] +
-                flow_details['signature_component'] +
-                flow_details['options_component']
-            )
-
-        except Exception as e:
-            # On error, return conservative flow factor
-            flow_factor = 0.0
-
-        return flow_factor, flow_details
+        """Calculate flow factor. See engine/patterns.py for full implementation."""
+        return _calculate_flow_factor(ticker, volume_ratio, self.full_df, getattr(self, 'signature_prints', None))
 
     # --- v11.0 SMART GATEKEEPER ---
     def apply_smart_gatekeeper(self, df):
-        """
-        v11.0: Smart Gatekeeper - Pre-filter candidates by dollar-volume liquidity.
-
-        Filters out illiquid stocks BEFORE expensive pattern analysis begins.
-        Uses tiered thresholds based on market cap:
-        - Large-cap ($10B+): $5M daily dollar-volume required
-        - Mid-cap ($2B-$10B): $2M daily dollar-volume required
-        - Small-cap (<$2B): $1M daily dollar-volume required
-
-        Exception: Stocks with $500K+ dark pool inflow bypass the liquidity filter
-        (catches early institutional accumulation in overlooked names).
-
-        Args:
-            df: DataFrame with ticker data (must have current_price, avg_volume, dp_total, market_cap)
-
-        Returns:
-            Filtered DataFrame with only liquid/DP-bypassed candidates
-        """
-        if df.empty:
-            return df
-
-        print("\n[GATEKEEPER v11.0] Applying dollar-volume liquidity filter...")
-        original_count = len(df)
-
-        # Calculate dollar-volume for each ticker
-        df = df.copy()
-
-        # Dollar volume = price × average daily volume
-        if 'current_price' in df.columns and 'avg_volume' in df.columns:
-            df['dollar_volume'] = df['current_price'] * df['avg_volume']
-        elif 'current_price' in df.columns:
-            # Estimate from available data
-            df['dollar_volume'] = df['current_price'] * 1_000_000  # Conservative estimate
-        else:
-            # Can't calculate - pass all through
-            print("  [GATEKEEPER] Warning: Missing price/volume data, skipping filter")
-            return df
-
-        # Determine market cap tier for each ticker
-        def get_liquidity_threshold(row):
-            """Get liquidity threshold based on market cap tier."""
-            market_cap = row.get('market_cap', 0)
-
-            if market_cap >= GATEKEEPER_CONFIG['large_cap_min']:
-                return GATEKEEPER_CONFIG['large_cap_threshold']  # $5M
-            elif market_cap >= GATEKEEPER_CONFIG['mid_cap_min']:
-                return GATEKEEPER_CONFIG['mid_cap_threshold']   # $2M
-            else:
-                return GATEKEEPER_CONFIG['small_cap_threshold']  # $1M
-
-        # Check DP bypass eligibility
-        def has_dp_bypass(row):
-            """Check if ticker has high enough DP inflow to bypass liquidity filter."""
-            dp_total = row.get('dp_total', 0)
-            return dp_total >= GATEKEEPER_CONFIG['dp_bypass_threshold']
-
-        # Apply filter
-        passed_liquidity = []
-        passed_dp_bypass = []
-        rejected = []
-
-        for idx, row in df.iterrows():
-            ticker = row.get('ticker', 'Unknown')
-            dollar_vol = row.get('dollar_volume', 0)
-            threshold = get_liquidity_threshold(row)
-
-            # Check DP bypass first
-            if has_dp_bypass(row):
-                passed_dp_bypass.append(idx)
-            # Check dollar-volume threshold
-            elif dollar_vol >= threshold:
-                passed_liquidity.append(idx)
-            else:
-                rejected.append(ticker)
-
-        # Combine passed candidates
-        passed_indices = passed_liquidity + passed_dp_bypass
-        filtered_df = df.loc[passed_indices].copy()
-
-        # Log results
-        liquidity_passed = len(passed_liquidity)
-        dp_bypassed = len(passed_dp_bypass)
-        rejected_count = len(rejected)
-
-        print(f"  [GATEKEEPER] Passed liquidity filter: {liquidity_passed}")
-        print(f"  [GATEKEEPER] DP bypass (institutional): {dp_bypassed}")
-        print(f"  [GATEKEEPER] Rejected (illiquid): {rejected_count}")
-
-        if rejected_count > 0 and rejected_count <= 10:
-            print(f"  [GATEKEEPER] Rejected tickers: {', '.join(rejected[:10])}")
-        elif rejected_count > 10:
-            print(f"  [GATEKEEPER] Sample rejected: {', '.join(rejected[:5])}... (+{rejected_count-5} more)")
-
-        return filtered_df
+        """Smart gatekeeper filter. See engine/patterns.py for full implementation."""
+        return _apply_smart_gatekeeper(df)
 
     # --- v11.0 SOLIDITY SCORE ---
     def calculate_solidity_score(self, ticker, history_df):
-        """
-        v11.0: Solidity Score - Detects institutional accumulation during retail exhaustion.
-
-        The "solidity" concept: When smart money quietly accumulates while retail traders
-        lose interest, you get a characteristic pattern:
-        - High dark pool activity (institutions loading)
-        - Narrow price range within 38.2% Fibonacci retracement (controlled buying)
-        - Declining retail volume (capitulation/boredom)
-        - Extended consolidation period (20+ days)
-
-        This pattern preceded LULU's breakout when Elliott Management built their $1B position.
-
-        Scoring Components (0.0 to 1.0):
-        1. Consolidation Quality (0-0.30): Price range within 38.2% Fib level
-        2. Volume Decline (0-0.25): Recent volume declining vs average
-        3. Institutional Flow (0-0.25): Dark pool activity level
-        4. Duration (0-0.20): Consolidation period length
-
-        Args:
-            ticker: Stock ticker symbol
-            history_df: Price history DataFrame (OHLCV)
-
-        Returns:
-            dict with solidity_score, components, and explanation
-        """
-        result = {
-            'solidity_score': 0.0,
-            'consolidation_quality': 0.0,
-            'volume_decline': 0.0,
-            'institutional_flow': 0.0,
-            'duration_score': 0.0,
-            'is_solid': False,
-            'explanation': ''
-        }
-
-        if history_df is None or len(history_df) < SOLIDITY_CONFIG['min_consolidation_days']:
-            result['explanation'] = 'Insufficient history for solidity analysis'
-            return result
-
-        try:
-            close = history_df['Close']
-            volume = history_df['Volume']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            if isinstance(volume, pd.DataFrame):
-                volume = volume.iloc[:, 0]
-
-            # --- Component 1: Consolidation Quality (0-0.30) ---
-            # Check if price range is within 38.2% Fibonacci level
-            lookback = min(len(close), 60)  # Look at recent 60 days
-            recent_close = close.iloc[-lookback:]
-
-            base_high = recent_close.max()
-            base_low = recent_close.min()
-            price_range = (base_high - base_low) / base_low if base_low > 0 else 1.0
-
-            # 38.2% Fib is the institutional standard for "tight" consolidation
-            fib_threshold = SOLIDITY_CONFIG['max_consolidation_range']
-
-            if price_range <= fib_threshold * 0.5:
-                # Very tight consolidation (< 19.1% range)
-                result['consolidation_quality'] = 0.30
-            elif price_range <= fib_threshold:
-                # Good consolidation (< 38.2% range)
-                result['consolidation_quality'] = 0.25
-            elif price_range <= fib_threshold * 1.5:
-                # Acceptable consolidation (< 57.3% range)
-                result['consolidation_quality'] = 0.15
-            else:
-                # Too wide - not a solid base
-                result['consolidation_quality'] = 0.0
-
-            # --- Component 2: Volume Decline (0-0.25) ---
-            # Declining volume = retail exhaustion/capitulation
-            vol_lookback = SOLIDITY_CONFIG['volume_lookback_days']
-            if len(volume) >= vol_lookback:
-                avg_volume_long = volume.iloc[-vol_lookback:].mean()
-                avg_volume_recent = volume.iloc[-5:].mean()
-
-                if avg_volume_long > 0:
-                    volume_ratio = avg_volume_recent / avg_volume_long
-
-                    # We WANT declining volume (smart money loading quietly)
-                    if volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio'] * 0.5:
-                        # Significantly declining (< 35% of average)
-                        result['volume_decline'] = 0.25
-                    elif volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio']:
-                        # Declining (< 70% of average)
-                        result['volume_decline'] = 0.20
-                    elif volume_ratio <= 1.0:
-                        # Stable volume
-                        result['volume_decline'] = 0.10
-                    else:
-                        # Increasing volume - not what we want for solidity
-                        result['volume_decline'] = 0.0
-
-            # --- Component 3: Institutional Flow (0-0.25) ---
-            # High dark pool activity indicates institutional accumulation
-            dp_total = 0
-            has_signature = False
-
-            # Get ticker data from full_df
-            if hasattr(self, 'full_df') and not self.full_df.empty:
-                ticker_data = self.full_df[self.full_df['ticker'] == ticker]
-                if not ticker_data.empty:
-                    dp_total = ticker_data.iloc[0].get('dp_total', 0)
-
-            # Check for signature prints in dp_support_levels
-            if ticker in self.dp_support_levels:
-                has_signature = len(self.dp_support_levels[ticker]) > 0
-
-            min_dp = SOLIDITY_CONFIG['min_dp_total']
-            if dp_total >= min_dp * 5:
-                # Massive institutional activity ($50M+)
-                result['institutional_flow'] = 0.25
-            elif dp_total >= min_dp * 2:
-                # Strong institutional activity ($20M+)
-                result['institutional_flow'] = 0.20
-            elif dp_total >= min_dp:
-                # Good institutional activity ($10M+)
-                result['institutional_flow'] = 0.15
-            elif has_signature:
-                # Has signature prints but lower DP total
-                result['institutional_flow'] = 0.10
-            else:
-                result['institutional_flow'] = 0.0
-
-            # Signature print bonus
-            if has_signature and result['institutional_flow'] > 0:
-                result['institutional_flow'] = min(0.25,
-                    result['institutional_flow'] + SOLIDITY_CONFIG['signature_print_bonus'])
-
-            # --- Component 4: Duration Score (0-0.20) ---
-            # Count days in consolidation (price within 10% of SMA20)
-            sma20 = close.rolling(20).mean()
-            if len(sma20.dropna()) > 0:
-                consolidation_mask = abs(close - sma20) / sma20 < 0.10
-                days_in_consolidation = consolidation_mask.iloc[-60:].sum()
-
-                min_days = SOLIDITY_CONFIG['min_consolidation_days']
-                if days_in_consolidation >= min_days * 2:
-                    # Extended consolidation (40+ days)
-                    result['duration_score'] = 0.20
-                elif days_in_consolidation >= min_days * 1.5:
-                    # Good consolidation (30+ days)
-                    result['duration_score'] = 0.15
-                elif days_in_consolidation >= min_days:
-                    # Minimum consolidation (20+ days)
-                    result['duration_score'] = 0.10
-                else:
-                    result['duration_score'] = 0.0
-
-            # --- Calculate Total Solidity Score ---
-            total_score = (
-                result['consolidation_quality'] +
-                result['volume_decline'] +
-                result['institutional_flow'] +
-                result['duration_score']
-            )
-
-            result['solidity_score'] = total_score
-            result['is_solid'] = total_score >= SOLIDITY_CONFIG['base_threshold']
-
-            # --- Generate Explanation ---
-            if result['is_solid']:
-                components = []
-                if result['consolidation_quality'] >= 0.20:
-                    components.append(f"Tight base ({price_range*100:.1f}% range)")
-                if result['volume_decline'] >= 0.15:
-                    components.append("Declining volume")
-                if result['institutional_flow'] >= 0.15:
-                    components.append(f"DP ${dp_total/1e6:.1f}M")
-                if result['duration_score'] >= 0.10:
-                    components.append(f"{days_in_consolidation}d consolidation")
-
-                result['explanation'] = f"SOLID BASE: Score={total_score:.2f} | " + ", ".join(components)
-            else:
-                weak = []
-                if result['consolidation_quality'] < 0.15:
-                    weak.append(f"Wide range ({price_range*100:.0f}%)")
-                if result['volume_decline'] < 0.10:
-                    weak.append("No volume decline")
-                if result['institutional_flow'] < 0.10:
-                    weak.append("Low DP activity")
-
-                result['explanation'] = f"Not solid ({total_score:.2f}): " + ", ".join(weak) if weak else f"Sub-threshold ({total_score:.2f})"
-
-        except Exception as e:
-            result['explanation'] = f'Solidity analysis error: {str(e)[:50]}'
-
-        return result
+        """Calculate solidity score. See engine/patterns.py for full implementation."""
+        return _calculate_solidity_score(ticker, history_df, self.full_df, self.dp_support_levels)
 
     def detect_phoenix_reversal(self, ticker, history_df):
-        """
-        v10.7: Flow-Adjusted Dynamic Scoring Model for Phoenix Detection.
-
-        Instead of hard thresholds (RSI must be 50-70), this uses a sliding scale.
-        High institutional flow (volume/dark pools) earns "forgiveness points" that
-        dynamically expand allowable limits.
-
-        Example: LULU with massive Elliott $1B stake can have RSI 80 and still pass,
-        while a low-volume stock with RSI 80 would be rejected.
-
-        Dynamic Thresholds (based on flow_factor 0.0-1.0):
-        - RSI: 50-70 → expands to 40-85 with max flow
-        - Drawdown: 35% → expands to 80% with max flow
-        - Base duration min: 60 → reduces to 30 with max flow
-
-        Returns dict with phoenix detection results and explanation.
-        """
-        result = {
-            'is_phoenix': False,
-            'phoenix_score': 0.0,
-            'base_duration': 0,
-            'volume_ratio': 0.0,
-            'rsi': 0.0,
-            'explanation': ''
-        }
-
-        min_days = PHOENIX_CONFIG['min_base_days']
-        max_days = PHOENIX_CONFIG['max_base_days']
-
-        if history_df is None or len(history_df) < min_days:
-            result['explanation'] = 'Insufficient history for phoenix analysis'
-            return result
-
-        try:
-            close = history_df['Close']
-            volume = history_df['Volume']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            if isinstance(volume, pd.DataFrame):
-                volume = volume.iloc[:, 0]
-
-            current_price = float(close.iloc[-1])
-
-            # Look for consolidation base in the past 60-250 days
-            lookback_days = min(len(close), max_days)
-            base_period = close.iloc[-lookback_days:]
-            base_high = base_period.max()
-            base_low = base_period.min()
-            base_range = (base_high - base_low) / base_low
-
-            # v11.2: Calculate 52-week (252 trading days) high for momentum filter
-            # True phoenix reversals emerge from bases, not from stocks already near highs
-            week_52_period = min(len(close), 252)
-            high_52w = close.iloc[-week_52_period:].max()
-            low_52w = close.iloc[-week_52_period:].min()
-            pct_from_52w_high = (high_52w - current_price) / high_52w if high_52w > 0 else 0
-            pct_from_52w_low = (current_price - low_52w) / low_52w if low_52w > 0 else 0
-            result['high_52w'] = float(high_52w)
-            result['low_52w'] = float(low_52w)
-            result['pct_from_52w_high'] = float(pct_from_52w_high)
-            result['pct_from_52w_low'] = float(pct_from_52w_low)
-
-            # v10.8.1: FIX - Look at FULL lookback period, not just min_days
-            # Previous bug: Only looked at last 60 days, making institutional phoenix (365+) impossible
-            sma50 = close.rolling(50).mean()
-
-            # Use the full available lookback period (up to max_days)
-            full_lookback = min(len(close), max_days)
-            full_sma = sma50.iloc[-full_lookback:] if len(sma50) >= full_lookback else sma50
-            full_close = close.iloc[-full_lookback:] if len(close) >= full_lookback else close
-
-            # v10.8.1: Dynamic consolidation threshold
-            # Base: 15% (increased from 10%), expands based on:
-            # 1. Flow factor (institutional conviction allows messier bases)
-            # 2. Drawdown magnitude (deeper corrections = choppier recoveries)
-            base_consolidation_pct = PHOENIX_CONFIG['min_consolidation_pct']  # 0.15
-
-            # Calculate pre-emptive flow factor for threshold adjustment
-            avg_volume_50d_prelim = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
-            avg_volume_recent_prelim = volume.iloc[-5:].mean()
-            volume_ratio_prelim = avg_volume_recent_prelim / (avg_volume_50d_prelim + 1)
-            flow_factor_prelim, _ = self.calculate_flow_factor(ticker, volume_ratio_prelim)
-
-            # Drawdown-based expansion: deeper drawdowns allow looser consolidation
-            # LULU with 60% drawdown gets +5% tolerance
-            drawdown_bonus = min(0.10, base_range * 0.15)  # Up to 10% extra for deep drawdowns
-
-            # Flow-based expansion: high institutional flow allows +5% tolerance
-            flow_bonus = flow_factor_prelim * 0.05  # Up to 5% extra for max flow
-
-            # Dynamic consolidation threshold: 15% base, up to 30% for deep drawdown + high flow
-            consolidation_threshold = base_consolidation_pct + drawdown_bonus + flow_bonus
-            consolidation_threshold = min(consolidation_threshold, 0.30)  # Cap at 30%
-            result['consolidation_threshold'] = consolidation_threshold
-
-            # Count days in consolidation across FULL lookback period
-            days_in_base = ((abs(full_close - full_sma) / full_sma) < consolidation_threshold).sum()
-            result['base_duration'] = int(days_in_base)
-
-            # Debug output for validation tickers
-            if ENABLE_VALIDATION_MODE and ticker in (VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']):
-                print(f"  [PHOENIX DEBUG] {ticker}: lookback={full_lookback}d, threshold={consolidation_threshold:.1%}, days_in_base={days_in_base}")
-
-            # Check for volume surge (recent 5-day average vs 50-day average)
-            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
-            avg_volume_recent = volume.iloc[-5:].mean()
-            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
-            result['volume_ratio'] = float(volume_ratio)
-
-            has_volume_surge = volume_ratio >= PHOENIX_CONFIG['volume_surge_threshold']
-
-            # v10.7: Calculate Flow Factor for dynamic threshold adjustment
-            flow_factor, flow_details = self.calculate_flow_factor(ticker, volume_ratio)
-            result['flow_factor'] = flow_factor
-
-            # Calculate RSI
-            delta = close.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / (loss + 1e-9)
-            rsi = 100 - (100 / (1 + rs))
-            current_rsi = float(rsi.iloc[-1])
-            result['rsi'] = current_rsi
-
-            # v10.7: DYNAMIC RSI THRESHOLDS based on flow factor
-            # Base: 50-70, with max flow expands to 40-85
-            # High institutional flow earns "forgiveness points"
-            rsi_min_dynamic = max(40, PHOENIX_CONFIG['rsi_min'] - flow_factor * 10)  # 50 → 40 with max flow
-            rsi_max_dynamic = min(85, PHOENIX_CONFIG['rsi_max'] + flow_factor * 15)  # 70 → 85 with max flow
-            rsi_in_range = rsi_min_dynamic <= current_rsi <= rsi_max_dynamic
-            result['rsi_range'] = f"{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}"
-
-            # Check for breakout (price near top of range)
-            breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
-            near_breakout = current_price >= base_low * (1 + base_range * 0.7)  # Near top 30% of range
-            recent_breakout = (current_price - base_low) / base_low >= breakout_threshold
-
-            # Check drawdown constraint
-            max_drawdown = (base_high - base_low) / base_high
-            acceptable_drawdown = max_drawdown <= PHOENIX_CONFIG['max_drawdown_pct']
-
-            # Dark pool support adds confidence
-            has_dp_support = False
-            dp_strength = 0.0
-            if ticker in self.dp_support_levels:
-                dp_levels = self.dp_support_levels[ticker]
-                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < 0.15]
-                has_dp_support = len(nearby_support) > 0
-                dp_strength = min(len(nearby_support) / 3.0, 1.0)  # More DP levels = stronger
-
-            # --- MULTI-LAYER SCORING SYSTEM ---
-            # Layer 1: Base Duration Score (0-25 points)
-            # v10.4: Extended for institutional phoenix patterns (LULU-like 18-24 month bases)
-            base_duration_score = 0.0
-            institutional_threshold = PHOENIX_CONFIG.get('institutional_threshold', 365)
-
-            if min_days <= days_in_base <= max_days:
-                # SPECULATIVE PHOENIX (60-365 days / 2-12 months)
-                if 90 <= days_in_base <= 180:
-                    # Optimal Wyckoff accumulation timeframe
-                    base_duration_score = 0.25
-                elif 60 <= days_in_base < 90:
-                    # Shorter base (partial credit)
-                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10
-                elif 180 < days_in_base < institutional_threshold:
-                    # Long base but not yet institutional
-                    base_duration_score = 0.20
-
-                # INSTITUTIONAL PHOENIX (365-730 days / 12-24 months)
-                elif institutional_threshold <= days_in_base <= 730:
-                    # Large-cap institutional accumulation (LULU, activist plays)
-                    # Longer bases = deeper conviction for institutions
-                    if 365 <= days_in_base <= 550:
-                        base_duration_score = 0.25  # 12-18 months (optimal institutional)
-                    elif 550 < days_in_base <= 730:
-                        base_duration_score = 0.23  # 18-24 months (very deep base)
-            else:
-                # Outside acceptable range
-                base_duration_score = 0.0
-
-            # Layer 2: Volume Confirmation Score (0-25 points)
-            volume_score = 0.0
-            if volume_ratio >= 1.5:
-                if volume_ratio >= 3.0:
-                    volume_score = 0.25  # Exceptional volume
-                elif volume_ratio >= 2.0:
-                    volume_score = 0.20  # Strong volume
-                else:
-                    volume_score = 0.10 + (volume_ratio - 1.5) / 0.5 * 0.10  # Gradual increase
-            else:
-                # Partial credit for moderate volume
-                if volume_ratio >= 1.2:
-                    volume_score = 0.05
-
-            # Layer 3: RSI Health Score (0-20 points) - v10.7: FLOW-ADJUSTED DYNAMIC SCORING
-            # High institutional flow expands acceptable RSI range
-            rsi_score = 0.0
-
-            # Define dynamic sweet spots based on flow factor
-            # Base sweet spot: 55-65, expands to 45-80 with max flow
-            sweet_spot_min = max(45, 55 - flow_factor * 10)
-            sweet_spot_max = min(80, 65 + flow_factor * 15)
-
-            if sweet_spot_min <= current_rsi <= sweet_spot_max:
-                # Within dynamic sweet spot - full or near-full credit
-                if 55 <= current_rsi <= 65:
-                    rsi_score = 0.20  # Classic sweet spot
-                elif 50 <= current_rsi <= 70:
-                    rsi_score = 0.18  # Standard acceptable range
-                else:
-                    # Extended range due to high flow - still good credit
-                    rsi_score = 0.15 + flow_factor * 0.05  # 0.15-0.20 based on flow
-
-            elif rsi_min_dynamic <= current_rsi <= rsi_max_dynamic:
-                # Within dynamic acceptable range but outside sweet spot
-                if current_rsi < sweet_spot_min:
-                    # Oversold side
-                    rsi_score = 0.08 + flow_factor * 0.04
-                else:
-                    # Overbought side - flow factor provides "forgiveness"
-                    # LULU with RSI 78 and high flow would score here
-                    distance_from_70 = current_rsi - 70
-                    penalty = min(0.10, distance_from_70 * 0.01)  # Small penalty per point above 70
-                    forgiveness = flow_factor * 0.12  # High flow forgives up to 0.12
-                    rsi_score = max(0.05, 0.15 - penalty + forgiveness)
-
-            elif 70 < current_rsi <= 85 and flow_factor >= 0.3:
-                # Overbought but with significant flow - partial credit with forgiveness
-                # This catches LULU-like scenarios: RSI 78 but $1B institutional stake
-                rsi_score = 0.05 + flow_factor * 0.08  # 0.05-0.13 based on flow
-
-            # Store scoring details for debugging
-            result['rsi_sweet_spot'] = f"{sweet_spot_min:.0f}-{sweet_spot_max:.0f}"
-
-            # Layer 4: Breakout Confirmation Score (0-15 points)
-            breakout_score = 0.0
-            if near_breakout or recent_breakout:
-                if recent_breakout:
-                    # Already broken out
-                    breakout_pct = (current_price - base_low) / base_low
-                    if breakout_pct >= 0.10:
-                        breakout_score = 0.15  # Strong breakout (10%+)
-                    elif breakout_pct >= 0.05:
-                        breakout_score = 0.12
-                    else:
-                        breakout_score = 0.08
-                elif near_breakout:
-                    # Near breakout (anticipatory)
-                    breakout_score = 0.10
-
-            # Layer 5: Drawdown Quality Score (0-10 points)
-            # v10.4: Extended for deep institutional corrections (LULU-like 60% drops)
-            drawdown_score = 0.0
-            if max_drawdown <= 0.70:  # Extended acceptable drawdown
-                # Lower drawdown = higher quality base (for speculative)
-                # Higher drawdown = deeper value opportunity (for institutional)
-                if max_drawdown <= 0.20:
-                    drawdown_score = 0.10  # Tight base (best for speculative)
-                elif max_drawdown <= 0.35:
-                    drawdown_score = 0.08  # Moderate correction
-                elif max_drawdown <= 0.50:
-                    drawdown_score = 0.07  # Significant correction (still acceptable)
-                elif max_drawdown <= 0.70:
-                    # Deep institutional correction (LULU: 60% drop)
-                    # If base is institutional (>365 days), this is POSITIVE (deep value + time to accumulate)
-                    if days_in_base >= institutional_threshold:
-                        drawdown_score = 0.10  # Deep value opportunity for institutions
-                    else:
-                        drawdown_score = 0.05  # Risky for short-term plays
-            else:
-                # Excessive drawdown (>70%) - severe distress signal
-                drawdown_score = -0.05
-
-            # Layer 6: Dark Pool Support Score (0-15 points + BONUS for mega-prints)
-            # v10.4: Magnitude-based scaling for institutional activism (LULU-like $1B+ stakes)
-            dp_score = 0.0
-            if has_dp_support:
-                dp_score = 0.10 + (dp_strength * 0.05)  # Base 10 + up to 5 bonus
-
-            # BONUS: Check for massive institutional dark pool activity
-            # Look for signature prints or unusually large DP accumulation
-            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
-                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
-                if ticker_row is not None and 'dp_total' in ticker_row:
-                    dp_total = ticker_row['dp_total']
-                    # Institutional activism threshold: $50M+ dark pool activity
-                    if dp_total > 50_000_000:  # $50M+
-                        # Scale bonus logarithmically (prevents single print from dominating)
-                        import math
-                        mega_print_bonus = min(0.15, math.log10(dp_total / 50_000_000) * 0.10)
-                        dp_score += mega_print_bonus
-                        # For truly massive prints ($500M+), add extra weight
-                        if dp_total > 500_000_000:  # $500M+ (LULU Elliott-level)
-                            dp_score += 0.10
-
-            # Layer 7: Pattern Synergy Bonus (0-10 points)
-            # v10.4: Detect overlapping patterns that reinforce each other (LULU has both!)
-            synergy_score = 0.0
-
-            # Check if this ticker also has double bottom pattern (cache check)
-            # Double bottom within phoenix base = STRONG institutional accumulation signal
-            # We'll check this later during pattern integration, but add placeholder
-            # The actual synergy bonus will be added during pattern aggregation in predict()
-
-            # v10.7: Layer 8: Flow Factor Bonus (0-15 points)
-            # High institutional conviction adds direct score bonus
-            # This allows stocks with massive flow to overcome weak individual components
-            flow_bonus = 0.0
-            if flow_factor >= 0.7:
-                flow_bonus = 0.15  # Exceptional institutional conviction
-            elif flow_factor >= 0.5:
-                flow_bonus = 0.10  # Strong institutional flow
-            elif flow_factor >= 0.3:
-                flow_bonus = 0.05  # Moderate institutional interest
-
-            # v11.0: Layer 9: Solidity Score (0-18 points)
-            # Detects institutional accumulation during retail exhaustion
-            # This is critical for LULU-style setups where smart money loads quietly
-            solidity_result = self.calculate_solidity_score(ticker, history_df)
-            solidity_score_raw = solidity_result.get('solidity_score', 0)
-
-            # Scale solidity to weight in Phoenix score (18% of total as per SOLIDITY_CONFIG)
-            solidity_weight = SOLIDITY_CONFIG['weight_in_phoenix']
-            solidity_contribution = solidity_score_raw * solidity_weight
-
-            # Store solidity components in result for transparency
-            result['solidity_score'] = solidity_score_raw
-            result['solidity_details'] = solidity_result
-
-            # --- COMPOSITE SCORE ---
-            composite_score = (
-                base_duration_score +
-                volume_score +
-                rsi_score +
-                breakout_score +
-                drawdown_score +
-                dp_score +
-                synergy_score +   # Pattern overlap bonus
-                flow_bonus +      # v10.7: Institutional flow bonus
-                solidity_contribution  # v11.0: Institutional accumulation score
-            )
-
-            # v10.7: Dynamic threshold based on flow factor
-            # High flow lowers the bar: 0.60 → 0.45 with max flow
-            base_threshold = 0.60
-            flow_adjusted_threshold = max(0.45, base_threshold - flow_factor * 0.15)
-            is_phoenix = composite_score >= flow_adjusted_threshold
-
-            result['is_phoenix'] = is_phoenix
-            result['phoenix_score'] = composite_score
-            result['threshold'] = flow_adjusted_threshold
-
-            # --- DETAILED EXPLANATION ---
-            score_components = []
-
-            if is_phoenix:
-                # Highlight strengths
-                if base_duration_score >= 0.20:
-                    score_components.append(f"{days_in_base}d base ({base_duration_score*100:.0f} pts)")
-                if volume_score >= 0.15:
-                    score_components.append(f"{volume_ratio:.1f}x volume ({volume_score*100:.0f} pts)")
-                if rsi_score >= 0.10:
-                    # v10.7: Show RSI with dynamic range context
-                    if current_rsi > 70:
-                        score_components.append(f"RSI {current_rsi:.0f} [flow-adjusted] ({rsi_score*100:.0f} pts)")
-                    else:
-                        score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
-                if breakout_score >= 0.10:
-                    score_components.append(f"Breakout ({breakout_score*100:.0f} pts)")
-                if dp_score >= 0.10:
-                    score_components.append(f"DP ${flow_details['raw_dp_total']/1e6:.0f}M ({dp_score*100:.0f} pts)")
-                if flow_bonus >= 0.05:
-                    score_components.append(f"Flow Factor {flow_factor:.2f} (+{flow_bonus*100:.0f} pts)")
-                # v11.0: Solidity score indicator
-                if solidity_contribution >= 0.05:
-                    score_components.append(f"SOLID BASE ({solidity_score_raw:.2f})")
-
-                threshold_note = f" [threshold={flow_adjusted_threshold:.2f}]" if flow_adjusted_threshold < 0.60 else ""
-                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f}{threshold_note} | " + ", ".join(score_components)
-            else:
-                # Show why it didn't qualify (scores too low)
-                weak_components = []
-                if base_duration_score < 0.15:
-                    weak_components.append(f"base {days_in_base}d ({base_duration_score*100:.0f} pts)")
-                if volume_score < 0.10:
-                    weak_components.append(f"volume {volume_ratio:.1f}x ({volume_score*100:.0f} pts)")
-                if rsi_score < 0.10:
-                    # v10.7: Show RSI with dynamic range info
-                    rsi_note = f" [range:{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}]" if flow_factor >= 0.2 else ""
-                    weak_components.append(f"RSI {current_rsi:.0f}{rsi_note} ({rsi_score*100:.0f} pts)")
-                if breakout_score < 0.08:
-                    weak_components.append(f"no breakout ({breakout_score*100:.0f} pts)")
-
-                # v10.7: Show flow factor if significant
-                flow_note = f", flow={flow_factor:.2f}" if flow_factor >= 0.2 else ""
-                threshold_note = f"/{flow_adjusted_threshold:.2f}" if flow_adjusted_threshold < 0.60 else "/0.60"
-
-                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}{threshold_note}{flow_note}): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
-
-        except Exception as e:
-            result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
-
-        return result
+        """Detect phoenix reversal. See engine/patterns.py for full implementation (~400 lines)."""
+        return _detect_phoenix_reversal(ticker, history_df, self.full_df, self.dp_support_levels, getattr(self, 'signature_prints', None))
 
     def detect_cup_and_handle(self, ticker, history_df):
-        """
-        Detect Cup-and-Handle pattern: U-shaped recovery + small consolidation (handle).
-
-        Pattern:
-        1. U-shaped recovery (30-60 days)
-        2. Price returns to 80-100% of prior high
-        3. Small handle consolidation (5-15 days, 5-15% pullback)
-        4. Volume decreasing during handle formation
-        5. Breakout above handle resistance
-
-        Returns dict with cup-and-handle detection results.
-        """
-        result = {
-            'is_cup_handle': False,
-            'cup_handle_score': 0.0,
-            'explanation': ''
-        }
-
-        if history_df is None or len(history_df) < 60:
-            result['explanation'] = 'Insufficient history'
-            return result
-
-        try:
-            close = history_df['Close']
-            volume = history_df['Volume']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            if isinstance(volume, pd.DataFrame):
-                volume = volume.iloc[:, 0]
-
-            # Look for cup formation in last 60 days
-            lookback = min(len(close), 60)
-            cup_period = close.iloc[-lookback:]
-
-            # Find the high before the cup (left rim)
-            left_rim_high = cup_period.iloc[:20].max()
-            left_rim_idx = cup_period.iloc[:20].idxmax()
-
-            # Find the low of the cup (bottom)
-            cup_low = cup_period.iloc[10:40].min()
-            cup_low_idx = cup_period.iloc[10:40].idxmin()
-
-            # Find the recent high (right rim / handle start)
-            right_rim_high = cup_period.iloc[-20:].max()
-
-            current_price = float(close.iloc[-1])
-
-            # Cup depth
-            cup_depth = (left_rim_high - cup_low) / left_rim_high
-
-            # Recovery ratio (how much of the drop was recovered)
-            recovery = (right_rim_high - cup_low) / (left_rim_high - cup_low) if left_rim_high > cup_low else 0
-
-            # Handle characteristics (last 15 days)
-            handle_period = close.iloc[-15:]
-            handle_high = handle_period.max()
-            handle_low = handle_period.min()
-            handle_depth = (handle_high - handle_low) / handle_high
-
-            # Volume trend during handle (should decline)
-            volume_handle = volume.iloc[-15:]
-            volume_pre_handle = volume.iloc[-30:-15]
-            volume_declining = volume_handle.mean() < volume_pre_handle.mean()
-
-            # Scoring
-            score = 0.0
-
-            # Cup quality (0-40 points)
-            if 0.15 <= cup_depth <= 0.50 and recovery >= 0.80:
-                score += 0.40
-            elif 0.10 <= cup_depth <= 0.55 and recovery >= 0.70:
-                score += 0.25
-
-            # Handle quality (0-30 points)
-            if 0.05 <= handle_depth <= 0.15 and volume_declining:
-                score += 0.30
-            elif 0.05 <= handle_depth <= 0.20:
-                score += 0.15
-
-            # Breakout confirmation (0-30 points)
-            if current_price >= handle_high * 1.02:  # 2% breakout
-                score += 0.30
-            elif current_price >= handle_high * 0.98:  # Near breakout
-                score += 0.15
-
-            result['is_cup_handle'] = score >= 0.60
-            result['cup_handle_score'] = score
-            result['explanation'] = f"Cup-Handle: {score:.2f} | Depth={cup_depth*100:.0f}%, Recovery={recovery*100:.0f}%, Handle={handle_depth*100:.0f}%" if score >= 0.60 else f"Not cup-handle (score={score:.2f})"
-
-        except Exception as e:
-            result['explanation'] = f'Cup-handle error: {str(e)[:50]}'
-
-        return result
+        """Detect cup-and-handle pattern. See engine/patterns.py for full implementation."""
+        return _detect_cup_and_handle(history_df)
 
     def detect_double_bottom(self, ticker, history_df):
-        """
-        Detect Double Bottom pattern: Two distinct lows at similar price levels with a bounce between.
-
-        Pattern:
-        1. First low (support test)
-        2. Bounce of 10-20% from first low
-        3. Second low within 2-5% of first low (support confirmation)
-        4. Time between lows: 20-60 days
-        5. Breakout above resistance (high between the lows)
-
-        Returns dict with double bottom detection results.
-        """
-        result = {
-            'is_double_bottom': False,
-            'double_bottom_score': 0.0,
-            'explanation': ''
-        }
-
-        if history_df is None or len(history_df) < 60:
-            result['explanation'] = 'Insufficient history'
-            return result
-
-        try:
-            close = history_df['Close']
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-
-            # Look for pattern in last 60 days
-            lookback = min(len(close), 60)
-            pattern_period = close.iloc[-lookback:]
-
-            # Find local minima (potential lows)
-            from scipy.signal import argrelextrema
-            local_min_indices = argrelextrema(pattern_period.values, np.less, order=5)[0]
-
-            if len(local_min_indices) < 2:
-                result['explanation'] = 'Insufficient local minima'
-                return result
-
-            # Take the two most recent lows
-            recent_lows = local_min_indices[-2:]
-            first_low_idx = recent_lows[0]
-            second_low_idx = recent_lows[1]
-
-            first_low = pattern_period.iloc[first_low_idx]
-            second_low = pattern_period.iloc[second_low_idx]
-
-            # Time between lows
-            days_between = second_low_idx - first_low_idx
-
-            # Find the high between the lows (resistance)
-            between_period = pattern_period.iloc[first_low_idx:second_low_idx]
-            resistance_high = between_period.max()
-
-            # Bounce height from first low
-            bounce_height = (resistance_high - first_low) / first_low
-
-            # Similarity of lows (should be within 5%)
-            low_similarity = abs(second_low - first_low) / first_low
-
-            current_price = float(close.iloc[-1])
-
-            # Scoring
-            score = 0.0
-
-            # Low similarity (0-35 points)
-            if low_similarity <= 0.02:  # Within 2%
-                score += 0.35
-            elif low_similarity <= 0.05:  # Within 5%
-                score += 0.25
-            elif low_similarity <= 0.08:  # Within 8%
-                score += 0.15
-
-            # Time spacing (0-25 points)
-            if 20 <= days_between <= 60:
-                score += 0.25
-            elif 15 <= days_between < 20 or 60 < days_between <= 80:
-                score += 0.15
-
-            # Bounce quality (0-20 points)
-            if bounce_height >= 0.15:  # 15%+ bounce
-                score += 0.20
-            elif bounce_height >= 0.10:
-                score += 0.15
-
-            # Breakout confirmation (0-20 points)
-            if current_price >= resistance_high * 1.03:  # 3% above resistance
-                score += 0.20
-            elif current_price >= resistance_high:
-                score += 0.10
-
-            result['is_double_bottom'] = score >= 0.60
-            result['double_bottom_score'] = score
-            result['explanation'] = f"Double-Bottom: {score:.2f} | Lows={low_similarity*100:.1f}% apart, Bounce={bounce_height*100:.0f}%, Days={days_between}" if score >= 0.60 else f"Not double-bottom (score={score:.2f})"
-
-        except Exception as e:
-            result['explanation'] = f'Double-bottom error: {str(e)[:50]}'
-
-        return result
+        """Detect double-bottom pattern. See engine/patterns.py for full implementation."""
+        return _detect_double_bottom(history_df)
 
     # --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
     def calculate_position_size(self, row, portfolio_value=100000):

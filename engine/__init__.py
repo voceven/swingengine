@@ -8,6 +8,7 @@ Modules:
 - data_loader.py: TitanDB, HistoryManager
 - data_prep.py: Triple-barrier labeling, TCN sequences
 - neural.py: SwingTransformer, TCN architectures
+- patterns.py: Pattern detection functions (bull flag, phoenix, etc.)
 """
 
 from .config import *
@@ -26,3 +27,14 @@ from .utils import (
 )
 from .data_loader import TitanDB, HistoryManager
 from .data_prep import triple_barrier_labels, prepare_tcn_sequences
+from .patterns import (
+    detect_bull_flag,
+    find_gex_walls,
+    detect_downtrend_reversal,
+    calculate_flow_factor,
+    calculate_solidity_score,
+    detect_phoenix_reversal,
+    detect_cup_and_handle,
+    detect_double_bottom,
+    apply_smart_gatekeeper,
+)
