@@ -376,6 +376,23 @@ import requests
 from datetime import datetime, timedelta
 
 # =============================================================================
+# COLAB PATH SETUP (must be before engine imports)
+# =============================================================================
+COLAB_ENV = False
+try:
+    from google.colab import drive
+    if not os.path.exists('/content/drive'):
+        drive.mount('/content/drive')
+    COLAB_ENV = True
+    # Add colab directory to Python path so 'engine' module can be found
+    COLAB_BASE = '/content/drive/My Drive/colab'
+    if COLAB_BASE not in sys.path:
+        sys.path.insert(0, COLAB_BASE)
+    print(f"  [COLAB] Added {COLAB_BASE} to sys.path")
+except ImportError:
+    pass  # Running locally, no path modification needed
+
+# =============================================================================
 # ENGINE MODULES (v12 Modular Architecture)
 # =============================================================================
 # All components imported from engine/ package
@@ -402,16 +419,6 @@ ALPACA_SECRET_KEY = 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK'
 
 # Initialize Client (New SDK)
 alpaca_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-
-# Colab support (optional - gracefully handles local execution)
-COLAB_ENV = False
-try:
-    from google.colab import drive
-    if not os.path.exists('/content/drive'):
-        drive.mount('/content/drive')
-    COLAB_ENV = True
-except ImportError:
-    pass  # Running locally, no Drive mount needed
 
 # =============================================================================
 # ML IMPORTS
