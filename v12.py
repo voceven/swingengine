@@ -1,0 +1,4624 @@
+# -*- coding: utf-8 -*-
+"""
+SwingEngine v12 - Grandmaster (Modular Architecture)
+
+Modular refactor of v11.5 - core logic in main file, utilities in engine/ package.
+Target: ~4500 lines (down from 5600) with modular imports.
+
+Architecture:
+1. BACKBONE: SQLite Database (Scalable History).
+2. BRAIN: 5x Ensemble Transformer (Hive Mind) + Diverse Ensemble Stack (CatBoost + TabNet + TCN + ElasticNet) + GPU Acceleration.
+3. CONTEXT: Enhanced Macro-Regime Awareness (VIX, TNX, DXY) with score weighting.
+4. EXECUTION: ATR-based Stop Loss & Take Profit.
+5. PATTERNS: 6 Pattern Types - Bull Flag, GEX Wall, Downtrend Reversal, Phoenix, Cup-Handle, Double Bottom.
+6. INTERPRETABILITY: Human-readable explanation generator for each signal.
+7. RISK: Sector capping to prevent over-concentration.
+8. PERFORMANCE: Ensemble caching, GPU acceleration, early stopping, configurable parameters.
+9. SIZING: Kelly Criterion position sizing with volatility-based risk tiers.
+10. v11.0 DUAL-RANKING: Separate Alpha Momentum and Phoenix Reversal leaderboards.
+11. v11.0 SOLIDITY: Institutional accumulation detection (38.2% Fib consolidation + declining volume).
+12. v11.0 GATEKEEPER: Dollar-volume liquidity pre-filtering with DP bypass.
+
+Changelog from v8.4:
+- Added bull flag pattern detection (consolidation after strong moves)
+- Added GEX wall scanner (gamma exposure support/resistance levels)
+- Added downtrend reversal detection (months-long downtrend + DP support)
+- Added explanation generator (human-readable reasoning for each pick)
+- Added sector capping (max 3 picks per sector per strategy)
+- Enhanced macro weighting (DXY/TNX/VIX influence individual scores)
+- Removed hard Colab dependency (works locally or in Colab)
+
+Changelog v9.5 (Calibration):
+- Relaxed bull flag thresholds (5% pole min, 15% max range) for more detections
+- Fixed GEX wall protection score (250K divisor for proper 75K+ = protected)
+- Added GEX debug output showing candidate/strike data overlap
+- Performance config: reduced transformer epochs (50->30), CatBoost trials (30->15)
+- Configurable batch sizes and ticker download limits
+- TPU/GPU/CPU auto-detection with torch_xla support
+
+Changelog v10.0 (Position Sizing):
+- Added Kelly Criterion position sizing (quarter-Kelly for safety)
+- Added Risk Tier Matrix (HIGH/MEDIUM/LOW conviction based on nn_score + vol)
+- Added volatility buckets (<5%, 5-6%, >6% ATR/Price)
+- Position sizing integrated into all strategy outputs
+- Displays position_pct, shares, and risk_tier for each pick
+
+Changelog v10.1 (Phoenix + Reliability):
+- ADDED: Phoenix Reversal Strategy (6-12 month base breakouts with volume surge)
+- ENHANCED: CatBoost AUC improvement (25 trials, max_iter=500, depth=10, CV=5)
+- FIXED: VIX/TNX/DXY reliability with NaN checking and retry logic (3 retries)
+- IMPROVED: Fetch success tracking with detailed error handling and logging
+- OPTIMIZED: Border count tuning in CatBoost for better model performance
+- Updated output filename to v10_grandmaster.csv
+
+Changelog v10.2 (Production Optimization - Quick Wins):
+- PERFORMANCE: Model caching with regime-aware invalidation (7-day default, 50-70min savings)
+- PERFORMANCE: Early stopping in CatBoost (early_stopping_rounds=50)
+- PATTERNS: Multi-layer phoenix scoring system (6 layers: duration, volume, RSI, breakout, drawdown, DP)
+- PATTERNS: Added Cup-and-Handle detection (U-shaped recovery + handle consolidation)
+- PATTERNS: Added Double Bottom detection (dual support test + resistance breakout)
+- PATTERNS: Enhanced phoenix threshold from boolean AND to weighted scoring (0.60 threshold)
+- PATTERNS: Detailed point-based explanations showing strength/weakness breakdown
+- Expected runtime: 83min → 20-30min (first run trains, subsequent runs load cache)
+- Expected phoenix detections: 0 → 3-8 per run (with relaxed scoring)
+
+Changelog v10.3 (Ensemble Stacking + GPU Acceleration):
+- ML ARCHITECTURE: Replaced single CatBoost with ensemble stacking (3 models + meta-learner)
+- ML MODELS: CatBoost + LightGBM + XGBoost with LogisticRegression meta-learner (v10.3)
+- GPU ACCELERATION: All 3 base models use GPU when available (task_type='GPU', device='gpu', device='cuda')
+
+Changelog v11.3 (Phase 3: ML Ensemble Overhaul - Architectural Diversity):
+- ML MODELS: Replaced redundant boosting (LightGBM/XGBoost) with diverse architectures
+- ENSEMBLE: CatBoost (tree splits) + TabNet (attention) + TCN (temporal) + ElasticNet (linear)
+- TCN: Temporal Convolutional Network for sequential pattern detection (dilated causal convolutions)
+- TABNET: Attention-based feature interaction learning (sparsemax/entmax masks)
+- ELASTICNET: L1+L2 regularized linear baseline (overfitting sanity check)
+- TARGET AUC: 0.945-0.955 through cognitive diversity vs 0.93-0.94 redundant boosting
+- PERFORMANCE: Ensemble caching system (4 model caches with regime-aware invalidation)
+- PERFORMANCE: Cross-validated stacking predictions for meta-learner training
+- QUALITY: Expected AUC improvement from 0.92-0.93 → 0.95+ with ensemble diversity
+- GPU DETECTION: Automatic CUDA detection with fallback to CPU
+- LOGGING: Detailed model weights and individual AUC scores for transparency
+- Expected runtime: 34min → 18-22min with GPU (first run trains all 3, subsequent runs load cache)
+- Expected AUC: 0.92 → 0.95+ with ensemble stacking
+
+Changelog v11.4 (Phase 4: Feature Engineering - Triple-Barrier + TCN Fix):
+- LABELS: Triple-Barrier Labeling replaces simple binary labels for realistic trade outcomes
+  - TP barrier: 1.5x ATR take-profit target
+  - SL barrier: 1.0x ATR stop-loss level
+  - TIME barrier: 5-day holding period max
+  - Labels reflect which barrier was hit first (TP=win, SL=loss)
+- TCN FIX: Real temporal sequences replace fake repeated snapshots
+  - Previous bug: Same feature vector repeated N times (no temporal info)
+  - Now: Actual day-by-day feature evolution (returns, volatility, RSI, momentum)
+  - Features: returns, volatility, volume_ratio, rsi, momentum_5d, momentum_10d
+- INFERENCE: TCN generates per-ticker sequences from price history
+- TARGET AUC: 0.92 → 0.94+ with proper labeling and real sequences
+
+Changelog v10.4 (Institutional Phoenix + Pattern Synergy - LULU-Inspired):
+- PHOENIX EXTENDED: Base duration extended from 250 days → 730 days (24 months)
+- PHOENIX TIERS: Speculative (2-12 months) vs Institutional (12-24 months) phoenix patterns
+- PHOENIX SCORING: Institutional phoenix (365-730 days) gets FULL base duration score (0.25)
+- DRAWDOWN EXTENDED: Acceptable drawdown 35% → 70% for deep institutional corrections (LULU: 60%)
+- DRAWDOWN SCORING: 50-70% drawdowns score HIGHER for institutional patterns (deep value opportunity)
+- DARK POOL MAGNITUDE: Logarithmic scaling for mega-prints ($50M+, $500M+, $1B+ institutional activism)
+- DARK POOL BONUS: $500M+ prints (Elliott/LULU-level) get +0.25 total DP score (vs 0.15 baseline)
+- PATTERN SYNERGY: Phoenix + Double Bottom = +8 point bonus (LULU pattern recognition)
+- PATTERN SYNERGY: Phoenix + Cup-Handle = +6 point bonus (institutional continuation)
+- PATTERN SYNERGY: Bull Flag + GEX Wall = +5 point bonus (momentum + support)
+- INSTITUTIONAL FOCUS: Catches large-cap ($5B+) activist plays with extended accumulation periods
+- Expected improvement: Catch LULU-like patterns that were previously missed
+- Rationale: Real-world validation showed BHR flagged but LULU (Elliott $1B stake) missed
+
+Changelog v10.5 (Oracle Reliability Fix - Data Integrity):
+- ROOT CAUSE: yfinance bulk downloads failing silently (63.5% success rate → 36.5% data loss)
+- ORACLE CHUNKING: Reduced batch size 75 → 50 tickers per chunk (API limit compliance)
+- RATE LIMITING: 1.5s delay between chunks with exponential backoff on errors (prevents bans)
+- INDIVIDUAL RETRY: Failed tickers get individual fetch retry (yfinance quirk workaround)
+- DATA INTEGRITY GATE: <90% fetch success → WARNING + user notification (no silent failures)
+- PROGRESS FEEDBACK: Chunk-by-chunk progress reporting for transparency
+- EXPECTED IMPROVEMENT: 63.5% → 95%+ Oracle fetch success rate
+- PHOENIX IMPACT: LULU-like patterns now detectable (data present → analysis works)
+- Rationale: Previous sessions found phoenix logic correct but no data to analyze
+
+Changelog v10.6 (Validation Mode Fix - CRITICAL):
+- ROOT CAUSE CORRECTED: Previous diagnosis missed the REAL blocker
+- THREE DATA STAGES: Oracle (781) → Fetch (3000) → Patterns (top 75 only)
+- FATAL FLAW: Validation mode added LULU with zeros → Low ML score → Never in top 75
+- FIX: Force validation tickers into top_candidates (bypass ML ranking filter)
+- VALIDATION_SUITE: Moved to module-level constant for cross-function access
+- DEBUG OUTPUT: Shows LULU's actual ML score, rank, data status, and phoenix result
+- PATTERN CHUNKING: Applied 50-ticker chunking to pattern downloads too (safety)
+- EXPECTED: LULU now reaches pattern analysis → Phoenix detection can run
+- Rationale: Validation mode adds ticker but NOT data → Pattern analysis never reached
+
+Changelog v10.6.1 (Data Sanitization - yfinance Header Leak Fix):
+- BUG: yfinance batch downloads leak header "Ticker" into data rows
+- CRASH: pd.to_datetime("Ticker") fails → ValueError stops engine
+- FIX 1: prepare_supervised_data uses errors='coerce' + dropna for robust parsing
+- FIX 2: sync_prices sanitizes data BEFORE DB insert (defense-in-depth)
+- REMOVES: Corrupt rows with "Ticker" in date column automatically cleaned
+- Rationale: yfinance quirk when downloading in chunks/groups
+
+Changelog v10.7 (Flow-Adjusted Dynamic Scoring Model):
+- ARCHITECTURE: Flow-Adjusted Dynamic Scoring replaces hard thresholds
+- CONCEPT: High institutional flow earns "forgiveness points" that expand limits
+- EXAMPLE: LULU with $1B Elliott stake can have RSI 80 and still pass
+- NEW METHOD: calculate_flow_factor() computes institutional conviction (0.0-1.0)
+- FLOW COMPONENTS: Volume intensity + Dark Pool activity + Signature prints + Options flow
+- DYNAMIC RSI: Base 50-70 expands to 40-85 with max flow factor
+- DYNAMIC THRESHOLD: Phoenix threshold 0.60 → 0.45 with max flow factor
+- FLOW BONUS: High flow adds 5-15 points directly to composite score
+- DATA FIX: Extended all downloads from 3mo to 2y (504 trading days)
+- MACRO FIX: get_market_regime with cooldown, individual fallback, and sanitization
+- MACRO COOLDOWN: 2s initial delay + exponential backoff between retries
+- MACRO FALLBACK: If batch fails, tries individual ticker fetches with 1s cooldown
+- Rationale: Binary thresholds rejected LULU (RSI 78) despite $1B institutional stake
+
+Changelog v10.8 (Anti-Throttling Oracle - Yahoo Rate Limit Defense):
+- PROBLEM: Yahoo Finance throttling causes 40% fetch success rate (too many requests)
+- LEVEL 1 FIX: User-Agent spoofing (Chrome browser headers) to appear as normal browser
+- LEVEL 2 FIX: Random delays 3-6s between chunks + smaller chunk size (50 → 20)
+- LEVEL 3 FIX: Incremental updates - only fetch data newer than last DB entry
+- WEEKEND AWARENESS: Skips sync on weekends when markets are closed (no new data)
+- SMART CACHE CHECK: Validates existing data freshness before full refresh
+- SESSION POOLING: Persistent requests session with connection pooling
+- EXPECTED: 40% → 90%+ Oracle success rate via stealth + efficiency
+- Rationale: Repeated large bulk requests triggered Yahoo's rate limiter
+
+Changelog v10.8.1 (Phoenix Detection Fix - LULU-Critical):
+- BUG 1 FIX: Phoenix lookback was truncated to 60 days (min_days)
+  - Previous: days_in_base capped at 60, institutional phoenix (365+) IMPOSSIBLE
+  - Now: Looks at FULL lookback period (up to 730 days)
+- BUG 2 FIX: Consolidation threshold was too strict (10%)
+  - Industry standard: 15-18% for VCP/flat base patterns (TraderLion/Minervini)
+  - For deep drawdown recoveries (60%+ drop like LULU): 20-25% is acceptable
+  - New: Dynamic threshold 15% base, +10% for deep drawdowns, +5% for high flow
+- DYNAMIC CONSOLIDATION: consolidation_threshold = 0.15 + drawdown_bonus + flow_bonus
+  - drawdown_bonus: Up to 10% extra for deep drawdowns (base_range * 0.15)
+  - flow_bonus: Up to 5% extra for institutional flow (flow_factor * 0.05)
+  - Capped at 30% maximum (prevents false positives)
+- DEBUG OUTPUT: Phoenix analysis now prints detailed debug for validation tickers
+- EXPECTED: LULU should now qualify for Phoenix detection with institutional scoring
+- Rationale: LULU had 60% drawdown + ~400 day base but failed 10% consolidation test
+
+Changelog v10.9 (Alpaca Data Layer - Production-Grade Pipeline):
+- ARCHITECTURE: Migrated from unstable yfinance to Alpaca Market Data API
+- RELIABILITY: Alpaca provides 99.9%+ uptime vs Yahoo's ~75% success rate
+- SPEED: Alpaca batch API is 3-5x faster than yfinance for bulk downloads
+- COVERAGE: Alpaca handles all stocks/ETFs; yfinance kept only for indices (^VIX, ^TNX)
+- NEW FUNCTION: fetch_alpaca_batch() for efficient batched price history
+- REFACTORED: sync_prices() now uses Alpaca for Oracle data
+- REFACTORED: enrich_market_data() now uses Alpaca for technical fetches
+- REFACTORED: Pattern downloads now use Alpaca for 2y history
+- PRESERVED: get_market_regime() still uses yfinance for macro indices
+- PREREQUISITE: Requires ALPACA_API_KEY and ALPACA_SECRET_KEY
+- EXPECTED: 75% → 99%+ data fetch success rate
+- Rationale: Yahoo Finance throttling made production use unreliable
+
+Changelog v10.10 (Dynamic Macro Intelligence - Z-Score Adaptation):
+- MACRO INTELLIGENCE: Replaced static thresholds with Dynamic Rolling Z-Scores
+- ADAPTIVE REGIME: Engine self-calibrates to "New Normal" market conditions (e.g., high-rate eras)
+- STATISTICAL BASELINE: Fetches 1-year macro history to calculate 6-month rolling averages/std-devs
+- VISIBILITY: Macro status now reports Z-Scores (e.g., "VIX -1.0σ") for context
+- DATA HYGIENE: Improved ticker sanitization to exclude warrants ("+") and zombies
+- ORACLE EFFICIENCY: Smart weekend-skipping logic (prevents redundant fetches if DB exists)
+- EXPECTED: Fewer false positives during high-volatility regimes; robust handling of structural market shifts
+
+Changelog v11.0 (Dual-Ranking Architecture - Phase 1 - LULU Fix):
+- CRITICAL FIX: LULU ranked 118th despite 0.96 phoenix score - momentum bias exposed
+- DUAL-RANKING: Separate Alpha Momentum vs Phoenix Reversals leaderboards (not competing)
+- ALPHA MOMENTUM: Trend score + RSI + price action + volume momentum (continuation plays)
+- PHOENIX REVERSAL: Consolidation duration + solidity + breakout + institutional flow (reversal plays)
+- SOLIDITY SCORE: Institutional accumulation detection (38.2% Fib consolidation + declining volume)
+  - Detects "smart money loading" while retail loses interest
+  - Price range within 38.2% of base (institutional Fibonacci level)
+  - 20+ day consolidation period required
+  - Dark pool activity > $10M threshold
+  - Declining retail volume confirmation
+  - Weight: 15-20% of final Phoenix score
+- SMART GATEKEEPER: Dollar-volume liquidity pre-filtering
+  - Large-cap: $5M daily dollar-volume required
+  - Mid-cap: $2M daily dollar-volume required
+  - Small-cap: $1M daily dollar-volume required
+  - DP BYPASS: $500K+ dark pool inflow bypasses liquidity filter (early accumulation)
+  - Bid-ask spread check: <= 0.5% for tradeable executions
+- EXPECTED: LULU moves from #118 to top 25 Phoenix Reversals where it belongs
+- BUG FIX: Leaderboard display regenerated AFTER position sizing (position_pct/risk_tier available)
+
+Changelog v11.2 (Phoenix Calibration + Accumulation Fix):
+- CRITICAL BUG FIX: Pattern bonuses were OVERWRITING each other instead of accumulating!
+  - Root cause: Each bonus used row.get() which reads ORIGINAL value, not accumulated
+  - Example: phoenix_boost(42) + solidity_bonus(9) + duration_bonus(12) → only 12 survived
+  - FIX: Use local accumulators (phoenix_accum, alpha_accum, etc.) with single write at end
+- SCORING REBALANCE: Increased pattern multipliers for achievable thresholds
+  - phoenix_boost: 25 → 40 (60% increase) for detected phoenix patterns
+  - solidity_boost: 15 → 20 (33% increase) for institutional bases
+  - legacy phoenix bonus: 15 → 25 for trend/ambush scores
+- THRESHOLD LOWERED: Phoenix min_score 60 → 55 (more lenient qualification)
+- WEIGHT ADJUSTMENTS: Rebalanced Phoenix Reversal scoring formula
+  - weight_ml: 0.12 → 0.15 (slight ML increase for base points)
+  - weight_solidity: 0.18 → 0.20 (increased institutional detection weight)
+  - weight_flow: 0.20 → 0.15 (early accumulation is quiet by design)
+- NEW FEATURE: Institutional Duration Bonus (12+ month bases)
+  - Adds up to 20 points for bases ≥365 days (LULU: 445d → +12.2 pts)
+  - Rewards patience in extended consolidation periods
+- MATH VALIDATION: LULU now properly accumulates ALL bonuses (~70+ pts)
+- EXPECTED RESULTS: 6-10 phoenix qualifications per run (vs 0 in v11.0)
+- RATIONALE: v11.0 detected patterns correctly but scoring was miscalibrated
+  - Perfect phoenix (1.0 score) + average ML (50) = only 31 pts (missed 60 threshold)
+  - v11.2 fixes: same pattern now scores 65+ pts with proper multipliers
+
+Changelog v11.2 (False Positive Prevention - MU Fix):
+- PROBLEM: MU ranked #1 on Phoenix Leaderboard with 99.9 score but only 0.40 solidity
+  - MU is a momentum play (near 52-week high), not a reversal from accumulation
+  - Heavy dark pool ($1.1B) + bullish gamma inflated score despite weak accumulation pattern
+- FIX 1: SOLIDITY GATE - Hard penalty for low solidity scores
+  - Raised base_threshold: 0.50 → 0.55 (clearer accumulation required)
+  - If solidity < 0.55 AND phoenix_score > 0: Apply 70% penalty to phoenix_accum
+  - Effect: MU (0.40 solidity) score drops from 99.9 to ~30 (below 55 threshold)
+  - Effect: LULU (0.70 solidity) remains at 99.9 (passes threshold)
+- FIX 2: MOMENTUM FILTER - 52-week high proximity check
+  - Calculate pct_from_52w_high for each phoenix candidate
+  - If stock is within 10% of 52-week high: Apply 50% phoenix penalty
+  - Boost alpha_momentum_score instead (correct leaderboard placement)
+  - Rationale: True phoenix reversals emerge from BASES, not from stocks at highs
+- EXPECTED RESULTS:
+  - MU: Removed from Phoenix Leaderboard (low solidity + near 52w high)
+  - LULU: Remains top 3 on Phoenix Leaderboard (high solidity + recovering from base)
+  - False positive rate: Expected reduction of 60-80%
+
+Changelog v11.2 Phase 2 (VIX Term Structure + VVIX Divergence):
+- NEW FEATURE: VIX Term Structure Analysis for regime detection
+  - Fetches ^VIX3M (3-month VIX futures) and ^VVIX (volatility of VIX)
+  - Calculates term structure ratio: VIX3M / VIX
+  - CONTANGO (ratio > 1.05): Bullish signal, +3 points macro adjustment
+  - BACKWARDATION (ratio < 0.95): Fear signal, -5 points macro adjustment
+  - New regime: "Fear (Backwardation)" when VIX in backwardation + VIX_z > 1.0
+- NEW FEATURE: VVIX Divergence Detection for vol spike prediction
+  - Tracks 5-day VVIX and VIX changes for divergence patterns
+  - BEARISH DIVERGENCE: VVIX rising (>5%) + VIX falling (<-2%) = vol spike incoming
+    - Applies -4 points penalty (warns of imminent volatility)
+  - BULLISH CONVERGENCE: VVIX falling (<-5%) + VIX rising (>2%) = vol spike fading
+    - Applies +2 points bonus (vol normalizing)
+  - VVIX Elevated warning when VVIX > 110 (high vol-of-vol)
+- ENHANCED OUTPUT: Macro regime now displays term structure and VVIX status
+  - Example: "VIX3M: 22.50 | Term Structure: CONTANGO (1.08) | VVIX: 95"
+- CONFIG: VIX_TERM_STRUCTURE_CONFIG with tunable thresholds
+- EXPECTED RESULTS: Better regime-aware position sizing during vol regime shifts
+
+Changelog v11.2 Phase 2.1 (Extreme Contango Fix - @alshfaw Analysis):
+- CRITICAL FIX: Extreme contango (>1.20) is now BEARISH, not bullish
+  - Reference: @alshfaw analysis - 1.26 historically precedes SPY corrections
+  - 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024
+- NEW INTERPRETATION:
+  - Normal (0.95-1.10): Neutral, no adjustment
+  - Mild contango (1.10-1.20): Healthy low vol, +2 points
+  - EXTREME contango (>1.20): COMPLACENCY WARNING, -4 points
+  - Backwardation (<0.95): Fear/panic, -5 points
+- NEW REGIME: "Complacency (Extreme Contango)" when ratio > 1.20
+- CURRENT STATUS (Dec 2025): VIX3M/VIX at 1.26 = EXTREME CONTANGO (bearish)
+- EXPECTED: Score adjustment now -4.0 instead of +3.0 (7 point swing)
+
+Changelog v11.5.2 (Momentum Filter Fix - NVO Restoration):
+- CRITICAL FIX: High solidity now BYPASSES momentum penalty
+  - NVO (solidity 0.70) was incorrectly filtered despite valid institutional accumulation
+  - Root cause: Momentum filter penalized ALL stocks near 52w high, including valid breakouts
+- NEW LOGIC: Solidity gate on momentum filter
+  - Only penalize if solidity < 0.55 (weak accumulation signal)
+  - High solidity (>= 0.55) = institutional conviction validates breakout thesis
+  - Example: NVO with 0.70 solidity now PASSES, MU with 0.40 solidity still FILTERED
+- AFFECTED CHECKS:
+  - 52w high proximity: Only penalize LOW solidity candidates near highs
+  - 52w low distance: Only penalize LOW solidity candidates far from lows
+- EXPECTED: NVO restored to Phoenix Leaderboard alongside LULU
+
+Changelog v11.5.3 (Sector Momentum Filter - FCX/KGC Fix):
+- CRITICAL FIX: Sector momentum now penalizes phoenix regardless of solidity
+  - FCX/KGC (precious metals) have high solidity but XLB sector is at ATH
+  - This is sector BETA, not individual stock ALPHA
+  - High solidity in a hot sector = institutions chasing momentum, not finding value
+- NEW FILTER: Sector 52-week high proximity check
+  - Fetches 1-year data for all sector ETFs (XLK, XLF, XLV, XLB, etc.)
+  - If sector within 10% of ATH: Apply 60% phoenix penalty (sector beta)
+  - If sector within 15% of ATH: Apply 40% phoenix penalty (moderate)
+  - Boosts alpha_score instead (correct leaderboard placement)
+- EXAMPLES:
+  - FCX (Basic Materials/XLB): XLB at ATH → heavy penalty → moved to Alpha
+  - KGC (Basic Materials/XLB): XLB at ATH → heavy penalty → moved to Alpha
+  - NVO (Healthcare/XLV): XLV not at ATH → NO penalty → stays on Phoenix
+  - LULU (Consumer Cyclical/XLY): Sector-relative check passes → stays on Phoenix
+- EXPECTED: FCX/KGC filtered from Phoenix, NVO/LULU remain
+- NOTE: v11.5.3 REPLACED by v11.5.4 - absolute ATH approach caused collateral damage
+
+Changelog v11.5.4 (Sector Beta Filter - Relative Performance):
+- REPLACED v11.5.3: Absolute sector ATH check was too broad
+  - Problem: In bullish market, multiple sectors near ATH → penalized valid phoenix too
+  - LULU dropped from 99.9 to 58.4 despite being true phoenix (XLY also near ATH)
+- NEW APPROACH: Stock vs Sector RELATIVE performance
+  - Compares stock's 6-month return to sector ETF's 6-month return
+  - True phoenix = stock OUTPERFORMING sector (individual alpha)
+  - Sector beta = stock just MATCHING sector (riding the wave)
+- PENALTY TIERS (based on relative performance):
+  - Underperforming sector (< -5%): 60% penalty - definitely not a leader
+  - Matching sector (-5% to 0%): 50% penalty - likely beta play
+  - Barely outperforming (0% to 5%): 30% penalty - mild concern
+  - Outperforming (> 5%): NO penalty - true individual alpha
+- EXAMPLES:
+  - LULU: If up 30% while XLY up 10% → 20% alpha → NO PENALTY → stays on Phoenix
+  - FCX: If up 25% while XLB up 25% → 0% alpha → PENALTY → moved to Alpha Momentum
+- DATA: Fetches 6-month returns for all sector ETFs (XLK, XLF, XLV, XLB, etc.)
+- EXPECTED: True individual reversals (LULU, NVO) pass; sector beta (FCX, KGC) filtered
+"""
+
+!pip uninstall -y alpaca-trade-api
+!pip install alpaca-py yfinance "websockets>=13.0" --upgrade
+# !pip install "websockets<11"
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+import sqlite3
+import warnings
+import os
+import time
+import re
+import sys
+import subprocess
+import logging
+import joblib
+import glob
+import shutil
+import random
+import requests
+from datetime import datetime, timedelta
+
+# =============================================================================
+# ENGINE MODULES (v12 Modular Architecture)
+# =============================================================================
+# All components imported from engine/ package
+from engine import (
+    # Config
+    SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
+    REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
+    MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
+    VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
+    POSITION_SIZING_CONFIG, RISK_TIER_MATRIX,
+    # Neural
+    SwingTransformer, TemporalBlock, TCN,
+    # Utils
+    get_device, configure_yfinance_session, YF_SESSION,
+    is_weekend, get_market_last_close_date, Logger,
+    sanitize_ticker_for_alpaca, fetch_alpaca_batch,
+    # Data
+    TitanDB, HistoryManager,
+    triple_barrier_labels, prepare_tcn_sequences,
+)
+
+ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
+ALPACA_SECRET_KEY = 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK'
+
+# Initialize Client (New SDK)
+alpaca_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+# Colab support (optional - gracefully handles local execution)
+COLAB_ENV = False
+try:
+    from google.colab import drive
+    if not os.path.exists('/content/drive'):
+        drive.mount('/content/drive')
+    COLAB_ENV = True
+except ImportError:
+    pass  # Running locally, no Drive mount needed
+
+# =============================================================================
+# ML IMPORTS
+# =============================================================================
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import roc_auc_score
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.feature_selection import SelectFromModel
+from sklearn.linear_model import LogisticRegression, ElasticNet
+import optuna
+from catboost import CatBoostClassifier, Pool
+# Phase 3: Removed LightGBM/XGBoost for architectural diversity
+# import lightgbm as lgb  # Replaced by TabNet (attention-based)
+# import xgboost as xgb   # Replaced by TCN (temporal CNN)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+# Phase 3: TabNet for attention-based feature interactions
+try:
+    from pytorch_tabnet.tab_model import TabNetClassifier
+    TABNET_AVAILABLE = True
+except ImportError:
+    TABNET_AVAILABLE = False
+    print("  [WARN] pytorch-tabnet not installed. Run: pip install pytorch-tabnet")
+
+# --- CONFIGURATION ---
+warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Device detection (imported from engine.utils)
+device, device_name = get_device()
+
+# =============================================================================
+# CONFIGURATION - Now imported from engine/config.py
+# =============================================================================
+# All config constants (SECTOR_MAP, PHOENIX_CONFIG, DUAL_RANKING_CONFIG, etc.)
+# are now imported from engine.config at the top of this file.
+# To modify configuration, edit: engine/config.py (~250 lines)
+# This enables faster iteration - only copy config.py to Colab for config changes.
+
+# =============================================================================
+# DATA PREPARATION - Imported from engine/data_prep.py
+# =============================================================================
+# triple_barrier_labels and prepare_tcn_sequences are now imported from engine.data_prep
+
+# =============================================================================
+# DATA LOADING - Imported from engine/data_loader.py
+# =============================================================================
+# TitanDB and HistoryManager are now imported from engine.data_loader
+
+# =============================================================================
+# NEURAL NETWORKS - Imported from engine/neural.py
+# =============================================================================
+# SwingTransformer, TemporalBlock, TCN are now imported from engine.neural
+
+# =============================================================================
+# SWING TRADING ENGINE
+# =============================================================================
+class SwingTradingEngine:
+    def __init__(self, base_dir=None):
+        self.base_dir = base_dir if base_dir else os.getcwd()
+        self.model_path = os.path.join(self.base_dir, "grandmaster_cat_v8.pkl")
+        self.transformer_path = os.path.join(self.base_dir, "grandmaster_transformer_v8.pth")
+
+        # Phase 3: Diverse ensemble model paths (CatBoost + TabNet + TCN + ElasticNet)
+        self.catboost_path = os.path.join(self.base_dir, "ensemble_catboost_v11.pkl")
+        self.tabnet_path = os.path.join(self.base_dir, "ensemble_tabnet_v11.pkl")
+        self.tcn_path = os.path.join(self.base_dir, "ensemble_tcn_v11.pth")
+        self.elasticnet_path = os.path.join(self.base_dir, "ensemble_elasticnet_v11.pkl")
+        self.meta_learner_path = os.path.join(self.base_dir, "ensemble_meta_v11.pkl")
+
+        self.scaler = StandardScaler()
+        self.nn_scaler = StandardScaler()
+        self.imputer = SimpleImputer(strategy='constant', fill_value=0)
+        self.features_list = []
+        self.full_df = pd.DataFrame()
+        self.price_cache_file = os.path.join(self.base_dir, "price_cache_v79.csv")
+
+        # Phase 3: Diverse ensemble models (architectural diversity > quantity)
+        self.catboost_model = None   # Tree-based (splits)
+        self.tabnet_model = None     # Attention-based (feature interactions)
+        self.tcn_model = None        # Temporal CNN (sequential patterns)
+        self.elasticnet_model = None # Linear regularized (sanity check)
+        self.meta_learner = None
+        self.model = None  # Keep for backward compatibility
+        self.nn_model = None
+        self.model_trained = False
+
+        self.spy_metrics = {'return': 0.0, 'rsi': 50.0, 'trend': 0.0}
+        self.sector_data = {}
+        self.sector_6m_returns = {}  # v11.5.4: Sector ETF 6-month returns for relative performance filter
+        self.market_breadth = 50.0
+        self.market_regime = "Neutral"
+        self.macro_data = {'vix': 20, 'tnx': 4.0, 'dxy': 100, 'spy_trend': True, 'spy_return': 0, 'adjustment': 0, 'regime_details': []}
+        self.optimized_bot_file = os.path.join(self.base_dir, "optimized_bot_data_v62.csv")
+        self.earnings_map = {}
+        self.sector_map_local = {}
+        self.cap_map = {}
+        self.dp_support_levels = {}
+        self.price_history_cache = {}  # Cache for pattern detection
+        self.strike_gamma_data = {}    # Strike-level gamma for GEX wall detection
+
+        self.history_mgr = HistoryManager(self.base_dir)
+
+    # --- UTILITIES ---
+    def normalize_ticker(self, ticker):
+        t = str(ticker).upper().strip().rstrip('=')
+        indices_map = {'SPX': '^SPX', 'VIX': '^VIX', 'RUT': '^RUT', 'DJX': '^DJX', 'NDX': '^NDX'}
+        if t in indices_map: return indices_map[t]
+        t = t.replace('.', '-')
+        if t == 'BRKB': return 'BRK-B'
+        if len(t) > 4 and t[-1].isdigit(): t = re.sub(r'\d+$', '', t)
+        return t
+
+    def safe_read(self, filepath, name):
+        if not filepath or not os.path.exists(filepath): return pd.DataFrame()
+        try:
+            df = pd.read_csv(filepath)
+            df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+            print(f"  [+] Loaded {name}: {len(df)} rows")
+            return df
+        except Exception as e:
+            print(f"  [!] Error reading {name}: {e}")
+            return pd.DataFrame()
+
+    def get_market_regime(self):
+        """
+        v10.10: Dynamic Regime Adaptation using Rolling Z-Scores.
+        Self-calibrates to market conditions (High VIX is relative, not absolute).
+        """
+        print("\n[TITAN] Assessing Macro Regime (Dynamic Z-Score Mode)...")
+
+        default_macro = {
+            'vix': 20.0, 'tnx': 4.0, 'dxy': 100.0,
+            'spy_trend': True, 'spy_return': 0.0,
+            'adjustment': 0, 'regime_details': ['Data unavailable'],
+            # v11.2 Phase 2: VIX Term Structure defaults
+            'vix3m': 22.0, 'term_structure_ratio': 1.0, 'term_structure': 'neutral',
+            'vvix': 90.0, 'vvix_divergence': 'none'
+        }
+
+        try:
+            # 1. Fetch 1 Year of history to establish statistical baseline
+            # v11.2 Phase 2: Added VIX3M and VVIX for term structure analysis
+            tickers = ['^VIX', '^VIX3M', '^VVIX', '^TNX', 'DX-Y.NYB', 'SPY']
+            data = yf.download(tickers, period="1y", progress=False, threads=False)
+
+            # Handle MultiIndex columns if necessary
+            if isinstance(data.columns, pd.MultiIndex):
+                close_df = data.xs('Close', axis=1, level=0)
+            else:
+                close_df = data['Close'] if 'Close' in data.columns else data
+
+            # Extract Series
+            vix_series = close_df['^VIX'].dropna()
+            tnx_series = close_df['^TNX'].dropna()
+            dxy_series = close_df['DX-Y.NYB'].dropna()
+            spy_series = close_df['SPY'].dropna()
+
+            # v11.2 Phase 2: Extract VIX3M and VVIX series
+            vix3m_series = close_df['^VIX3M'].dropna() if '^VIX3M' in close_df.columns else None
+            vvix_series = close_df['^VVIX'].dropna() if '^VVIX' in close_df.columns else None
+
+            # Get Current Values (Last available)
+            vix_curr = float(vix_series.iloc[-1])
+            tnx_curr = float(tnx_series.iloc[-1])
+            dxy_curr = float(dxy_series.iloc[-1])
+            spy_curr = float(spy_series.iloc[-1])
+
+            # v11.2 Phase 2: Get VIX3M and VVIX current values
+            vix3m_curr = float(vix3m_series.iloc[-1]) if vix3m_series is not None and len(vix3m_series) > 0 else vix_curr * 1.1
+            vvix_curr = float(vvix_series.iloc[-1]) if vvix_series is not None and len(vvix_series) > 0 else 90.0
+
+            # 2. Calculate Z-Scores (6-month rolling window = 126 trading days)
+            window = 126
+
+            def calculate_z_score(series, current_val):
+                if len(series) < window: return 0.0
+                rolling_mean = series.rolling(window=window).mean().iloc[-1]
+                rolling_std = series.rolling(window=window).std().iloc[-1]
+                if rolling_std == 0: return 0.0
+                return (current_val - rolling_mean) / rolling_std
+
+            vix_z = calculate_z_score(vix_series, vix_curr)
+            tnx_z = calculate_z_score(tnx_series, tnx_curr)
+            dxy_z = calculate_z_score(dxy_series, dxy_curr)
+
+            # 3. Calculate Dynamic Penalties
+            macro_adjustment = 0
+            regime_details = []
+
+            # VIX Penalty
+            if vix_z > MACRO_WEIGHTS['vix_z_threshold']:
+                penalty = (vix_z - MACRO_WEIGHTS['vix_z_threshold']) * MACRO_WEIGHTS['vix_penalty_per_sigma']
+                macro_adjustment -= penalty
+                regime_details.append(f"VIX Stress (+{vix_z:.1f}σ)")
+
+            # TNX Penalty
+            if tnx_z > MACRO_WEIGHTS['tnx_z_threshold']:
+                penalty = (tnx_z - MACRO_WEIGHTS['tnx_z_threshold']) * MACRO_WEIGHTS['tnx_penalty_per_sigma']
+                macro_adjustment -= penalty
+                regime_details.append(f"Rate Shock (+{tnx_z:.1f}σ)")
+
+            # DXY Penalty
+            if dxy_z > MACRO_WEIGHTS['dxy_z_threshold']:
+                penalty = (dxy_z - MACRO_WEIGHTS['dxy_z_threshold']) * MACRO_WEIGHTS['dxy_penalty_per_sigma']
+                macro_adjustment -= penalty
+                regime_details.append(f"USD Spike (+{dxy_z:.1f}σ)")
+
+            # =========================================================================
+            # v11.2 Phase 2: VIX TERM STRUCTURE ANALYSIS
+            # =========================================================================
+            # Key insight from @alshfaw: 1.26 is historically BEARISH for SPY
+            # Extreme contango (>1.20) = complacency trap, precedes corrections
+            # Mild contango (1.10-1.20) = healthy low vol environment
+            # Backwardation (<0.95) = fear/panic, imminent vol spike
+            term_structure_ratio = vix3m_curr / vix_curr if vix_curr > 0 else 1.0
+            ts_config = VIX_TERM_STRUCTURE_CONFIG
+
+            if term_structure_ratio > ts_config['extreme_contango_threshold']:
+                # EXTREME contango (>1.20) - COMPLACENCY WARNING
+                # 1.26 brought markets down in Aug, Sep, Oct, Nov, Dec 2024
+                term_structure = 'extreme_contango'
+                macro_adjustment -= ts_config['extreme_contango_penalty']
+                regime_details.append(f"⚠️ EXTREME Contango ({term_structure_ratio:.2f}) - Complacency Risk")
+            elif term_structure_ratio > ts_config['mild_contango_threshold']:
+                # Mild contango (1.10-1.20) - healthy low vol
+                term_structure = 'contango'
+                macro_adjustment += ts_config['mild_contango_bonus']
+                regime_details.append(f"Contango ({term_structure_ratio:.2f})")
+            elif term_structure_ratio < ts_config['backwardation_threshold']:
+                # Backwardation (<0.95) - bearish/fear signal
+                term_structure = 'backwardation'
+                macro_adjustment -= ts_config['backwardation_penalty']
+                regime_details.append(f"⚠️ Backwardation ({term_structure_ratio:.2f})")
+            else:
+                # Normal (0.95-1.10) - neutral
+                term_structure = 'neutral'
+
+            # =========================================================================
+            # v11.2 Phase 2: VVIX DIVERGENCE DETECTION
+            # =========================================================================
+            # VVIX rising + VIX falling = vol spike incoming (bearish divergence)
+            # VVIX falling + VIX rising = vol spike fading (bullish convergence)
+            vvix_divergence = 'none'
+            if vvix_series is not None and len(vvix_series) >= ts_config['vvix_divergence_lookback']:
+                lookback = ts_config['vvix_divergence_lookback']
+                vvix_change = (vvix_series.iloc[-1] - vvix_series.iloc[-lookback]) / vvix_series.iloc[-lookback]
+                vix_change = (vix_series.iloc[-1] - vix_series.iloc[-lookback]) / vix_series.iloc[-lookback]
+
+                # Bearish divergence: VVIX rising (>5%) while VIX falling (<-2%)
+                if vvix_change > 0.05 and vix_change < -0.02:
+                    vvix_divergence = 'bearish'
+                    macro_adjustment -= ts_config['vvix_divergence_penalty']
+                    regime_details.append(f"⚠️ VVIX Divergence (vol spike risk)")
+
+                # Bullish convergence: VVIX falling (<-5%) while VIX rising (>2%)
+                elif vvix_change < -0.05 and vix_change > 0.02:
+                    vvix_divergence = 'bullish'
+                    macro_adjustment += ts_config['vvix_convergence_bonus']
+                    regime_details.append(f"VVIX Convergence (vol fading)")
+
+                # Extreme VVIX warning (regardless of divergence)
+                if vvix_curr > ts_config['vvix_high_threshold']:
+                    regime_details.append(f"VVIX Elevated ({vvix_curr:.0f})")
+
+            # 4. Define Regime Label
+            if vix_z > 3.0: regime = "Crisis (Extreme Vol)"
+            elif term_structure == 'backwardation' and vix_z > 1.0: regime = "Fear (Backwardation)"
+            elif term_structure == 'extreme_contango': regime = "Complacency (Extreme Contango)"
+            elif tnx_z > 3.0: regime = "Rate Shock"
+            elif spy_curr > spy_series.iloc[-20]: regime = "Bull Trend"
+            elif vix_curr > 25 and vix_z < 1.0: regime = "High Vol (New Normal)"
+            else: regime = "Neutral"
+
+            # Store Data (note: 'vix' key = VIX30D per @alshfaw terminology)
+            self.macro_data = {
+                'vix': vix_curr, 'vix_z': vix_z,  # vix = VIX30D (^VIX = 30-day implied vol)
+                'tnx': tnx_curr, 'tnx_z': tnx_z,
+                'dxy': dxy_curr, 'dxy_z': dxy_z,
+                'spy_trend': spy_curr > spy_series.iloc[-20],
+                'adjustment': macro_adjustment,
+                'regime_details': regime_details,
+                # v11.2 Phase 2: VIX Term Structure data (VIX3M/VIX30D ratio)
+                'vix3m': vix3m_curr,
+                'term_structure_ratio': term_structure_ratio,
+                'term_structure': term_structure,
+                'vvix': vvix_curr,
+                'vvix_divergence': vvix_divergence
+            }
+            self.market_regime = regime
+
+            # v11.2 Phase 2: Enhanced output with term structure
+            # Note: VIX30D = ^VIX (standard VIX measures 30-day implied vol) per @alshfaw terminology
+            print(f"  [MACRO] VIX30D: {vix_curr:.2f} ({vix_z:+.1f}σ) | TNX: {tnx_curr:.2f}% ({tnx_z:+.1f}σ) | DXY: {dxy_curr:.2f} ({dxy_z:+.1f}σ)")
+            print(f"  [MACRO] VIX3M/VIX30D: {term_structure_ratio:.2f} | Structure: {term_structure.upper()} | VVIX: {vvix_curr:.0f}")
+            print(f"  [MACRO] Regime: {regime} | Adjustment: {macro_adjustment:+.1f}")
+            return regime
+
+        except Exception as e:
+            print(f"  [MACRO] Dynamic fetch failed: {e}. Using defaults.")
+            self.macro_data = default_macro
+            return "Neutral"
+
+        # """
+        # v10.7: Robust macro regime assessment with cooldown, individual fallback, and sanitization.
+        # """
+        # print("\n[TITAN] Assessing Macro Regime...")
+
+        # # v10.7: Default values used if fetch fails completely
+        # default_macro = {
+        #     'vix': 20.0, 'tnx': 4.0, 'dxy': 100.0,
+        #     'spy_trend': True, 'spy_return': 0.0,
+        #     'adjustment': 0, 'regime_details': ['Data unavailable']
+        # }
+
+        # try:
+        #     max_retries = 3
+        #     vix = tnx = dxy = spy_current = spy_start = None
+
+        #     # v10.7: Initial cooldown to let yfinance rate limiter reset
+        #     time.sleep(2.0)
+
+        #     for attempt in range(max_retries):
+        #         try:
+        #             # v10.7: Try batch download first (v10.8: with session)
+        #             tickers = ['^VIX', '^TNX', 'DX-Y.NYB', 'SPY']
+        #             data = yf.download(tickers, period="5d", progress=False, threads=False)
+
+        #             # v10.7: Handle both single and multi-column return formats
+        #             if 'Close' in data.columns or (isinstance(data.columns, pd.MultiIndex) and 'Close' in data.columns.get_level_values(0)):
+        #                 close_data = data['Close'] if 'Close' in data.columns else data.xs('Close', axis=1, level=0)
+        #             else:
+        #                 close_data = data
+
+        #             # Extract values with NaN checking
+        #             vix = close_data['^VIX'].iloc[-1] if '^VIX' in close_data.columns else None
+        #             tnx = close_data['^TNX'].iloc[-1] if '^TNX' in close_data.columns else None
+        #             dxy = close_data['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in close_data.columns else None
+        #             spy_current = close_data['SPY'].iloc[-1] if 'SPY' in close_data.columns else None
+        #             spy_start = close_data['SPY'].iloc[0] if 'SPY' in close_data.columns else None
+
+        #             # v10.7: Sanitize - convert to float and check for NaN
+        #             try:
+        #                 vix = float(vix) if vix is not None and not pd.isna(vix) else None
+        #                 tnx = float(tnx) if tnx is not None and not pd.isna(tnx) else None
+        #                 dxy = float(dxy) if dxy is not None and not pd.isna(dxy) else None
+        #                 spy_current = float(spy_current) if spy_current is not None and not pd.isna(spy_current) else None
+        #                 spy_start = float(spy_start) if spy_start is not None and not pd.isna(spy_start) else None
+        #             except (TypeError, ValueError):
+        #                 pass
+
+        #             # Check for NaN values and retry if needed
+        #             missing = []
+        #             if vix is None: missing.append('VIX')
+        #             if tnx is None: missing.append('TNX')
+        #             if dxy is None: missing.append('DXY')
+        #             if spy_current is None or spy_start is None: missing.append('SPY')
+
+        #             if missing:
+        #                 if attempt < max_retries - 1:
+        #                     print(f"  [MACRO] Missing {', '.join(missing)}, retrying ({attempt + 1}/{max_retries})...")
+        #                     time.sleep(2 ** (attempt + 1))  # Exponential backoff: 2, 4, 8 seconds
+        #                     continue
+        #                 else:
+        #                     # v10.7: Try individual fetches as last resort
+        #                     print(f"  [MACRO] Batch failed, trying individual fetches...")
+        #                     time.sleep(2.0)
+
+        #                     if vix is None:
+        #                         try:
+        #                             vix_data = yf.download('^VIX', period='5d', progress=False)
+        #                             vix = float(vix_data['Close'].iloc[-1]) if not vix_data.empty else default_macro['vix']
+        #                         except: vix = default_macro['vix']
+        #                         time.sleep(1.0)
+
+        #                     if tnx is None:
+        #                         try:
+        #                             tnx_data = yf.download('^TNX', period='5d', progress=False)
+        #                             tnx = float(tnx_data['Close'].iloc[-1]) if not tnx_data.empty else default_macro['tnx']
+        #                         except: tnx = default_macro['tnx']
+        #                         time.sleep(1.0)
+
+        #                     if dxy is None:
+        #                         try:
+        #                             dxy_data = yf.download('DX-Y.NYB', period='5d', progress=False)
+        #                             dxy = float(dxy_data['Close'].iloc[-1]) if not dxy_data.empty else default_macro['dxy']
+        #                         except: dxy = default_macro['dxy']
+        #                         time.sleep(1.0)
+
+        #                     if spy_current is None or spy_start is None:
+        #                         try:
+        #                             spy_data = yf.download('SPY', period='5d', progress=False)
+        #                             if not spy_data.empty:
+        #                                 spy_current = float(spy_data['Close'].iloc[-1])
+        #                                 spy_start = float(spy_data['Close'].iloc[0])
+        #                         except:
+        #                             spy_current = 500.0
+        #                             spy_start = 500.0
+
+        #             break  # Exit retry loop
+
+        #         except Exception as retry_error:
+        #             if attempt < max_retries - 1:
+        #                 print(f"  [MACRO] Fetch attempt {attempt + 1} failed: {str(retry_error)[:50]}")
+        #                 time.sleep(2 ** (attempt + 1))
+        #                 continue
+        #             else:
+        #                 raise retry_error
+
+        #     # v10.7: Final sanitization - ensure we have valid values
+        #     vix = vix if vix is not None and 5 < vix < 100 else default_macro['vix']
+        #     tnx = tnx if tnx is not None and 0 < tnx < 20 else default_macro['tnx']
+        #     dxy = dxy if dxy is not None and 80 < dxy < 130 else default_macro['dxy']
+        #     spy_current = spy_current if spy_current is not None else 500.0
+        #     spy_start = spy_start if spy_start is not None else 500.0
+
+        #     spy_trend = spy_current > spy_start
+        #     spy_return = (spy_current - spy_start) / spy_start if spy_start > 0 else 0
+
+        #     # Store raw macro values for score weighting
+        #     self.macro_data = {
+        #         'vix': vix,
+        #         'tnx': tnx,
+        #         'dxy': dxy,
+        #         'spy_trend': spy_trend,
+        #         'spy_return': spy_return
+        #     }
+
+        #     # Calculate regime based on successfully fetched data
+        #     regime = "Neutral"
+        #     regime_details = []
+
+        #     if vix > 30:
+        #         regime = "Bear Volatility"
+        #         regime_details.append(f"High fear (VIX {vix:.1f})")
+        #     elif vix > 20 and not spy_trend:
+        #         regime = "Correction"
+        #         regime_details.append(f"Elevated volatility + weakness")
+        #     elif tnx > 4.5 and dxy > 105:
+        #         regime = "Rates Pressure"
+        #         regime_details.append(f"Yields pressuring equities (TNX {tnx:.2f}%)")
+        #     elif spy_trend and vix < 20:
+        #         regime = "Bull Trend"
+        #         regime_details.append(f"Risk-on environment")
+        #     else:
+        #         regime_details.append("Mixed signals")
+
+        #     # Calculate macro adjustment score (used to weight individual picks)
+        #     macro_adjustment = 0
+        #     if vix > MACRO_WEIGHTS['vix_penalty_threshold']:
+        #         macro_adjustment -= (vix - MACRO_WEIGHTS['vix_penalty_threshold']) * MACRO_WEIGHTS['vix_penalty_per_point']
+        #     if tnx > MACRO_WEIGHTS['tnx_penalty_threshold']:
+        #         macro_adjustment -= (tnx - MACRO_WEIGHTS['tnx_penalty_threshold']) * MACRO_WEIGHTS['tnx_penalty_per_point']
+        #     if dxy > MACRO_WEIGHTS['dxy_strength_threshold']:
+        #         macro_adjustment -= (dxy - MACRO_WEIGHTS['dxy_strength_threshold']) * MACRO_WEIGHTS['dxy_penalty_per_point']
+
+        #     self.macro_data['adjustment'] = macro_adjustment
+        #     self.macro_data['regime_details'] = regime_details
+
+        #     print(f"  [MACRO] VIX: {vix:.2f} | TNX: {tnx:.2f}% | DXY: {dxy:.2f} | Regime: {regime}")
+        #     print(f"  [MACRO] Score Adjustment: {macro_adjustment:+.1f} points")
+        #     self.market_regime = regime
+        #     return regime
+
+        # except Exception as e:
+        #     print(f"  [MACRO] Data fetch failed ({str(e)[:50]}). Using defaults.")
+        #     self.macro_data = default_macro.copy()
+        #     self.market_regime = "Neutral"
+        #     return "Neutral"
+
+    def optimize_large_dataset(self, big_filepath, date_stamp=None):
+        chunk_size = 200000
+        chunks = []
+        strike_chunks = []  # Preserve strike-level data for GEX analysis
+        iv_factor = None
+        try:
+            for chunk in pd.read_csv(big_filepath, chunksize=chunk_size, low_memory=False):
+                chunk.columns = chunk.columns.str.strip().str.lower().str.replace(' ', '_')
+                if iv_factor is None and 'implied_volatility' in chunk.columns:
+                    sample = chunk['implied_volatility'].dropna().head(100)
+                    iv_factor = 100.0 if not sample.empty and sample.mean() < 5.0 else 1.0
+
+                mask = pd.Series(False, index=chunk.index)
+                if 'gamma' in chunk.columns: mask |= (chunk['gamma'].abs() > 0.001)
+                if 'premium' in chunk.columns: mask |= (chunk['premium'] > 170000)
+                chunk = chunk[mask].copy()
+                if chunk.empty: continue
+
+                if 'underlying_symbol' in chunk.columns:
+                     chunk['ticker'] = chunk['underlying_symbol'].apply(self.normalize_ticker)
+
+                chunk['weight'] = 0.0
+                if 'side' in chunk.columns:
+                    chunk.loc[chunk['side'].str.upper().isin(['ASK', 'A', 'BUY']), 'weight'] = 1.0
+                    chunk.loc[chunk['side'].str.upper().isin(['BID', 'B', 'SELL']), 'weight'] = -0.5
+
+                mult = chunk['size'] if 'size' in chunk.columns else 100
+                if 'gamma' in chunk.columns: chunk['net_gamma'] = chunk['gamma'] * mult * chunk['weight']
+                else: chunk['net_gamma'] = 0
+
+                vol = chunk['volume'].fillna(0)
+                oi = chunk['open_interest'].fillna(0)
+                chunk['is_authentic'] = vol > oi
+                chunk['authentic_gamma'] = np.where(chunk['is_authentic'], chunk['net_gamma'], 0)
+
+                if 'delta' in chunk.columns: chunk['net_delta'] = chunk['delta'] * mult * chunk['weight']
+                else: chunk['net_delta'] = 0
+
+                if 'implied_volatility' in chunk.columns: chunk['adj_iv'] = chunk['implied_volatility'] * iv_factor
+                else: chunk['adj_iv'] = 0
+
+                cols = ['ticker', 'net_gamma', 'authentic_gamma', 'net_delta', 'open_interest', 'adj_iv', 'equity_type']
+                if 'sector' in chunk.columns: cols.append('sector')
+                for c in cols:
+                    if c not in chunk.columns: chunk[c] = 0 if c != 'equity_type' else 'Unknown'
+                chunks.append(chunk[cols])
+
+                # PRESERVE STRIKE-LEVEL DATA for GEX wall detection
+                if 'strike' in chunk.columns and 'ticker' in chunk.columns:
+                    strike_data = chunk[['ticker', 'strike', 'net_gamma']].copy()
+                    strike_data = strike_data[strike_data['net_gamma'].abs() > 100]  # Filter significant gamma
+                    if not strike_data.empty:
+                        strike_chunks.append(strike_data)
+
+            full_optimized = pd.concat(chunks, ignore_index=True)
+            agg_rules = {'net_gamma': 'sum', 'authentic_gamma': 'sum', 'net_delta': 'sum', 'open_interest': 'sum', 'adj_iv': 'mean', 'equity_type': 'first'}
+            if 'sector' in full_optimized.columns: agg_rules['sector'] = 'first'
+            final_df = full_optimized.groupby('ticker').agg(agg_rules).reset_index()
+
+            # Store strike-level gamma data for GEX analysis
+            if strike_chunks and date_stamp is None:  # Only for today's data
+                strike_df = pd.concat(strike_chunks, ignore_index=True)
+                # Aggregate by ticker+strike
+                strike_agg = strike_df.groupby(['ticker', 'strike'])['net_gamma'].sum().reset_index()
+                # Store as dict: ticker -> {strike: gamma}
+                for ticker in strike_agg['ticker'].unique():
+                    ticker_strikes = strike_agg[strike_agg['ticker'] == ticker]
+                    self.strike_gamma_data[ticker] = dict(zip(ticker_strikes['strike'], ticker_strikes['net_gamma']))
+                print(f"  [GEX] Preserved strike-level gamma for {len(self.strike_gamma_data)} tickers")
+
+            if date_stamp: final_df['date'] = date_stamp
+            elif not date_stamp: final_df.to_csv(self.optimized_bot_file, index=False)
+            return final_df
+        except Exception as e:
+            print(f"  [!] Dataset optimization error: {e}")
+            return pd.DataFrame()
+
+    def extract_strike_gamma(self, big_filepath):
+        """
+        Lightweight extraction of strike-level gamma data for GEX wall analysis.
+        Called separately when cached aggregated data is used.
+        """
+        print(f"  [GEX] Extracting strike-level gamma from raw file...")
+        chunk_size = 200000
+        strike_chunks = []
+
+        try:
+            for chunk in pd.read_csv(big_filepath, chunksize=chunk_size, low_memory=False):
+                chunk.columns = chunk.columns.str.strip().str.lower().str.replace(' ', '_')
+
+                # Quick filter for significant options
+                if 'gamma' not in chunk.columns or 'strike' not in chunk.columns:
+                    continue
+
+                mask = chunk['gamma'].abs() > 0.001
+                chunk = chunk[mask].copy()
+                if chunk.empty:
+                    continue
+
+                if 'underlying_symbol' in chunk.columns:
+                    chunk['ticker'] = chunk['underlying_symbol'].apply(self.normalize_ticker)
+
+                # Calculate net gamma
+                chunk['weight'] = 0.0
+                if 'side' in chunk.columns:
+                    chunk.loc[chunk['side'].str.upper().isin(['ASK', 'A', 'BUY']), 'weight'] = 1.0
+                    chunk.loc[chunk['side'].str.upper().isin(['BID', 'B', 'SELL']), 'weight'] = -0.5
+
+                mult = chunk['size'] if 'size' in chunk.columns else 100
+                chunk['net_gamma'] = chunk['gamma'] * mult * chunk['weight']
+
+                # Keep only significant gamma entries
+                strike_data = chunk[['ticker', 'strike', 'net_gamma']].copy()
+                strike_data = strike_data[strike_data['net_gamma'].abs() > 50]  # Lower threshold
+                if not strike_data.empty:
+                    strike_chunks.append(strike_data)
+
+            if strike_chunks:
+                strike_df = pd.concat(strike_chunks, ignore_index=True)
+                # Aggregate by ticker+strike
+                strike_agg = strike_df.groupby(['ticker', 'strike'])['net_gamma'].sum().reset_index()
+                # Store as dict: ticker -> {strike: gamma}
+                for ticker in strike_agg['ticker'].unique():
+                    ticker_strikes = strike_agg[strike_agg['ticker'] == ticker]
+                    self.strike_gamma_data[ticker] = dict(zip(ticker_strikes['strike'], ticker_strikes['net_gamma']))
+                print(f"  [GEX] Extracted strike-level gamma for {len(self.strike_gamma_data)} tickers")
+            else:
+                print(f"  [GEX] No strike data found in file (check if 'strike' column exists)")
+
+        except Exception as e:
+            print(f"  [!] Strike extraction error: {e}")
+
+    def generate_temporal_features(self, current_flow_df):
+        print("\n[2.5/4] Calculating Temporal Features (Velocity)...")
+        hist_df = self.history_mgr.db.get_history_df()
+        if hist_df.empty: return current_flow_df
+
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        hist_df = hist_df[hist_df['date'] != today_str]
+
+        today_df = current_flow_df.copy()
+        today_df['date'] = today_str
+
+        cols = ['ticker', 'date', 'net_gamma', 'authentic_gamma', 'net_delta', 'open_interest']
+        valid_cols = [c for c in cols if c in hist_df.columns and c in today_df.columns]
+        if len(valid_cols) < 3: return current_flow_df
+
+        combined = pd.concat([hist_df[valid_cols], today_df[valid_cols]])
+        try:
+            combined['date'] = pd.to_datetime(combined['date'])
+            combined = combined.sort_values('date')
+            gamma_pivot = combined.pivot_table(index='ticker', columns='date', values='net_gamma', aggfunc='sum').fillna(0)
+            gamma_velocity = gamma_pivot.diff(axis=1).mean(axis=1).rename('gamma_velocity')
+            oi_pivot = combined.pivot_table(index='ticker', columns='date', values='open_interest', aggfunc='sum').fillna(0)
+            oi_accel = oi_pivot.diff(axis=1).mean(axis=1).rename('oi_accel')
+            features_df = pd.concat([gamma_velocity, oi_accel], axis=1).reset_index()
+            updated_df = pd.merge(current_flow_df, features_df, on='ticker', how='left').fillna(0)
+            print(f"  [+] Generated Velocity Features for {len(updated_df)} tickers.")
+            return updated_df
+        except: return current_flow_df
+
+    # --- SUPERVISED LEARNING PIPELINE ---
+    def prepare_supervised_data(self, window_size=3, lookahead=1):
+        print(f"\n[TRANSFORMER] Preparing Supervised Data (Window={window_size}, Lookahead={lookahead}d)...")
+        hist_df = self.history_mgr.db.get_history_df()
+        if hist_df.empty: return None, None, None, None
+
+        needed_cols = ['ticker', 'date', 'net_gamma', 'net_delta', 'open_interest', 'adj_iv']
+        valid_cols = [c for c in needed_cols if c in hist_df.columns]
+        if len(valid_cols) < 4: return None, None, None, None
+
+        price_df = self.history_mgr.db.get_price_df()
+        if price_df.empty: return self.prepare_inference_data(window_size)
+
+        # v10.6.1: Robust date parsing - yfinance sometimes leaks header "Ticker" into data
+        price_df['date'] = pd.to_datetime(price_df['date'], errors='coerce')
+        price_df = price_df.dropna(subset=['date'])  # Remove corrupt rows with "Ticker" in date
+        if price_df.empty: return self.prepare_inference_data(window_size)
+
+        df = hist_df[valid_cols].copy()
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date'])  # Safety: remove any corrupt rows here too
+        df = df.sort_values(['ticker', 'date'])
+
+        feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
+        df[feature_cols] = self.nn_scaler.fit_transform(df[feature_cols])
+
+        sequences = []
+        targets = []
+        tickers_list = []
+
+        grouped = df.groupby('ticker')
+        price_lookup = price_df.set_index(['ticker', 'date'])['close'].to_dict()
+        count_labeled = 0
+
+        print(f"  [TRANSFORMER] Building sequences from {len(df)} rows...")
+
+        for ticker, group in grouped:
+            if len(group) >= window_size:
+                for i in range(len(group) - window_size):
+                    seq_slice = group.iloc[i : i+window_size]
+                    seq_dates = seq_slice['date'].values
+                    last_date = pd.to_datetime(seq_dates[-1])
+                    target_date = last_date + timedelta(days=lookahead)
+                    start_price = price_lookup.get((ticker, last_date))
+                    end_price = None
+                    for d in range(3):
+                        check_date = target_date + timedelta(days=d)
+                        if (ticker, check_date) in price_lookup:
+                            end_price = price_lookup[(ticker, check_date)]
+                            break
+                    if start_price and end_price and start_price > 0:
+                        ret = (end_price - start_price) / start_price
+                        label = 1 if ret > 0.01 else 0
+                        sequences.append(seq_slice[feature_cols].values)
+                        targets.append(label)
+                        count_labeled += 1
+
+                sequences.append(group[feature_cols].values[-window_size:])
+                targets.append(-1)
+                tickers_list.append(ticker)
+
+        if not sequences: return None, None, None, None
+        X = np.array(sequences)
+        y = np.array(targets)
+        print(f"  [TRANSFORMER] Created {len(X)} sequences. Labeled Training Data: {count_labeled}.")
+        return X, y, tickers_list, feature_cols
+
+    def prepare_inference_data(self, window_size):
+        hist_df = self.history_mgr.db.get_history_df()
+        if hist_df.empty: return None, None, None, None
+
+        needed_cols = ['ticker', 'date', 'net_gamma', 'net_delta', 'open_interest', 'adj_iv']
+        valid_cols = [c for c in needed_cols if c in hist_df.columns]
+        if len(valid_cols) < 4: return None, None, None, None
+        df = hist_df[valid_cols].copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values(['ticker', 'date'])
+        feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
+        df[feature_cols] = self.nn_scaler.fit_transform(df[feature_cols])
+        sequences, targets, tickers_list = [], [], []
+        for ticker, group in df.groupby('ticker'):
+            if len(group) >= window_size:
+                sequences.append(group[feature_cols].values[-window_size:])
+                targets.append(-1)
+                tickers_list.append(ticker)
+        if not sequences: return None, None, None, None
+        return np.array(sequences), np.array(targets), tickers_list, feature_cols
+
+    # --- HIVE MIND (ENSEMBLE) ---
+    def train_run_transformer(self):
+        X_data, y_data, inference_tickers, feature_cols = self.prepare_supervised_data(window_size=3, lookahead=1)
+        if X_data is None or np.sum(y_data != -1) == 0:
+             X_data, y_data, inference_tickers, feature_cols = self.prepare_supervised_data(window_size=2, lookahead=1)
+
+        if X_data is None: return
+
+        train_mask = y_data != -1
+        X_train = X_data[train_mask]
+        y_train = y_data[train_mask]
+        X_infer = X_data[~train_mask]
+
+        input_size = len(feature_cols)
+        num_models = 5
+        ensemble_preds = []
+
+        if len(X_train) > 10:
+            print(f"  [HIVE MIND] Training {num_models} Independent Transformers (Bagging)...")
+            X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+            y_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+            X_infer_tensor = torch.tensor(X_infer, dtype=torch.float32).to(device) if len(X_infer) > 0 else None
+
+            for i in range(num_models):
+                print(f"    ... Training Brain #{i+1} ...")
+                torch.manual_seed(42 + i)
+                model = SwingTransformer(input_size=input_size, d_model=128, num_layers=3).to(device)
+                model.train()
+                optimizer = optim.Adam(model.parameters(), lr=0.0005)
+                criterion = nn.BCELoss()
+                epochs = PERFORMANCE_CONFIG.get('transformer_epochs', 30)
+                for epoch in range(epochs):
+                    optimizer.zero_grad()
+                    outputs = model(X_tensor)
+                    loss = criterion(outputs, y_tensor)
+                    loss.backward()
+                    optimizer.step()
+                model.eval()
+                if X_infer_tensor is not None:
+                    with torch.no_grad():
+                        preds = model(X_infer_tensor).cpu().numpy().flatten()
+                        ensemble_preds.append(preds)
+        else: return
+
+        if ensemble_preds:
+            avg_preds = np.mean(ensemble_preds, axis=0)
+            nn_df = pd.DataFrame({'ticker': inference_tickers, 'nn_score': avg_preds})
+            min_s, max_s = nn_df['nn_score'].min(), nn_df['nn_score'].max()
+            if max_s - min_s > 0.0001:
+                nn_df['nn_score'] = (nn_df['nn_score'] - min_s) / (max_s - min_s) * 100
+            else: nn_df['nn_score'] = nn_df['nn_score'] * 100
+            if not self.full_df.empty:
+                self.full_df = pd.merge(self.full_df, nn_df, on='ticker', how='left').fillna(0)
+
+        # --- GPU MEMORY CLEANUP (v11.5.1) ---
+        # Free GPU memory after Hive Mind training to prevent OOM during ensemble training
+        try:
+            del X_tensor, y_tensor
+            if X_infer_tensor is not None:
+                del X_infer_tensor
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass  # Variables may not exist if training was skipped
+
+    # --- RESTORED SECTOR FETCH ---
+    def fetch_sector_history(self):
+        print("  [CONTEXT] Fetching Sector ETF History...")
+        try:
+            etfs = list(SECTOR_MAP.values()) + ['SPY']
+            # Fetch 1-month data for relative performance
+            data = yf.download(etfs, period="1mo", progress=False)['Close']
+            if isinstance(data, pd.Series): data = data.to_frame()
+            for etf in etfs:
+                if etf in data.columns:
+                    series = data[etf].dropna()
+                    if len(series) > 1:
+                        self.sector_data[etf] = (series.iloc[-1] - series.iloc[0]) / series.iloc[0]
+                    else: self.sector_data[etf] = 0.0
+
+            # v11.5.4: Fetch 6-month data for sector relative performance filter
+            # Used to compare stock performance vs sector performance
+            # True phoenix = stock outperforming sector (individual alpha)
+            # Sector beta = stock just matching sector (riding the wave)
+            data_6m = yf.download(etfs, period="6mo", progress=False)['Close']
+            if isinstance(data_6m, pd.Series): data_6m = data_6m.to_frame()
+            self.sector_6m_returns = {}
+            for etf in etfs:
+                if etf in data_6m.columns:
+                    series = data_6m[etf].dropna()
+                    if len(series) > 20:
+                        start_price = series.iloc[0]
+                        current_price = series.iloc[-1]
+                        return_6m = (current_price - start_price) / start_price if start_price > 0 else 0.0
+                        self.sector_6m_returns[etf] = float(return_6m)
+        except Exception as e:
+            pass
+
+    # --- RESTORED BREADTH CALC ---
+    def calculate_market_breadth(self, cached_data):
+        print("  [MACRO] Calculating Market Breadth...")
+        if not cached_data: return 50.0
+        count = sum(1 for t, m in cached_data.items() if m.get('dist_sma50', 0) > 0)
+        return (count / len(cached_data) * 100) if cached_data else 50.0
+
+    # --- RESTORED FUNDAMENTAL ANALYSIS (CRITICAL FIX) ---
+    def analyze_fundamentals_and_sector(self, ticker, equity_type):
+        res = {'quality_score': 0, 'sector_status': 'Neutral', 'quality_label': 'Unknown', 'ambush_bonus': 0}
+
+        # ETF Filter
+        if str(equity_type).upper() == 'ETF':
+            res['quality_label'] = 'ETF'
+        else:
+            # Quality Check
+            mkt_cap = self.cap_map.get(ticker, 0)
+            if mkt_cap > 10_000_000_000:
+                res['quality_score'] = 3
+                res['quality_label'] = 'Quality Leader'
+            elif mkt_cap > 2_000_000_000:
+                res['quality_score'] = 0
+                res['quality_label'] = 'Standard'
+            else:
+                res['quality_score'] = 1
+                res['quality_label'] = 'Speculative'
+
+        # Sector Check
+        sector_name = self.sector_map_local.get(ticker, 'Unknown')
+        etf = SECTOR_MAP.get(sector_name, None)
+        if etf and etf in self.sector_data and 'SPY' in self.sector_data:
+            sector_perf = self.sector_data[etf]
+            spy_perf = self.sector_data['SPY']
+
+            if sector_perf > spy_perf:
+                res['sector_status'] = 'Leading Sector'
+                res['quality_score'] += 4
+                res['ambush_bonus'] = -10
+            else:
+                res['sector_status'] = 'Lagging Sector'
+                res['quality_score'] -= 2
+                res['ambush_bonus'] = 5
+        return res
+
+    # --- RESTORED EARNINGS CHECK ---
+    def check_earnings_proximity(self, ticker):
+        if ticker in self.earnings_map:
+            next_date_str = self.earnings_map[ticker]
+            try:
+                earnings_ts = pd.to_datetime(next_date_str)
+                days_away = (earnings_ts - pd.Timestamp.now()).days
+                if 0 <= days_away <= 5: return True
+                return False
+            except: pass
+        return False
+
+    # --- PHASE 9: PATTERN DETECTION METHODS ---
+
+    def detect_bull_flag(self, ticker, history_df, debug=False):
+        """
+        Detect bull flag pattern: strong upward move (pole) followed by consolidation (flag).
+
+        Bull flag criteria:
+        1. Strong upward move (pole): gain in first N days
+        2. Consolidation (flag): tight range in recent days
+        3. Volume declining during flag phase (optional)
+
+        Returns dict with pattern detection results and explanation.
+        """
+        result = {
+            'is_flag': False,
+            'flag_score': 0.0,
+            'pole_gain': 0.0,
+            'flag_range': 0.0,
+            'explanation': ''
+        }
+
+        lookback = BULL_FLAG_CONFIG['pole_days'] + BULL_FLAG_CONFIG['flag_days'] + 5
+
+        if history_df is None or len(history_df) < lookback:
+            result['explanation'] = 'Insufficient price history for pattern detection'
+            return result
+
+        try:
+            close = history_df['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            volume = history_df['Volume'] if 'Volume' in history_df.columns else None
+            if isinstance(volume, pd.DataFrame) and volume is not None:
+                volume = volume.iloc[:, 0]
+
+            # Use last N days of data
+            close = close.iloc[-lookback:]
+            if volume is not None:
+                volume = volume.iloc[-lookback:]
+
+            pole_days = BULL_FLAG_CONFIG['pole_days']
+            flag_days = BULL_FLAG_CONFIG['flag_days']
+
+            # Pole phase: first segment of the lookback
+            pole_start = close.iloc[0]
+            pole_end = close.iloc[pole_days]
+            pole_gain = (pole_end - pole_start) / pole_start if pole_start > 0 else 0
+
+            # Flag phase: last segment (consolidation)
+            flag_segment = close.iloc[-flag_days:]
+            flag_high = flag_segment.max()
+            flag_low = flag_segment.min()
+            flag_range = (flag_high - flag_low) / flag_segment.mean() if flag_segment.mean() > 0 else 1
+
+            # Volume analysis (optional - don't require it)
+            volume_declining = True  # Default to True if no volume data
+            volume_ratio = 1.0
+            if volume is not None and len(volume) >= lookback:
+                pole_volume = volume.iloc[:pole_days].mean()
+                flag_volume = volume.iloc[-flag_days:].mean()
+                if pole_volume > 0:
+                    volume_ratio = flag_volume / pole_volume
+                    volume_declining = volume_ratio < BULL_FLAG_CONFIG['volume_decline_ratio']
+
+            # Check if pattern matches (volume declining is BONUS, not required)
+            pole_ok = pole_gain >= BULL_FLAG_CONFIG['pole_min_gain']
+            flag_ok = flag_range <= BULL_FLAG_CONFIG['flag_max_range']
+            is_flag = pole_ok and flag_ok  # Don't require volume declining
+
+            # v11.5 FIX: Check if breakout already occurred (stale flag detection)
+            # If current price is >5% above flag high, the breakout already happened
+            current_price = close.iloc[-1]
+            breakout_threshold = 1.05  # 5% above flag range = breakout occurred
+            breakout_already_happened = current_price > flag_high * breakout_threshold
+
+            if breakout_already_happened and is_flag:
+                is_flag = False  # Invalidate stale flags
+                breakout_pct = ((current_price / flag_high) - 1) * 100
+                result['is_flag'] = False
+                result['pole_gain'] = pole_gain
+                result['flag_range'] = flag_range
+                result['flag_score'] = 0.1  # Minimal score for tracking
+                result['explanation'] = f"Flag breakout already occurred (+{breakout_pct:.1f}% above flag)"
+                return result
+
+            result['pole_gain'] = pole_gain
+            result['flag_range'] = flag_range
+            result['is_flag'] = is_flag
+
+            if is_flag:
+                # Score calculation: higher pole gain and tighter flag = better
+                base_score = min(1.0, (pole_gain / 0.15) * 0.4 + (1 - flag_range / BULL_FLAG_CONFIG['flag_max_range']) * 0.4)
+                if volume_declining:
+                    base_score += 0.2  # Bonus for volume confirmation
+                result['flag_score'] = base_score
+                result['explanation'] = f"BULL FLAG: {pole_gain*100:.1f}% pole, {flag_range*100:.1f}% range"
+                if volume_declining:
+                    result['explanation'] += " +vol"
+            elif pole_ok and not flag_ok:
+                # Pole qualified but consolidation too wide
+                result['flag_score'] = 0.25
+                result['explanation'] = f"Flag forming: {pole_gain*100:.1f}% pole, range {flag_range*100:.1f}% (need <{BULL_FLAG_CONFIG['flag_max_range']*100:.0f}%)"
+            elif pole_gain > 0.04:
+                # Weak pole but showing momentum
+                result['flag_score'] = 0.15
+                result['explanation'] = f"Weak momentum: {pole_gain*100:.1f}% move"
+            else:
+                result['explanation'] = 'No bull flag pattern'
+
+        except Exception as e:
+            result['explanation'] = f'Pattern detection error: {str(e)[:50]}'
+
+        return result
+
+    def find_gex_walls(self, ticker, current_price, bot_df=None):
+        """
+        Find gamma exposure (GEX) walls that could act as support/resistance.
+
+        GEX walls are strike prices with concentrated gamma that create
+        "magnetic" levels where market makers' hedging activity provides support or resistance.
+
+        Returns dict with wall levels and explanation.
+        """
+        result = {
+            'support_wall': None,
+            'resistance_wall': None,
+            'wall_protection_score': 0.0,
+            'explanation': ''
+        }
+
+        if current_price is None or current_price <= 0:
+            result['explanation'] = 'Invalid price data'
+            return result
+
+        # PRIORITY 1: Use cached strike-level gamma data
+        if ticker in self.strike_gamma_data and self.strike_gamma_data[ticker]:
+            try:
+                strike_gamma = self.strike_gamma_data[ticker]  # dict: {strike: gamma}
+
+                # Support walls: strikes below price with large positive gamma
+                support_candidates = {k: v for k, v in strike_gamma.items()
+                                     if k < current_price and v > GEX_WALL_CONFIG['min_support_gamma']}
+
+                if support_candidates:
+                    best_strike = max(support_candidates.keys(), key=lambda x: support_candidates[x])
+                    result['support_wall'] = float(best_strike)
+                    support_gamma = support_candidates[best_strike]
+                    proximity = (current_price - best_strike) / current_price
+
+                    if proximity <= GEX_WALL_CONFIG['proximity_pct']:
+                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
+                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
+
+                # Resistance walls: strikes above price with large negative gamma
+                resist_candidates = {k: v for k, v in strike_gamma.items()
+                                    if k > current_price and v < GEX_WALL_CONFIG['min_resist_gamma']}
+
+                if resist_candidates:
+                    best_resist = min(resist_candidates.keys(), key=lambda x: resist_candidates[x])
+                    result['resistance_wall'] = float(best_resist)
+
+                # Build explanation
+                explanations = []
+                if result['support_wall']:
+                    support_dist = (current_price - result['support_wall']) / current_price * 100
+                    gamma_val = support_candidates.get(result['support_wall'], 0)
+                    explanations.append(f"GEX support ${result['support_wall']:.0f} ({support_dist:.1f}% below, {gamma_val/1000:.0f}K gamma)")
+                if result['resistance_wall']:
+                    resist_dist = (result['resistance_wall'] - current_price) / current_price * 100
+                    explanations.append(f"GEX resist ${result['resistance_wall']:.0f} ({resist_dist:.1f}% above)")
+
+                result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
+                return result
+
+            except Exception as e:
+                result['explanation'] = f'GEX cache error: {str(e)[:30]}'
+
+        # PRIORITY 2: Check if we have strike-level data in bot_df
+        if bot_df is not None and not bot_df.empty and 'strike' in bot_df.columns:
+            try:
+                ticker_data = bot_df[bot_df['ticker'] == ticker] if 'ticker' in bot_df.columns else bot_df
+
+                if ticker_data.empty or 'net_gamma' not in ticker_data.columns:
+                    result['explanation'] = 'No gamma data for strike analysis'
+                    return result
+
+                # Aggregate gamma by strike
+                strike_gamma = ticker_data.groupby('strike')['net_gamma'].sum()
+
+                # Support walls: strikes below price with large positive gamma
+                support_mask = (strike_gamma.index < current_price) & (strike_gamma > GEX_WALL_CONFIG['min_support_gamma'])
+                support_candidates = strike_gamma[support_mask]
+
+                if not support_candidates.empty:
+                    result['support_wall'] = float(support_candidates.idxmax())
+                    support_gamma = support_candidates.max()
+                    proximity = (current_price - result['support_wall']) / current_price
+
+                    if proximity <= GEX_WALL_CONFIG['proximity_pct']:
+                        # Score calibration: 75K+ gamma = 0.3+ score (counts as protected)
+                        result['wall_protection_score'] = min(1.0, support_gamma / 250_000)
+
+                # Resistance walls: strikes above price with large negative gamma
+                resist_mask = (strike_gamma.index > current_price) & (strike_gamma < GEX_WALL_CONFIG['min_resist_gamma'])
+                resist_candidates = strike_gamma[resist_mask]
+
+                if not resist_candidates.empty:
+                    result['resistance_wall'] = float(resist_candidates.idxmin())
+
+                # Build explanation
+                explanations = []
+                if result['support_wall']:
+                    support_dist = (current_price - result['support_wall']) / current_price * 100
+                    explanations.append(f"GEX support at ${result['support_wall']:.2f} ({support_dist:.1f}% below)")
+                if result['resistance_wall']:
+                    resist_dist = (result['resistance_wall'] - current_price) / current_price * 100
+                    explanations.append(f"GEX resistance at ${result['resistance_wall']:.2f} ({resist_dist:.1f}% above)")
+
+                result['explanation'] = " | ".join(explanations) if explanations else "No significant GEX walls"
+                return result
+
+            except Exception as e:
+                result['explanation'] = f'GEX analysis error: {str(e)[:50]}'
+
+        # PRIORITY 3: Fallback to dark pool support levels
+        if ticker in self.dp_support_levels:
+            dp_levels = self.dp_support_levels[ticker]
+            support_levels = [p for p in dp_levels if p < current_price]
+            if support_levels:
+                best_support = max(support_levels)
+                proximity = (current_price - best_support) / current_price
+                if proximity <= GEX_WALL_CONFIG['proximity_pct']:
+                    result['support_wall'] = best_support
+                    result['wall_protection_score'] = 0.5  # DP support is less reliable than GEX
+                    result['explanation'] = f"DP support at ${best_support:.2f} ({proximity*100:.1f}% below)"
+                else:
+                    result['explanation'] = f"DP support at ${best_support:.2f} (too far: {proximity*100:.1f}%)"
+            else:
+                result['explanation'] = 'No support levels detected'
+        else:
+            result['explanation'] = 'No strike-level or DP data available'
+
+        return result
+
+    def detect_downtrend_reversal(self, ticker, history_df):
+        """
+        Detect potential reversal setup: months-long downtrend with dark pool support at bottom.
+
+        Criteria:
+        1. Extended downtrend: price below 50 SMA for 35+ of last 60 days
+        2. Dark pool accumulation near current price levels
+        3. RSI showing potential bullish divergence
+
+        Returns dict with reversal detection results and explanation.
+        """
+        result = {
+            'is_reversal': False,
+            'reversal_score': 0.0,
+            'days_below_sma': 0,
+            'has_dp_support': False,
+            'explanation': ''
+        }
+
+        lookback = REVERSAL_CONFIG['lookback_days']
+
+        if history_df is None or len(history_df) < lookback:
+            result['explanation'] = 'Insufficient history for reversal analysis'
+            return result
+
+        try:
+            close = history_df['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            # Calculate SMA50
+            sma50 = close.rolling(50).mean()
+
+            # Count days below SMA50 in lookback period
+            recent_close = close.iloc[-lookback:]
+            recent_sma = sma50.iloc[-lookback:]
+            days_below = (recent_close < recent_sma).sum()
+            result['days_below_sma'] = int(days_below)
+
+            is_downtrend = days_below >= REVERSAL_CONFIG['min_days_below_sma']
+
+            # Check for dark pool support at current levels
+            current_price = float(close.iloc[-1])
+            has_dp_support = False
+            dp_level = None
+
+            if ticker in self.dp_support_levels:
+                dp_levels = self.dp_support_levels[ticker]
+                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < REVERSAL_CONFIG['dp_proximity_pct']]
+                if nearby_support:
+                    has_dp_support = True
+                    dp_level = max(nearby_support)
+
+            result['has_dp_support'] = has_dp_support
+
+            # Check for RSI bullish divergence (price making lower lows, RSI making higher lows)
+            has_divergence = False
+            if len(close) > 20:
+                # Simple divergence check
+                delta = close.diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / (loss + 1e-9)
+                rsi = 100 - (100 / (1 + rs))
+
+                # Compare first half vs second half of recent period
+                price_trend = close.iloc[-10:].mean() < close.iloc[-20:-10].mean()  # Price declining
+                rsi_trend = rsi.iloc[-10:].mean() > rsi.iloc[-20:-10].mean()  # RSI rising
+                has_divergence = price_trend and rsi_trend
+
+            # Determine if reversal setup is present
+            is_reversal = is_downtrend and (has_dp_support or has_divergence)
+            result['is_reversal'] = is_reversal
+
+            if is_reversal:
+                score_components = []
+                base_score = 0.5
+
+                if has_dp_support:
+                    base_score += 0.3
+                    score_components.append(f"DP support at ${dp_level:.2f}")
+                if has_divergence:
+                    base_score += 0.2
+                    score_components.append("RSI bullish divergence")
+
+                result['reversal_score'] = min(1.0, base_score)
+                result['explanation'] = f"REVERSAL SETUP: {days_below}/{lookback} days in downtrend, " + ", ".join(score_components)
+            elif is_downtrend:
+                result['reversal_score'] = 0.2
+                result['explanation'] = f"Downtrend ({days_below}/{lookback} days below SMA50) but no support confirmation"
+            else:
+                result['explanation'] = 'Not in extended downtrend'
+
+        except Exception as e:
+            result['explanation'] = f'Reversal detection error: {str(e)[:50]}'
+
+        return result
+
+    def calculate_flow_factor(self, ticker, volume_ratio=1.0):
+        """
+        v10.7: Calculate Flow Factor (0.0 to 1.0) for dynamic threshold adjustment.
+
+        High institutional flow earns "forgiveness points" that expand trading thresholds.
+        A stock with massive buying (like LULU with Elliott $1B stake) can exceed normal
+        RSI limits and still qualify for phoenix detection.
+
+        Components:
+        1. Volume Intensity (0-0.25): Recent volume vs 50-day average
+        2. Dark Pool Activity (0-0.35): Total DP accumulation (log-scaled for mega-prints)
+        3. Institutional Signature (0-0.20): Presence of signature block trades
+        4. Net Options Flow (0-0.20): Gamma/delta positioning from options
+
+        Returns:
+            flow_factor (float): 0.0 (no flow) to 1.0 (maximum institutional conviction)
+            flow_details (dict): Breakdown of components for debugging
+        """
+        import math
+
+        flow_factor = 0.0
+        flow_details = {
+            'volume_component': 0.0,
+            'dp_component': 0.0,
+            'signature_component': 0.0,
+            'options_component': 0.0,
+            'raw_dp_total': 0.0,
+            'has_signature': False
+        }
+
+        try:
+            # Component 1: Volume Intensity (0-0.25)
+            # Higher volume = more institutional interest
+            if volume_ratio >= 1.0:
+                if volume_ratio >= 4.0:
+                    flow_details['volume_component'] = 0.25  # Exceptional volume
+                elif volume_ratio >= 2.5:
+                    flow_details['volume_component'] = 0.20
+                elif volume_ratio >= 1.5:
+                    flow_details['volume_component'] = 0.15
+                else:
+                    flow_details['volume_component'] = 0.05 + (volume_ratio - 1.0) * 0.10
+
+            # Component 2: Dark Pool Activity (0-0.35)
+            # Log-scaled to handle mega-prints like Elliott's $1B LULU stake
+            ticker_data = None
+            if hasattr(self, 'full_df') and not self.full_df.empty:
+                ticker_rows = self.full_df[self.full_df['ticker'] == ticker]
+                if not ticker_rows.empty:
+                    ticker_data = ticker_rows.iloc[0]
+
+            if ticker_data is not None and 'dp_total' in ticker_data:
+                dp_total = float(ticker_data.get('dp_total', 0))
+                flow_details['raw_dp_total'] = dp_total
+
+                if dp_total > 0:
+                    # Log-scaled scoring (prevents single mega-print from dominating)
+                    # $1M = baseline, $10M = moderate, $100M = strong, $1B = exceptional
+                    if dp_total >= 1_000_000_000:  # $1B+ (Elliott/activist level)
+                        flow_details['dp_component'] = 0.35
+                    elif dp_total >= 500_000_000:  # $500M+
+                        flow_details['dp_component'] = 0.30
+                    elif dp_total >= 100_000_000:  # $100M+
+                        flow_details['dp_component'] = 0.25
+                    elif dp_total >= 50_000_000:   # $50M+
+                        flow_details['dp_component'] = 0.20
+                    elif dp_total >= 10_000_000:   # $10M+
+                        flow_details['dp_component'] = 0.12
+                    elif dp_total >= 1_000_000:    # $1M+
+                        flow_details['dp_component'] = 0.05
+
+            # Component 3: Institutional Signature Prints (0-0.20)
+            # Check for signature block trades (large single prints)
+            if hasattr(self, 'signature_prints') and ticker in self.signature_prints:
+                flow_details['has_signature'] = True
+                sig_count = len(self.signature_prints[ticker]) if isinstance(self.signature_prints[ticker], list) else 1
+                flow_details['signature_component'] = min(0.20, 0.10 + sig_count * 0.05)
+            elif ticker_data is not None:
+                # Fallback: Check for large single-day DP prints
+                dp_max = float(ticker_data.get('dp_max', ticker_data.get('dp_total', 0)))
+                if dp_max >= 50_000_000:  # Single $50M+ print
+                    flow_details['signature_component'] = 0.15
+                    flow_details['has_signature'] = True
+                elif dp_max >= 10_000_000:  # Single $10M+ print
+                    flow_details['signature_component'] = 0.08
+
+            # Component 4: Net Options Flow (0-0.20)
+            # Bullish gamma/delta positioning indicates institutional conviction
+            if ticker_data is not None:
+                net_gamma = float(ticker_data.get('net_gamma', 0))
+                net_delta = float(ticker_data.get('net_delta', 0))
+
+                # Positive gamma + positive delta = bullish institutional positioning
+                if net_gamma > 0 and net_delta > 0:
+                    # Scale by magnitude
+                    gamma_strength = min(1.0, abs(net_gamma) / 1000000)  # $1M gamma = max
+                    delta_strength = min(1.0, abs(net_delta) / 5000000)  # $5M delta = max
+                    flow_details['options_component'] = 0.20 * (gamma_strength + delta_strength) / 2
+                elif net_gamma > 0 or net_delta > 0:
+                    # Partially bullish
+                    flow_details['options_component'] = 0.08
+
+            # Calculate total flow factor (capped at 1.0)
+            flow_factor = min(1.0,
+                flow_details['volume_component'] +
+                flow_details['dp_component'] +
+                flow_details['signature_component'] +
+                flow_details['options_component']
+            )
+
+        except Exception as e:
+            # On error, return conservative flow factor
+            flow_factor = 0.0
+
+        return flow_factor, flow_details
+
+    # --- v11.0 SMART GATEKEEPER ---
+    def apply_smart_gatekeeper(self, df):
+        """
+        v11.0: Smart Gatekeeper - Pre-filter candidates by dollar-volume liquidity.
+
+        Filters out illiquid stocks BEFORE expensive pattern analysis begins.
+        Uses tiered thresholds based on market cap:
+        - Large-cap ($10B+): $5M daily dollar-volume required
+        - Mid-cap ($2B-$10B): $2M daily dollar-volume required
+        - Small-cap (<$2B): $1M daily dollar-volume required
+
+        Exception: Stocks with $500K+ dark pool inflow bypass the liquidity filter
+        (catches early institutional accumulation in overlooked names).
+
+        Args:
+            df: DataFrame with ticker data (must have current_price, avg_volume, dp_total, market_cap)
+
+        Returns:
+            Filtered DataFrame with only liquid/DP-bypassed candidates
+        """
+        if df.empty:
+            return df
+
+        print("\n[GATEKEEPER v11.0] Applying dollar-volume liquidity filter...")
+        original_count = len(df)
+
+        # Calculate dollar-volume for each ticker
+        df = df.copy()
+
+        # Dollar volume = price × average daily volume
+        if 'current_price' in df.columns and 'avg_volume' in df.columns:
+            df['dollar_volume'] = df['current_price'] * df['avg_volume']
+        elif 'current_price' in df.columns:
+            # Estimate from available data
+            df['dollar_volume'] = df['current_price'] * 1_000_000  # Conservative estimate
+        else:
+            # Can't calculate - pass all through
+            print("  [GATEKEEPER] Warning: Missing price/volume data, skipping filter")
+            return df
+
+        # Determine market cap tier for each ticker
+        def get_liquidity_threshold(row):
+            """Get liquidity threshold based on market cap tier."""
+            market_cap = row.get('market_cap', 0)
+
+            if market_cap >= GATEKEEPER_CONFIG['large_cap_min']:
+                return GATEKEEPER_CONFIG['large_cap_threshold']  # $5M
+            elif market_cap >= GATEKEEPER_CONFIG['mid_cap_min']:
+                return GATEKEEPER_CONFIG['mid_cap_threshold']   # $2M
+            else:
+                return GATEKEEPER_CONFIG['small_cap_threshold']  # $1M
+
+        # Check DP bypass eligibility
+        def has_dp_bypass(row):
+            """Check if ticker has high enough DP inflow to bypass liquidity filter."""
+            dp_total = row.get('dp_total', 0)
+            return dp_total >= GATEKEEPER_CONFIG['dp_bypass_threshold']
+
+        # Apply filter
+        passed_liquidity = []
+        passed_dp_bypass = []
+        rejected = []
+
+        for idx, row in df.iterrows():
+            ticker = row.get('ticker', 'Unknown')
+            dollar_vol = row.get('dollar_volume', 0)
+            threshold = get_liquidity_threshold(row)
+
+            # Check DP bypass first
+            if has_dp_bypass(row):
+                passed_dp_bypass.append(idx)
+            # Check dollar-volume threshold
+            elif dollar_vol >= threshold:
+                passed_liquidity.append(idx)
+            else:
+                rejected.append(ticker)
+
+        # Combine passed candidates
+        passed_indices = passed_liquidity + passed_dp_bypass
+        filtered_df = df.loc[passed_indices].copy()
+
+        # Log results
+        liquidity_passed = len(passed_liquidity)
+        dp_bypassed = len(passed_dp_bypass)
+        rejected_count = len(rejected)
+
+        print(f"  [GATEKEEPER] Passed liquidity filter: {liquidity_passed}")
+        print(f"  [GATEKEEPER] DP bypass (institutional): {dp_bypassed}")
+        print(f"  [GATEKEEPER] Rejected (illiquid): {rejected_count}")
+
+        if rejected_count > 0 and rejected_count <= 10:
+            print(f"  [GATEKEEPER] Rejected tickers: {', '.join(rejected[:10])}")
+        elif rejected_count > 10:
+            print(f"  [GATEKEEPER] Sample rejected: {', '.join(rejected[:5])}... (+{rejected_count-5} more)")
+
+        return filtered_df
+
+    # --- v11.0 SOLIDITY SCORE ---
+    def calculate_solidity_score(self, ticker, history_df):
+        """
+        v11.0: Solidity Score - Detects institutional accumulation during retail exhaustion.
+
+        The "solidity" concept: When smart money quietly accumulates while retail traders
+        lose interest, you get a characteristic pattern:
+        - High dark pool activity (institutions loading)
+        - Narrow price range within 38.2% Fibonacci retracement (controlled buying)
+        - Declining retail volume (capitulation/boredom)
+        - Extended consolidation period (20+ days)
+
+        This pattern preceded LULU's breakout when Elliott Management built their $1B position.
+
+        Scoring Components (0.0 to 1.0):
+        1. Consolidation Quality (0-0.30): Price range within 38.2% Fib level
+        2. Volume Decline (0-0.25): Recent volume declining vs average
+        3. Institutional Flow (0-0.25): Dark pool activity level
+        4. Duration (0-0.20): Consolidation period length
+
+        Args:
+            ticker: Stock ticker symbol
+            history_df: Price history DataFrame (OHLCV)
+
+        Returns:
+            dict with solidity_score, components, and explanation
+        """
+        result = {
+            'solidity_score': 0.0,
+            'consolidation_quality': 0.0,
+            'volume_decline': 0.0,
+            'institutional_flow': 0.0,
+            'duration_score': 0.0,
+            'is_solid': False,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < SOLIDITY_CONFIG['min_consolidation_days']:
+            result['explanation'] = 'Insufficient history for solidity analysis'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            # --- Component 1: Consolidation Quality (0-0.30) ---
+            # Check if price range is within 38.2% Fibonacci level
+            lookback = min(len(close), 60)  # Look at recent 60 days
+            recent_close = close.iloc[-lookback:]
+
+            base_high = recent_close.max()
+            base_low = recent_close.min()
+            price_range = (base_high - base_low) / base_low if base_low > 0 else 1.0
+
+            # 38.2% Fib is the institutional standard for "tight" consolidation
+            fib_threshold = SOLIDITY_CONFIG['max_consolidation_range']
+
+            if price_range <= fib_threshold * 0.5:
+                # Very tight consolidation (< 19.1% range)
+                result['consolidation_quality'] = 0.30
+            elif price_range <= fib_threshold:
+                # Good consolidation (< 38.2% range)
+                result['consolidation_quality'] = 0.25
+            elif price_range <= fib_threshold * 1.5:
+                # Acceptable consolidation (< 57.3% range)
+                result['consolidation_quality'] = 0.15
+            else:
+                # Too wide - not a solid base
+                result['consolidation_quality'] = 0.0
+
+            # --- Component 2: Volume Decline (0-0.25) ---
+            # Declining volume = retail exhaustion/capitulation
+            vol_lookback = SOLIDITY_CONFIG['volume_lookback_days']
+            if len(volume) >= vol_lookback:
+                avg_volume_long = volume.iloc[-vol_lookback:].mean()
+                avg_volume_recent = volume.iloc[-5:].mean()
+
+                if avg_volume_long > 0:
+                    volume_ratio = avg_volume_recent / avg_volume_long
+
+                    # We WANT declining volume (smart money loading quietly)
+                    if volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio'] * 0.5:
+                        # Significantly declining (< 35% of average)
+                        result['volume_decline'] = 0.25
+                    elif volume_ratio <= SOLIDITY_CONFIG['volume_decline_ratio']:
+                        # Declining (< 70% of average)
+                        result['volume_decline'] = 0.20
+                    elif volume_ratio <= 1.0:
+                        # Stable volume
+                        result['volume_decline'] = 0.10
+                    else:
+                        # Increasing volume - not what we want for solidity
+                        result['volume_decline'] = 0.0
+
+            # --- Component 3: Institutional Flow (0-0.25) ---
+            # High dark pool activity indicates institutional accumulation
+            dp_total = 0
+            has_signature = False
+
+            # Get ticker data from full_df
+            if hasattr(self, 'full_df') and not self.full_df.empty:
+                ticker_data = self.full_df[self.full_df['ticker'] == ticker]
+                if not ticker_data.empty:
+                    dp_total = ticker_data.iloc[0].get('dp_total', 0)
+
+            # Check for signature prints in dp_support_levels
+            if ticker in self.dp_support_levels:
+                has_signature = len(self.dp_support_levels[ticker]) > 0
+
+            min_dp = SOLIDITY_CONFIG['min_dp_total']
+            if dp_total >= min_dp * 5:
+                # Massive institutional activity ($50M+)
+                result['institutional_flow'] = 0.25
+            elif dp_total >= min_dp * 2:
+                # Strong institutional activity ($20M+)
+                result['institutional_flow'] = 0.20
+            elif dp_total >= min_dp:
+                # Good institutional activity ($10M+)
+                result['institutional_flow'] = 0.15
+            elif has_signature:
+                # Has signature prints but lower DP total
+                result['institutional_flow'] = 0.10
+            else:
+                result['institutional_flow'] = 0.0
+
+            # Signature print bonus
+            if has_signature and result['institutional_flow'] > 0:
+                result['institutional_flow'] = min(0.25,
+                    result['institutional_flow'] + SOLIDITY_CONFIG['signature_print_bonus'])
+
+            # --- Component 4: Duration Score (0-0.20) ---
+            # Count days in consolidation (price within 10% of SMA20)
+            sma20 = close.rolling(20).mean()
+            if len(sma20.dropna()) > 0:
+                consolidation_mask = abs(close - sma20) / sma20 < 0.10
+                days_in_consolidation = consolidation_mask.iloc[-60:].sum()
+
+                min_days = SOLIDITY_CONFIG['min_consolidation_days']
+                if days_in_consolidation >= min_days * 2:
+                    # Extended consolidation (40+ days)
+                    result['duration_score'] = 0.20
+                elif days_in_consolidation >= min_days * 1.5:
+                    # Good consolidation (30+ days)
+                    result['duration_score'] = 0.15
+                elif days_in_consolidation >= min_days:
+                    # Minimum consolidation (20+ days)
+                    result['duration_score'] = 0.10
+                else:
+                    result['duration_score'] = 0.0
+
+            # --- Calculate Total Solidity Score ---
+            total_score = (
+                result['consolidation_quality'] +
+                result['volume_decline'] +
+                result['institutional_flow'] +
+                result['duration_score']
+            )
+
+            result['solidity_score'] = total_score
+            result['is_solid'] = total_score >= SOLIDITY_CONFIG['base_threshold']
+
+            # --- Generate Explanation ---
+            if result['is_solid']:
+                components = []
+                if result['consolidation_quality'] >= 0.20:
+                    components.append(f"Tight base ({price_range*100:.1f}% range)")
+                if result['volume_decline'] >= 0.15:
+                    components.append("Declining volume")
+                if result['institutional_flow'] >= 0.15:
+                    components.append(f"DP ${dp_total/1e6:.1f}M")
+                if result['duration_score'] >= 0.10:
+                    components.append(f"{days_in_consolidation}d consolidation")
+
+                result['explanation'] = f"SOLID BASE: Score={total_score:.2f} | " + ", ".join(components)
+            else:
+                weak = []
+                if result['consolidation_quality'] < 0.15:
+                    weak.append(f"Wide range ({price_range*100:.0f}%)")
+                if result['volume_decline'] < 0.10:
+                    weak.append("No volume decline")
+                if result['institutional_flow'] < 0.10:
+                    weak.append("Low DP activity")
+
+                result['explanation'] = f"Not solid ({total_score:.2f}): " + ", ".join(weak) if weak else f"Sub-threshold ({total_score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Solidity analysis error: {str(e)[:50]}'
+
+        return result
+
+    def detect_phoenix_reversal(self, ticker, history_df):
+        """
+        v10.7: Flow-Adjusted Dynamic Scoring Model for Phoenix Detection.
+
+        Instead of hard thresholds (RSI must be 50-70), this uses a sliding scale.
+        High institutional flow (volume/dark pools) earns "forgiveness points" that
+        dynamically expand allowable limits.
+
+        Example: LULU with massive Elliott $1B stake can have RSI 80 and still pass,
+        while a low-volume stock with RSI 80 would be rejected.
+
+        Dynamic Thresholds (based on flow_factor 0.0-1.0):
+        - RSI: 50-70 → expands to 40-85 with max flow
+        - Drawdown: 35% → expands to 80% with max flow
+        - Base duration min: 60 → reduces to 30 with max flow
+
+        Returns dict with phoenix detection results and explanation.
+        """
+        result = {
+            'is_phoenix': False,
+            'phoenix_score': 0.0,
+            'base_duration': 0,
+            'volume_ratio': 0.0,
+            'rsi': 0.0,
+            'explanation': ''
+        }
+
+        min_days = PHOENIX_CONFIG['min_base_days']
+        max_days = PHOENIX_CONFIG['max_base_days']
+
+        if history_df is None or len(history_df) < min_days:
+            result['explanation'] = 'Insufficient history for phoenix analysis'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            current_price = float(close.iloc[-1])
+
+            # Look for consolidation base in the past 60-250 days
+            lookback_days = min(len(close), max_days)
+            base_period = close.iloc[-lookback_days:]
+            base_high = base_period.max()
+            base_low = base_period.min()
+            base_range = (base_high - base_low) / base_low
+
+            # v11.2: Calculate 52-week (252 trading days) high for momentum filter
+            # True phoenix reversals emerge from bases, not from stocks already near highs
+            week_52_period = min(len(close), 252)
+            high_52w = close.iloc[-week_52_period:].max()
+            low_52w = close.iloc[-week_52_period:].min()
+            pct_from_52w_high = (high_52w - current_price) / high_52w if high_52w > 0 else 0
+            pct_from_52w_low = (current_price - low_52w) / low_52w if low_52w > 0 else 0
+            result['high_52w'] = float(high_52w)
+            result['low_52w'] = float(low_52w)
+            result['pct_from_52w_high'] = float(pct_from_52w_high)
+            result['pct_from_52w_low'] = float(pct_from_52w_low)
+
+            # v10.8.1: FIX - Look at FULL lookback period, not just min_days
+            # Previous bug: Only looked at last 60 days, making institutional phoenix (365+) impossible
+            sma50 = close.rolling(50).mean()
+
+            # Use the full available lookback period (up to max_days)
+            full_lookback = min(len(close), max_days)
+            full_sma = sma50.iloc[-full_lookback:] if len(sma50) >= full_lookback else sma50
+            full_close = close.iloc[-full_lookback:] if len(close) >= full_lookback else close
+
+            # v10.8.1: Dynamic consolidation threshold
+            # Base: 15% (increased from 10%), expands based on:
+            # 1. Flow factor (institutional conviction allows messier bases)
+            # 2. Drawdown magnitude (deeper corrections = choppier recoveries)
+            base_consolidation_pct = PHOENIX_CONFIG['min_consolidation_pct']  # 0.15
+
+            # Calculate pre-emptive flow factor for threshold adjustment
+            avg_volume_50d_prelim = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent_prelim = volume.iloc[-5:].mean()
+            volume_ratio_prelim = avg_volume_recent_prelim / (avg_volume_50d_prelim + 1)
+            flow_factor_prelim, _ = self.calculate_flow_factor(ticker, volume_ratio_prelim)
+
+            # Drawdown-based expansion: deeper drawdowns allow looser consolidation
+            # LULU with 60% drawdown gets +5% tolerance
+            drawdown_bonus = min(0.10, base_range * 0.15)  # Up to 10% extra for deep drawdowns
+
+            # Flow-based expansion: high institutional flow allows +5% tolerance
+            flow_bonus = flow_factor_prelim * 0.05  # Up to 5% extra for max flow
+
+            # Dynamic consolidation threshold: 15% base, up to 30% for deep drawdown + high flow
+            consolidation_threshold = base_consolidation_pct + drawdown_bonus + flow_bonus
+            consolidation_threshold = min(consolidation_threshold, 0.30)  # Cap at 30%
+            result['consolidation_threshold'] = consolidation_threshold
+
+            # Count days in consolidation across FULL lookback period
+            days_in_base = ((abs(full_close - full_sma) / full_sma) < consolidation_threshold).sum()
+            result['base_duration'] = int(days_in_base)
+
+            # Debug output for validation tickers
+            if ENABLE_VALIDATION_MODE and ticker in (VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']):
+                print(f"  [PHOENIX DEBUG] {ticker}: lookback={full_lookback}d, threshold={consolidation_threshold:.1%}, days_in_base={days_in_base}")
+
+            # Check for volume surge (recent 5-day average vs 50-day average)
+            avg_volume_50d = volume.iloc[-50:].mean() if len(volume) >= 50 else volume.mean()
+            avg_volume_recent = volume.iloc[-5:].mean()
+            volume_ratio = avg_volume_recent / (avg_volume_50d + 1)
+            result['volume_ratio'] = float(volume_ratio)
+
+            has_volume_surge = volume_ratio >= PHOENIX_CONFIG['volume_surge_threshold']
+
+            # v10.7: Calculate Flow Factor for dynamic threshold adjustment
+            flow_factor, flow_details = self.calculate_flow_factor(ticker, volume_ratio)
+            result['flow_factor'] = flow_factor
+
+            # Calculate RSI
+            delta = close.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / (loss + 1e-9)
+            rsi = 100 - (100 / (1 + rs))
+            current_rsi = float(rsi.iloc[-1])
+            result['rsi'] = current_rsi
+
+            # v10.7: DYNAMIC RSI THRESHOLDS based on flow factor
+            # Base: 50-70, with max flow expands to 40-85
+            # High institutional flow earns "forgiveness points"
+            rsi_min_dynamic = max(40, PHOENIX_CONFIG['rsi_min'] - flow_factor * 10)  # 50 → 40 with max flow
+            rsi_max_dynamic = min(85, PHOENIX_CONFIG['rsi_max'] + flow_factor * 15)  # 70 → 85 with max flow
+            rsi_in_range = rsi_min_dynamic <= current_rsi <= rsi_max_dynamic
+            result['rsi_range'] = f"{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}"
+
+            # Check for breakout (price near top of range)
+            breakout_threshold = PHOENIX_CONFIG['breakout_threshold']
+            near_breakout = current_price >= base_low * (1 + base_range * 0.7)  # Near top 30% of range
+            recent_breakout = (current_price - base_low) / base_low >= breakout_threshold
+
+            # Check drawdown constraint
+            max_drawdown = (base_high - base_low) / base_high
+            acceptable_drawdown = max_drawdown <= PHOENIX_CONFIG['max_drawdown_pct']
+
+            # Dark pool support adds confidence
+            has_dp_support = False
+            dp_strength = 0.0
+            if ticker in self.dp_support_levels:
+                dp_levels = self.dp_support_levels[ticker]
+                nearby_support = [p for p in dp_levels if abs(p - current_price) / current_price < 0.15]
+                has_dp_support = len(nearby_support) > 0
+                dp_strength = min(len(nearby_support) / 3.0, 1.0)  # More DP levels = stronger
+
+            # --- MULTI-LAYER SCORING SYSTEM ---
+            # Layer 1: Base Duration Score (0-25 points)
+            # v10.4: Extended for institutional phoenix patterns (LULU-like 18-24 month bases)
+            base_duration_score = 0.0
+            institutional_threshold = PHOENIX_CONFIG.get('institutional_threshold', 365)
+
+            if min_days <= days_in_base <= max_days:
+                # SPECULATIVE PHOENIX (60-365 days / 2-12 months)
+                if 90 <= days_in_base <= 180:
+                    # Optimal Wyckoff accumulation timeframe
+                    base_duration_score = 0.25
+                elif 60 <= days_in_base < 90:
+                    # Shorter base (partial credit)
+                    base_duration_score = 0.15 + (days_in_base - 60) / 30 * 0.10
+                elif 180 < days_in_base < institutional_threshold:
+                    # Long base but not yet institutional
+                    base_duration_score = 0.20
+
+                # INSTITUTIONAL PHOENIX (365-730 days / 12-24 months)
+                elif institutional_threshold <= days_in_base <= 730:
+                    # Large-cap institutional accumulation (LULU, activist plays)
+                    # Longer bases = deeper conviction for institutions
+                    if 365 <= days_in_base <= 550:
+                        base_duration_score = 0.25  # 12-18 months (optimal institutional)
+                    elif 550 < days_in_base <= 730:
+                        base_duration_score = 0.23  # 18-24 months (very deep base)
+            else:
+                # Outside acceptable range
+                base_duration_score = 0.0
+
+            # Layer 2: Volume Confirmation Score (0-25 points)
+            volume_score = 0.0
+            if volume_ratio >= 1.5:
+                if volume_ratio >= 3.0:
+                    volume_score = 0.25  # Exceptional volume
+                elif volume_ratio >= 2.0:
+                    volume_score = 0.20  # Strong volume
+                else:
+                    volume_score = 0.10 + (volume_ratio - 1.5) / 0.5 * 0.10  # Gradual increase
+            else:
+                # Partial credit for moderate volume
+                if volume_ratio >= 1.2:
+                    volume_score = 0.05
+
+            # Layer 3: RSI Health Score (0-20 points) - v10.7: FLOW-ADJUSTED DYNAMIC SCORING
+            # High institutional flow expands acceptable RSI range
+            rsi_score = 0.0
+
+            # Define dynamic sweet spots based on flow factor
+            # Base sweet spot: 55-65, expands to 45-80 with max flow
+            sweet_spot_min = max(45, 55 - flow_factor * 10)
+            sweet_spot_max = min(80, 65 + flow_factor * 15)
+
+            if sweet_spot_min <= current_rsi <= sweet_spot_max:
+                # Within dynamic sweet spot - full or near-full credit
+                if 55 <= current_rsi <= 65:
+                    rsi_score = 0.20  # Classic sweet spot
+                elif 50 <= current_rsi <= 70:
+                    rsi_score = 0.18  # Standard acceptable range
+                else:
+                    # Extended range due to high flow - still good credit
+                    rsi_score = 0.15 + flow_factor * 0.05  # 0.15-0.20 based on flow
+
+            elif rsi_min_dynamic <= current_rsi <= rsi_max_dynamic:
+                # Within dynamic acceptable range but outside sweet spot
+                if current_rsi < sweet_spot_min:
+                    # Oversold side
+                    rsi_score = 0.08 + flow_factor * 0.04
+                else:
+                    # Overbought side - flow factor provides "forgiveness"
+                    # LULU with RSI 78 and high flow would score here
+                    distance_from_70 = current_rsi - 70
+                    penalty = min(0.10, distance_from_70 * 0.01)  # Small penalty per point above 70
+                    forgiveness = flow_factor * 0.12  # High flow forgives up to 0.12
+                    rsi_score = max(0.05, 0.15 - penalty + forgiveness)
+
+            elif 70 < current_rsi <= 85 and flow_factor >= 0.3:
+                # Overbought but with significant flow - partial credit with forgiveness
+                # This catches LULU-like scenarios: RSI 78 but $1B institutional stake
+                rsi_score = 0.05 + flow_factor * 0.08  # 0.05-0.13 based on flow
+
+            # Store scoring details for debugging
+            result['rsi_sweet_spot'] = f"{sweet_spot_min:.0f}-{sweet_spot_max:.0f}"
+
+            # Layer 4: Breakout Confirmation Score (0-15 points)
+            breakout_score = 0.0
+            if near_breakout or recent_breakout:
+                if recent_breakout:
+                    # Already broken out
+                    breakout_pct = (current_price - base_low) / base_low
+                    if breakout_pct >= 0.10:
+                        breakout_score = 0.15  # Strong breakout (10%+)
+                    elif breakout_pct >= 0.05:
+                        breakout_score = 0.12
+                    else:
+                        breakout_score = 0.08
+                elif near_breakout:
+                    # Near breakout (anticipatory)
+                    breakout_score = 0.10
+
+            # Layer 5: Drawdown Quality Score (0-10 points)
+            # v10.4: Extended for deep institutional corrections (LULU-like 60% drops)
+            drawdown_score = 0.0
+            if max_drawdown <= 0.70:  # Extended acceptable drawdown
+                # Lower drawdown = higher quality base (for speculative)
+                # Higher drawdown = deeper value opportunity (for institutional)
+                if max_drawdown <= 0.20:
+                    drawdown_score = 0.10  # Tight base (best for speculative)
+                elif max_drawdown <= 0.35:
+                    drawdown_score = 0.08  # Moderate correction
+                elif max_drawdown <= 0.50:
+                    drawdown_score = 0.07  # Significant correction (still acceptable)
+                elif max_drawdown <= 0.70:
+                    # Deep institutional correction (LULU: 60% drop)
+                    # If base is institutional (>365 days), this is POSITIVE (deep value + time to accumulate)
+                    if days_in_base >= institutional_threshold:
+                        drawdown_score = 0.10  # Deep value opportunity for institutions
+                    else:
+                        drawdown_score = 0.05  # Risky for short-term plays
+            else:
+                # Excessive drawdown (>70%) - severe distress signal
+                drawdown_score = -0.05
+
+            # Layer 6: Dark Pool Support Score (0-15 points + BONUS for mega-prints)
+            # v10.4: Magnitude-based scaling for institutional activism (LULU-like $1B+ stakes)
+            dp_score = 0.0
+            if has_dp_support:
+                dp_score = 0.10 + (dp_strength * 0.05)  # Base 10 + up to 5 bonus
+
+            # BONUS: Check for massive institutional dark pool activity
+            # Look for signature prints or unusually large DP accumulation
+            if ticker in self.full_df[self.full_df['ticker'] == ticker].index:
+                ticker_row = self.full_df[self.full_df['ticker'] == ticker].iloc[0] if not self.full_df[self.full_df['ticker'] == ticker].empty else None
+                if ticker_row is not None and 'dp_total' in ticker_row:
+                    dp_total = ticker_row['dp_total']
+                    # Institutional activism threshold: $50M+ dark pool activity
+                    if dp_total > 50_000_000:  # $50M+
+                        # Scale bonus logarithmically (prevents single print from dominating)
+                        import math
+                        mega_print_bonus = min(0.15, math.log10(dp_total / 50_000_000) * 0.10)
+                        dp_score += mega_print_bonus
+                        # For truly massive prints ($500M+), add extra weight
+                        if dp_total > 500_000_000:  # $500M+ (LULU Elliott-level)
+                            dp_score += 0.10
+
+            # Layer 7: Pattern Synergy Bonus (0-10 points)
+            # v10.4: Detect overlapping patterns that reinforce each other (LULU has both!)
+            synergy_score = 0.0
+
+            # Check if this ticker also has double bottom pattern (cache check)
+            # Double bottom within phoenix base = STRONG institutional accumulation signal
+            # We'll check this later during pattern integration, but add placeholder
+            # The actual synergy bonus will be added during pattern aggregation in predict()
+
+            # v10.7: Layer 8: Flow Factor Bonus (0-15 points)
+            # High institutional conviction adds direct score bonus
+            # This allows stocks with massive flow to overcome weak individual components
+            flow_bonus = 0.0
+            if flow_factor >= 0.7:
+                flow_bonus = 0.15  # Exceptional institutional conviction
+            elif flow_factor >= 0.5:
+                flow_bonus = 0.10  # Strong institutional flow
+            elif flow_factor >= 0.3:
+                flow_bonus = 0.05  # Moderate institutional interest
+
+            # v11.0: Layer 9: Solidity Score (0-18 points)
+            # Detects institutional accumulation during retail exhaustion
+            # This is critical for LULU-style setups where smart money loads quietly
+            solidity_result = self.calculate_solidity_score(ticker, history_df)
+            solidity_score_raw = solidity_result.get('solidity_score', 0)
+
+            # Scale solidity to weight in Phoenix score (18% of total as per SOLIDITY_CONFIG)
+            solidity_weight = SOLIDITY_CONFIG['weight_in_phoenix']
+            solidity_contribution = solidity_score_raw * solidity_weight
+
+            # Store solidity components in result for transparency
+            result['solidity_score'] = solidity_score_raw
+            result['solidity_details'] = solidity_result
+
+            # --- COMPOSITE SCORE ---
+            composite_score = (
+                base_duration_score +
+                volume_score +
+                rsi_score +
+                breakout_score +
+                drawdown_score +
+                dp_score +
+                synergy_score +   # Pattern overlap bonus
+                flow_bonus +      # v10.7: Institutional flow bonus
+                solidity_contribution  # v11.0: Institutional accumulation score
+            )
+
+            # v10.7: Dynamic threshold based on flow factor
+            # High flow lowers the bar: 0.60 → 0.45 with max flow
+            base_threshold = 0.60
+            flow_adjusted_threshold = max(0.45, base_threshold - flow_factor * 0.15)
+            is_phoenix = composite_score >= flow_adjusted_threshold
+
+            result['is_phoenix'] = is_phoenix
+            result['phoenix_score'] = composite_score
+            result['threshold'] = flow_adjusted_threshold
+
+            # --- DETAILED EXPLANATION ---
+            score_components = []
+
+            if is_phoenix:
+                # Highlight strengths
+                if base_duration_score >= 0.20:
+                    score_components.append(f"{days_in_base}d base ({base_duration_score*100:.0f} pts)")
+                if volume_score >= 0.15:
+                    score_components.append(f"{volume_ratio:.1f}x volume ({volume_score*100:.0f} pts)")
+                if rsi_score >= 0.10:
+                    # v10.7: Show RSI with dynamic range context
+                    if current_rsi > 70:
+                        score_components.append(f"RSI {current_rsi:.0f} [flow-adjusted] ({rsi_score*100:.0f} pts)")
+                    else:
+                        score_components.append(f"RSI {current_rsi:.0f} ({rsi_score*100:.0f} pts)")
+                if breakout_score >= 0.10:
+                    score_components.append(f"Breakout ({breakout_score*100:.0f} pts)")
+                if dp_score >= 0.10:
+                    score_components.append(f"DP ${flow_details['raw_dp_total']/1e6:.0f}M ({dp_score*100:.0f} pts)")
+                if flow_bonus >= 0.05:
+                    score_components.append(f"Flow Factor {flow_factor:.2f} (+{flow_bonus*100:.0f} pts)")
+                # v11.0: Solidity score indicator
+                if solidity_contribution >= 0.05:
+                    score_components.append(f"SOLID BASE ({solidity_score_raw:.2f})")
+
+                threshold_note = f" [threshold={flow_adjusted_threshold:.2f}]" if flow_adjusted_threshold < 0.60 else ""
+                result['explanation'] = f"PHOENIX REVERSAL: Score={composite_score:.2f}{threshold_note} | " + ", ".join(score_components)
+            else:
+                # Show why it didn't qualify (scores too low)
+                weak_components = []
+                if base_duration_score < 0.15:
+                    weak_components.append(f"base {days_in_base}d ({base_duration_score*100:.0f} pts)")
+                if volume_score < 0.10:
+                    weak_components.append(f"volume {volume_ratio:.1f}x ({volume_score*100:.0f} pts)")
+                if rsi_score < 0.10:
+                    # v10.7: Show RSI with dynamic range info
+                    rsi_note = f" [range:{rsi_min_dynamic:.0f}-{rsi_max_dynamic:.0f}]" if flow_factor >= 0.2 else ""
+                    weak_components.append(f"RSI {current_rsi:.0f}{rsi_note} ({rsi_score*100:.0f} pts)")
+                if breakout_score < 0.08:
+                    weak_components.append(f"no breakout ({breakout_score*100:.0f} pts)")
+
+                # v10.7: Show flow factor if significant
+                flow_note = f", flow={flow_factor:.2f}" if flow_factor >= 0.2 else ""
+                threshold_note = f"/{flow_adjusted_threshold:.2f}" if flow_adjusted_threshold < 0.60 else "/0.60"
+
+                result['explanation'] = f'Near-phoenix (Score={composite_score:.2f}{threshold_note}{flow_note}): ' + ', '.join(weak_components) if weak_components else f'Sub-threshold pattern (score={composite_score:.2f})'
+
+        except Exception as e:
+            result['explanation'] = f'Phoenix detection error: {str(e)[:50]}'
+
+        return result
+
+    def detect_cup_and_handle(self, ticker, history_df):
+        """
+        Detect Cup-and-Handle pattern: U-shaped recovery + small consolidation (handle).
+
+        Pattern:
+        1. U-shaped recovery (30-60 days)
+        2. Price returns to 80-100% of prior high
+        3. Small handle consolidation (5-15 days, 5-15% pullback)
+        4. Volume decreasing during handle formation
+        5. Breakout above handle resistance
+
+        Returns dict with cup-and-handle detection results.
+        """
+        result = {
+            'is_cup_handle': False,
+            'cup_handle_score': 0.0,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < 60:
+            result['explanation'] = 'Insufficient history'
+            return result
+
+        try:
+            close = history_df['Close']
+            volume = history_df['Volume']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            if isinstance(volume, pd.DataFrame):
+                volume = volume.iloc[:, 0]
+
+            # Look for cup formation in last 60 days
+            lookback = min(len(close), 60)
+            cup_period = close.iloc[-lookback:]
+
+            # Find the high before the cup (left rim)
+            left_rim_high = cup_period.iloc[:20].max()
+            left_rim_idx = cup_period.iloc[:20].idxmax()
+
+            # Find the low of the cup (bottom)
+            cup_low = cup_period.iloc[10:40].min()
+            cup_low_idx = cup_period.iloc[10:40].idxmin()
+
+            # Find the recent high (right rim / handle start)
+            right_rim_high = cup_period.iloc[-20:].max()
+
+            current_price = float(close.iloc[-1])
+
+            # Cup depth
+            cup_depth = (left_rim_high - cup_low) / left_rim_high
+
+            # Recovery ratio (how much of the drop was recovered)
+            recovery = (right_rim_high - cup_low) / (left_rim_high - cup_low) if left_rim_high > cup_low else 0
+
+            # Handle characteristics (last 15 days)
+            handle_period = close.iloc[-15:]
+            handle_high = handle_period.max()
+            handle_low = handle_period.min()
+            handle_depth = (handle_high - handle_low) / handle_high
+
+            # Volume trend during handle (should decline)
+            volume_handle = volume.iloc[-15:]
+            volume_pre_handle = volume.iloc[-30:-15]
+            volume_declining = volume_handle.mean() < volume_pre_handle.mean()
+
+            # Scoring
+            score = 0.0
+
+            # Cup quality (0-40 points)
+            if 0.15 <= cup_depth <= 0.50 and recovery >= 0.80:
+                score += 0.40
+            elif 0.10 <= cup_depth <= 0.55 and recovery >= 0.70:
+                score += 0.25
+
+            # Handle quality (0-30 points)
+            if 0.05 <= handle_depth <= 0.15 and volume_declining:
+                score += 0.30
+            elif 0.05 <= handle_depth <= 0.20:
+                score += 0.15
+
+            # Breakout confirmation (0-30 points)
+            if current_price >= handle_high * 1.02:  # 2% breakout
+                score += 0.30
+            elif current_price >= handle_high * 0.98:  # Near breakout
+                score += 0.15
+
+            result['is_cup_handle'] = score >= 0.60
+            result['cup_handle_score'] = score
+            result['explanation'] = f"Cup-Handle: {score:.2f} | Depth={cup_depth*100:.0f}%, Recovery={recovery*100:.0f}%, Handle={handle_depth*100:.0f}%" if score >= 0.60 else f"Not cup-handle (score={score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Cup-handle error: {str(e)[:50]}'
+
+        return result
+
+    def detect_double_bottom(self, ticker, history_df):
+        """
+        Detect Double Bottom pattern: Two distinct lows at similar price levels with a bounce between.
+
+        Pattern:
+        1. First low (support test)
+        2. Bounce of 10-20% from first low
+        3. Second low within 2-5% of first low (support confirmation)
+        4. Time between lows: 20-60 days
+        5. Breakout above resistance (high between the lows)
+
+        Returns dict with double bottom detection results.
+        """
+        result = {
+            'is_double_bottom': False,
+            'double_bottom_score': 0.0,
+            'explanation': ''
+        }
+
+        if history_df is None or len(history_df) < 60:
+            result['explanation'] = 'Insufficient history'
+            return result
+
+        try:
+            close = history_df['Close']
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+
+            # Look for pattern in last 60 days
+            lookback = min(len(close), 60)
+            pattern_period = close.iloc[-lookback:]
+
+            # Find local minima (potential lows)
+            from scipy.signal import argrelextrema
+            local_min_indices = argrelextrema(pattern_period.values, np.less, order=5)[0]
+
+            if len(local_min_indices) < 2:
+                result['explanation'] = 'Insufficient local minima'
+                return result
+
+            # Take the two most recent lows
+            recent_lows = local_min_indices[-2:]
+            first_low_idx = recent_lows[0]
+            second_low_idx = recent_lows[1]
+
+            first_low = pattern_period.iloc[first_low_idx]
+            second_low = pattern_period.iloc[second_low_idx]
+
+            # Time between lows
+            days_between = second_low_idx - first_low_idx
+
+            # Find the high between the lows (resistance)
+            between_period = pattern_period.iloc[first_low_idx:second_low_idx]
+            resistance_high = between_period.max()
+
+            # Bounce height from first low
+            bounce_height = (resistance_high - first_low) / first_low
+
+            # Similarity of lows (should be within 5%)
+            low_similarity = abs(second_low - first_low) / first_low
+
+            current_price = float(close.iloc[-1])
+
+            # Scoring
+            score = 0.0
+
+            # Low similarity (0-35 points)
+            if low_similarity <= 0.02:  # Within 2%
+                score += 0.35
+            elif low_similarity <= 0.05:  # Within 5%
+                score += 0.25
+            elif low_similarity <= 0.08:  # Within 8%
+                score += 0.15
+
+            # Time spacing (0-25 points)
+            if 20 <= days_between <= 60:
+                score += 0.25
+            elif 15 <= days_between < 20 or 60 < days_between <= 80:
+                score += 0.15
+
+            # Bounce quality (0-20 points)
+            if bounce_height >= 0.15:  # 15%+ bounce
+                score += 0.20
+            elif bounce_height >= 0.10:
+                score += 0.15
+
+            # Breakout confirmation (0-20 points)
+            if current_price >= resistance_high * 1.03:  # 3% above resistance
+                score += 0.20
+            elif current_price >= resistance_high:
+                score += 0.10
+
+            result['is_double_bottom'] = score >= 0.60
+            result['double_bottom_score'] = score
+            result['explanation'] = f"Double-Bottom: {score:.2f} | Lows={low_similarity*100:.1f}% apart, Bounce={bounce_height*100:.0f}%, Days={days_between}" if score >= 0.60 else f"Not double-bottom (score={score:.2f})"
+
+        except Exception as e:
+            result['explanation'] = f'Double-bottom error: {str(e)[:50]}'
+
+        return result
+
+    # --- PHASE 10: POSITION SIZING (Kelly Criterion) ---
+    def calculate_position_size(self, row, portfolio_value=100000):
+        """
+        Calculate position size using Modified Kelly Criterion.
+
+        Kelly Formula: f* = (p*b - q) / b
+        Where: p = win probability, q = loss probability (1-p), b = win/loss ratio
+
+        Simplified as: Position = (Edge * P(win) - P(loss)) / Vol_Risk
+        Capped at quarter-Kelly for safety.
+
+        Args:
+            row: DataFrame row with ticker data (nn_score, atr, current_price, etc.)
+            portfolio_value: Total portfolio value for sizing
+
+        Returns:
+            dict with position_size, position_pct, risk_tier, kelly_raw, etc.
+        """
+        result = {
+            'position_size': 0,
+            'position_pct': 0.0,
+            'shares': 0,
+            'risk_tier': 'MEDIUM',
+            'vol_bucket': 'medium',
+            'kelly_raw': 0.0,
+            'kelly_capped': 0.0,
+            'sizing_explanation': ''
+        }
+
+        try:
+            # Extract key metrics
+            nn_score = row.get('nn_score', 50)
+            current_price = row.get('current_price', 0)
+            atr = row.get('atr', 0)
+
+            if current_price <= 0:
+                result['sizing_explanation'] = 'Invalid price'
+                return result
+
+            # Calculate volatility ratio (ATR/Price)
+            vol_ratio = atr / current_price if current_price > 0 else 0.10
+
+            # Determine vol bucket
+            if vol_ratio < RISK_TIER_MATRIX['vol_thresholds']['low']:
+                vol_bucket = '<5%'
+                result['vol_bucket'] = 'low'
+            elif vol_ratio < RISK_TIER_MATRIX['vol_thresholds']['medium']:
+                vol_bucket = '5-6%'
+                result['vol_bucket'] = 'medium'
+            else:
+                vol_bucket = '>6%'
+                result['vol_bucket'] = 'high'
+
+            # Determine score tier and get multiplier
+            multiplier = 0.20  # Default for low scores
+            for (low, high), vol_dict in RISK_TIER_MATRIX['score_tiers'].items():
+                if low <= nn_score <= high:
+                    multiplier = vol_dict.get(vol_bucket, 0.20)
+                    if nn_score >= 95:
+                        result['risk_tier'] = 'HIGH_CONVICTION'
+                    elif nn_score >= 85:
+                        result['risk_tier'] = 'MEDIUM_HIGH'
+                    else:
+                        result['risk_tier'] = 'MEDIUM'
+                    break
+
+            # Estimate edge based on model confidence
+            # nn_score of 90 = 0.15 edge, 80 = 0.10 edge, 70 = 0.05 edge
+            estimated_edge = max(0.02, (nn_score - 50) / 400)  # 0.02 to 0.125
+
+            # Estimate win rate from score (conservative)
+            win_rate = min(0.65, 0.50 + (nn_score - 50) / 200)  # 0.50 to 0.65
+
+            # Kelly calculation: f* = (p * b - q) / b, where b = edge / (1 - edge)
+            # Simplified: f* = (win_rate * (1 + edge) - (1 - win_rate)) / (1 + edge)
+            loss_rate = 1 - win_rate
+            if vol_ratio > 0:
+                kelly_raw = (estimated_edge * win_rate - loss_rate) / vol_ratio
+            else:
+                kelly_raw = 0
+
+            # Cap at quarter-Kelly for safety
+            kelly_fraction = POSITION_SIZING_CONFIG['kelly_fraction']
+            kelly_capped = max(0, kelly_raw * kelly_fraction)
+
+            # Apply tier multiplier
+            position_pct = kelly_capped * multiplier
+
+            # Enforce min/max bounds
+            min_pct = POSITION_SIZING_CONFIG['min_position_pct']
+            max_pct = POSITION_SIZING_CONFIG['max_position_pct']
+            position_pct = max(min_pct, min(max_pct, position_pct))
+
+            # Calculate dollar amount and shares
+            position_size = portfolio_value * position_pct
+            shares = int(position_size / current_price) if current_price > 0 else 0
+
+            # Populate result
+            result['position_size'] = round(position_size, 2)
+            result['position_pct'] = round(position_pct * 100, 2)  # As percentage
+            result['shares'] = shares
+            result['kelly_raw'] = round(kelly_raw, 4)
+            result['kelly_capped'] = round(kelly_capped, 4)
+            result['sizing_explanation'] = (
+                f"{result['risk_tier']} | Vol:{result['vol_bucket']} | "
+                f"Kelly:{kelly_raw:.1%}→{position_pct:.1%} | "
+                f"${position_size:,.0f} ({shares} shares)"
+            )
+
+        except Exception as e:
+            result['sizing_explanation'] = f'Sizing error: {str(e)[:30]}'
+
+        return result
+
+    def get_vol_bucket_label(self, vol_ratio):
+        """Helper to get human-readable vol bucket label."""
+        if vol_ratio < 0.05:
+            return 'LOW (<5%)'
+        elif vol_ratio < 0.06:
+            return 'MEDIUM (5-6%)'
+        else:
+            return 'HIGH (>6%)'
+
+    def generate_signal_explanation(self, row, patterns):
+        """
+        Generate human-readable explanation for why this ticker is being recommended.
+        Combines macro context, flow analysis, pattern recognition, and AI confidence.
+
+        Returns a structured explanation string.
+        """
+        reasons = []
+        warnings = []
+
+        # 1. Macro Context
+        if hasattr(self, 'macro_data') and self.macro_data:
+            macro = self.macro_data
+            reasons.append(f"Macro: {self.market_regime}")
+            if macro.get('adjustment', 0) < -5:
+                warnings.append(f"Macro headwinds ({macro['adjustment']:+.1f} adjustment)")
+
+        # 2. Flow Analysis
+        net_gamma = row.get('net_gamma', 0)
+        gamma_velocity = row.get('gamma_velocity', 0)
+        dp_sentiment = row.get('dp_sentiment', 0)
+        dp_total = row.get('dp_total', 0)
+
+        if net_gamma > 100:
+            reasons.append(f"Bullish gamma (+{net_gamma:.0f})")
+        elif net_gamma < -100:
+            warnings.append(f"Bearish gamma ({net_gamma:.0f})")
+
+        if gamma_velocity > 30:
+            reasons.append(f"Accelerating gamma ({gamma_velocity:.0f}% velocity)")
+
+        if dp_sentiment > 0.3:
+            reasons.append("Dark pool accumulation")
+        elif dp_sentiment < -0.3:
+            warnings.append("Dark pool distribution")
+
+        if dp_total > 5_000_000:
+            reasons.append(f"Heavy DP activity (${dp_total/1e6:.1f}M)")
+
+        # 3. Pattern Recognition
+        if patterns:
+            # Bull Flag
+            if patterns.get('bull_flag', {}).get('is_flag'):
+                reasons.append(patterns['bull_flag']['explanation'])
+            elif patterns.get('bull_flag', {}).get('flag_score', 0) > 0.2:
+                reasons.append(patterns['bull_flag']['explanation'])
+
+            # GEX Walls
+            if patterns.get('gex_wall', {}).get('wall_protection_score', 0) > 0.3:
+                reasons.append(patterns['gex_wall']['explanation'])
+
+            # Reversal
+            if patterns.get('reversal', {}).get('is_reversal'):
+                reasons.append(patterns['reversal']['explanation'])
+
+            # Phoenix
+            if patterns.get('phoenix', {}).get('is_phoenix'):
+                reasons.append(patterns['phoenix']['explanation'])
+
+            # Cup-and-Handle
+            if patterns.get('cup_handle', {}).get('is_cup_handle'):
+                reasons.append(patterns['cup_handle']['explanation'])
+
+            # Double Bottom
+            if patterns.get('double_bottom', {}).get('is_double_bottom'):
+                reasons.append(patterns['double_bottom']['explanation'])
+
+        # 4. AI Confidence
+        nn_score = row.get('nn_score', 0)
+        if nn_score > 75:
+            reasons.append(f"High Hive Mind confidence ({nn_score:.0f}%)")
+        elif nn_score > 60:
+            reasons.append(f"Moderate AI confidence ({nn_score:.0f}%)")
+        elif nn_score < 40:
+            warnings.append(f"Low AI confidence ({nn_score:.0f}%)")
+
+        # 5. Technical Context
+        rsi = row.get('rsi', 50)
+        trend_score = row.get('trend_score_val', 0) if 'trend_score_val' in row else row.get('trend_score', 0)
+
+        if rsi < 35:
+            reasons.append(f"Oversold (RSI {rsi:.0f})")
+        elif rsi > 70:
+            warnings.append(f"Overbought (RSI {rsi:.0f})")
+
+        # 6. Sector Context
+        sector_status = row.get('sector_status', 'Unknown')
+        if sector_status == 'Leading Sector':
+            reasons.append("In leading sector")
+        elif sector_status == 'Lagging Sector':
+            if patterns and patterns.get('reversal', {}).get('is_reversal'):
+                reasons.append("Lagging sector reversal play")
+            else:
+                warnings.append("In lagging sector")
+
+        # 7. Quality
+        quality = row.get('quality', 'Unknown')
+        if quality == 'Quality Leader':
+            reasons.append("Large cap quality")
+        elif quality == 'Speculative':
+            warnings.append("Small cap/speculative")
+
+        # Build final explanation
+        explanation_parts = []
+        if reasons:
+            explanation_parts.append(" | ".join(reasons[:5]))  # Limit to top 5 reasons
+        if warnings:
+            explanation_parts.append("⚠️ " + ", ".join(warnings[:3]))  # Limit warnings
+
+        return " || ".join(explanation_parts) if explanation_parts else "Standard momentum signal"
+
+    def apply_sector_capping(self, df, max_per_sector=None):
+        """
+        Apply sector capping to prevent over-concentration in any single sector.
+        Returns filtered dataframe with max N picks per sector.
+        """
+        if max_per_sector is None:
+            max_per_sector = MAX_PICKS_PER_SECTOR
+
+        if df.empty or 'ticker' not in df.columns:
+            return df
+
+        # Get sector for each ticker
+        def get_sector(ticker):
+            return self.sector_map_local.get(ticker, 'Unknown')
+
+        df = df.copy()
+        df['_sector'] = df['ticker'].apply(get_sector)
+
+        # Group by sector and take top N from each
+        capped_dfs = []
+        sector_counts = {}
+
+        for _, row in df.iterrows():
+            sector = row['_sector']
+            sector_counts[sector] = sector_counts.get(sector, 0)
+
+            if sector_counts[sector] < max_per_sector:
+                capped_dfs.append(row)
+                sector_counts[sector] += 1
+
+        if capped_dfs:
+            result = pd.DataFrame(capped_dfs)
+            result = result.drop(columns=['_sector'], errors='ignore')
+
+            # Log sector distribution
+            print(f"  [RISK] Sector capping applied: {dict(sector_counts)}")
+            return result
+
+        return df.drop(columns=['_sector'], errors='ignore')
+
+    # --- RESTORED PROCESS FLOW DATA ---
+    def process_flow_data(self, file_map):
+        print("\n[1/4] Processing Options & Dark Pool Data...")
+        df_dp = self.safe_read(file_map.get('dp'), "Dark Pools")
+        dp_stats = pd.DataFrame()
+        if not df_dp.empty:
+            df_dp['ticker'] = df_dp['ticker'].apply(self.normalize_ticker)
+            if 'ext_hour_sold_codes' in df_dp.columns:
+                ghost_codes = ['extended_hours_trade_late_or_out_of_sequence', 'sold_out_of_sequence']
+                is_ghost = df_dp['ext_hour_sold_codes'].isin(ghost_codes)
+                ghost_prints = df_dp[is_ghost & (df_dp['premium'] > 500_000)]  # Lowered from 1M to 500K
+                if not ghost_prints.empty:
+                    print(f"  [SHIELD] Detected {len(ghost_prints)} Signature Prints.")
+                    for t, group in ghost_prints.groupby('ticker'): self.dp_support_levels[t] = group['price'].unique().tolist()
+            if {'nbbo_ask', 'nbbo_bid'}.issubset(df_dp.columns):
+                df_dp['sentiment'] = np.where(df_dp['price'] >= df_dp['nbbo_ask'], 1, np.where(df_dp['price'] <= df_dp['nbbo_bid'], -1, 0))
+            else: df_dp['sentiment'] = 0
+            df_dp['est_vol'] = df_dp['premium'] / (df_dp['price'] + 1e-9)
+            dp_stats = df_dp.groupby('ticker').agg({'premium': 'sum', 'sentiment': 'mean', 'est_vol': 'sum'}).rename(columns={'premium': 'dp_total', 'sentiment': 'dp_sentiment'})
+            dp_stats['dp_vwap'] = dp_stats['dp_total'] / (dp_stats['est_vol'] + 1e-9)
+            dp_stats.drop(columns=['est_vol'], inplace=True)
+
+        df_hot = self.safe_read(file_map.get('hot'), "Hot Chains")
+        flow_stats = pd.DataFrame()
+        if not df_hot.empty:
+            df_hot['ticker'] = df_hot['option_symbol'].str.extract(r'([A-Z]+)').iloc[:, 0].apply(self.normalize_ticker)
+            if 'next_earnings_date' in df_hot.columns:
+                print("  [SPEED] Caching Earnings Dates...")
+                valid_dates = df_hot.dropna(subset=['next_earnings_date'])
+                self.earnings_map = dict(zip(valid_dates['ticker'], valid_dates['next_earnings_date']))
+            df_hot['is_call'] = df_hot['option_symbol'].str.contains('C', regex=True)
+            df_hot['net_prem'] = df_hot['premium'] * np.where(df_hot['is_call'], 1, -1)
+            flow_stats = df_hot.groupby('ticker').agg({'premium': 'sum', 'net_prem': 'sum', 'iv': 'mean'}).rename(columns={'premium': 'opt_vol', 'net_prem': 'net_flow', 'iv': 'avg_iv'})
+
+        df_oi = self.safe_read(file_map.get('oi'), "OI Changes")
+        oi_stats = pd.DataFrame()
+        if not df_oi.empty:
+            if 'underlying_symbol' in df_oi.columns: df_oi['ticker'] = df_oi['underlying_symbol']
+            df_oi['ticker'] = df_oi['ticker'].apply(self.normalize_ticker)
+            oi_stats = df_oi.groupby('ticker').agg({'oi_change': 'sum'}).rename(columns={'oi_change': 'oi_change'})
+
+        df_screener = self.safe_read(file_map.get('bot_lite'), "Stock Screener")
+        if not df_screener.empty and 'ticker' in df_screener.columns:
+            df_screener['ticker'] = df_screener['ticker'].apply(self.normalize_ticker)
+            if 'marketcap' in df_screener.columns: self.cap_map = dict(zip(df_screener['ticker'], df_screener['marketcap']))
+            if 'sector' in df_screener.columns: self.sector_map_local.update(dict(zip(df_screener['ticker'], df_screener['sector'])))
+
+        df_bot = pd.DataFrame()
+        greeks_stats = pd.DataFrame()
+        if os.path.exists(self.optimized_bot_file):
+            print(f"  [+] Found Optimized Dataset: {os.path.basename(self.optimized_bot_file)}")
+            df_bot = self.safe_read(self.optimized_bot_file, "Optimized Gamma Data")
+            # ALSO extract strike-level data from raw file for GEX analysis
+            if file_map.get('bot_big') and os.path.exists(file_map.get('bot_big')):
+                self.extract_strike_gamma(file_map.get('bot_big'))
+        elif file_map.get('bot_big') and os.path.exists(file_map.get('bot_big')):
+            df_bot = self.optimize_large_dataset(file_map.get('bot_big'), date_stamp=None)
+        elif not df_screener.empty:
+            df_bot = df_screener.copy()
+            if 'net_call_premium' in df_bot.columns:
+                df_bot['screener_flow'] = df_bot['net_call_premium'] - df_bot['net_put_premium']
+                df_bot['net_gamma'] = df_bot['screener_flow'] / 100.0
+
+        # --- PATTERN VALIDATION SUITE (v10.6: Uses module-level VALIDATION_SUITE) ---
+        # Force-include known institutional phoenix patterns to validate detection
+        # v10.6 FIX: Now forces validation tickers into top 75 (see predict() method)
+
+        if ENABLE_VALIDATION_MODE:
+            # Combine all test tickers from module-level VALIDATION_SUITE
+            test_tickers = (
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
+            )
+
+            if not df_bot.empty and 'ticker' in df_bot.columns and test_tickers:
+                print(f"\n  [VALIDATION MODE] Adding {len(test_tickers)} tickers to candidate pool...")
+                for test_ticker in test_tickers:
+                    if test_ticker not in df_bot['ticker'].values:
+                        # Add minimal row for forced ticker (will be force-included in top 75 later)
+                        force_row = {
+                            'ticker': test_ticker,
+                            'net_gamma': 0.0,  # Low score OK - we force into top 75 anyway
+                            'net_flow': 0.0,
+                            'dp_total': 0.0
+                        }
+                        df_bot = pd.concat([df_bot, pd.DataFrame([force_row])], ignore_index=True)
+                        print(f"    → Added {test_ticker} (will be force-included in pattern analysis)")
+        # --- END VALIDATION SUITE ---
+
+        if not df_bot.empty:
+            target_gamma = 'authentic_gamma' if 'authentic_gamma' in df_bot.columns else 'net_gamma'
+            if target_gamma in df_bot.columns:
+                 if 'sector' in df_bot.columns:
+                     valid = df_bot.dropna(subset=['sector'])
+                     self.sector_map_local.update(dict(zip(valid['ticker'], valid['sector'])))
+                 agg = {target_gamma: 'sum', 'equity_type': 'first', 'adj_iv': 'mean'}
+                 if 'open_interest' in df_bot.columns: agg['open_interest'] = 'sum'
+                 if 'net_delta' in df_bot.columns: agg['net_delta'] = 'sum'
+                 greeks_stats = df_bot.groupby('ticker').agg(agg).rename(columns={target_gamma: 'net_gamma'})
+
+        dfs = [d for d in [dp_stats, flow_stats, oi_stats, greeks_stats] if not d.empty]
+        if not dfs: return pd.DataFrame()
+        full_df = dfs[0]
+        for d in dfs[1:]: full_df = pd.merge(full_df, d, how='outer', left_index=True, right_index=True)
+        self.full_df = full_df.reset_index().rename(columns={'index': 'ticker'}).fillna(0)
+
+        self.get_market_regime()
+        self.full_df = self.generate_temporal_features(self.full_df)
+        self.train_run_transformer()
+        return self.full_df
+
+    def calculate_technicals(self, history_df):
+        if len(history_df) < 50: return None
+        close = history_df['Close']
+        if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+        sma20 = close.rolling(20).mean()
+        sma50 = close.rolling(50).mean()
+        trend_score = (close - sma20) / (sma20 + 1e-9)
+        volatility = close.pct_change().rolling(20).std()
+        dist_sma50 = (close.iloc[-1] - sma50.iloc[-1]) / sma50.iloc[-1]
+        div_score = 0.0
+        if len(close) > 15:
+            y_p = close.iloc[-10:].values
+            y_r = rsi.iloc[-10:].values
+            if y_p[-1] > y_p[0] and y_r[-1] < y_r[0]: div_score = 1.0
+
+        return {
+            'rsi': float(rsi.iloc[-1]),
+            'trend_score': float(trend_score.iloc[-1]),
+            'volatility': float(volatility.iloc[-1]),
+            'flag_score': 0.0,
+            'divergence_score': float(div_score),
+            'sma_alignment': 1 if sma20.iloc[-1] > sma50.iloc[-1] else 0,
+            'lagged_return_5d': float((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) if len(close) > 6 else 0.0,
+            'current_price': float(close.iloc[-1]),
+            'dist_sma50': float(dist_sma50)
+        }
+
+    def enrich_market_data(self, flow_df):
+        print("\n[2/4] Enriching with Price History (Deep Mode via Alpaca)...")
+        if flow_df.empty: return self.full_df
+
+        # Fetch Sector Data
+        try:
+            self.fetch_sector_history()
+        except: pass
+
+        cached_data = {}
+        if os.path.exists(self.price_cache_file):
+            try:
+                df_cache = pd.read_csv(self.price_cache_file)
+                cached_data = df_cache.set_index('ticker').to_dict('index')
+            except: pass
+
+        if 'ticker' not in flow_df.columns: return flow_df
+        tickers = flow_df['ticker'].unique().tolist()
+
+        # Filter: only fetch what we don't have in cache
+        to_fetch = [t for t in tickers if t not in cached_data and len(str(t)) < 8 and str(t) != 'nan']
+
+        # FIX: Prioritize validation tickers to ensure they're always fetched
+        # Even if we hit the 3000 limit, these tickers must be included
+        # Also add validation tickers even if not in flow_df (ensures price data exists)
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            # Add validation tickers that aren't in flow_df but need price data
+            missing_from_flow = [t for t in priority_tickers if t not in tickers and t not in cached_data]
+            if missing_from_flow:
+                print(f"  [FETCH] Adding validation tickers missing from flow data: {missing_from_flow}")
+                to_fetch = missing_from_flow + to_fetch
+
+            # Move priority tickers to front of list
+            priority_in_fetch = [t for t in priority_tickers if t in to_fetch]
+            other_tickers = [t for t in to_fetch if t not in priority_tickers]
+            to_fetch = priority_in_fetch + other_tickers
+            if priority_in_fetch:
+                print(f"  [FETCH] Prioritized {len(priority_in_fetch)} validation tickers: {priority_in_fetch}")
+
+        # Limit downloads for performance
+        max_fetch = PERFORMANCE_CONFIG.get('max_tickers_to_fetch', 3000)
+        if len(to_fetch) > max_fetch:
+            print(f"  [FETCH] Limiting from {len(to_fetch)} to {max_fetch} tickers for performance")
+            to_fetch = to_fetch[:max_fetch]
+
+        if to_fetch:
+            print(f"  [FETCH] Downloading {len(to_fetch)} tickers via Alpaca...")
+
+            # Use global Alpaca helper to fetch 3 months of data
+            start_date_3mo = datetime.now() - timedelta(days=90)
+            fetched_data = fetch_alpaca_batch(to_fetch, start_date=start_date_3mo)
+
+            for ticker, hist in fetched_data.items():
+                try:
+                    metrics = self.calculate_technicals(hist)
+                    if metrics:
+                        cached_data[ticker] = metrics
+                except Exception as e:
+                    pass
+
+            # Save updated cache
+            try:
+                pd.DataFrame.from_dict(cached_data, orient='index').reset_index().rename(columns={'index':'ticker'}).to_csv(self.price_cache_file, index=False)
+                print(f"  [FETCH] Updated cache with {len(fetched_data)} new tickers.")
+            except: pass
+
+        self.market_breadth = self.calculate_market_breadth(cached_data)
+        tech_df = pd.DataFrame.from_dict(cached_data, orient='index').reset_index().rename(columns={'index':'ticker'})
+
+        if tech_df.empty:
+            self.full_df = flow_df.copy()
+            for c in ['trend_score', 'rsi']: self.full_df[c] = 0
+            return self.full_df
+
+        final_df = pd.merge(flow_df, tech_df, on='ticker', how='left')
+        self.full_df = final_df[final_df['rsi'].notna()].fillna(0)
+
+        # FIX: Ensure validation tickers are in full_df even if missing from flow data
+        # This handles cases where LULU isn't in the daily bot-eod-report but we have price data
+        if ENABLE_VALIDATION_MODE:
+            priority_tickers = (
+                VALIDATION_SUITE.get('institutional_phoenix', []) +
+                VALIDATION_SUITE.get('speculative_phoenix', [])
+            )
+            for ticker in priority_tickers:
+                if ticker not in self.full_df['ticker'].values and ticker in tech_df['ticker'].values:
+                    # Create synthetic row with price data only (no flow data)
+                    ticker_tech = tech_df[tech_df['ticker'] == ticker].iloc[0].to_dict()
+                    # Add default flow columns
+                    for col in self.full_df.columns:
+                        if col not in ticker_tech:
+                            ticker_tech[col] = 0
+                    ticker_tech['ticker'] = ticker
+                    self.full_df = pd.concat([self.full_df, pd.DataFrame([ticker_tech])], ignore_index=True)
+                    print(f"  [VALIDATION] Added {ticker} to candidate pool (price data only, no flow data)")
+
+        return self.full_df
+
+    def train_model(self, force_retrain=False):
+        """
+        Phase 3: Diverse Ensemble with Architectural Diversity
+        CatBoost (trees) + TabNet (attention) + TCN (temporal) + ElasticNet (linear)
+        Target: 0.945-0.955 AUC through cognitive diversity, not quantity
+        """
+        if self.full_df.empty: return
+
+        import joblib
+        import json
+
+        # --- ENSEMBLE CACHE CHECK ---
+        cache_duration_days = PERFORMANCE_CONFIG.get('model_cache_days', 7)
+        meta_metadata_path = self.meta_learner_path.replace('.pkl', '_metadata.json')
+
+        # Check if ALL ensemble components are cached (Phase 3: new model paths)
+        all_cached = all([
+            os.path.exists(self.catboost_path),
+            os.path.exists(self.tabnet_path),
+            os.path.exists(self.tcn_path),
+            os.path.exists(self.elasticnet_path),
+            os.path.exists(self.meta_learner_path),
+            os.path.exists(meta_metadata_path)
+        ])
+
+        should_use_cache = False
+        if not force_retrain and all_cached:
+            try:
+                model_age_seconds = time.time() - os.path.getmtime(self.meta_learner_path)
+                model_age_days = model_age_seconds / (24 * 3600)
+
+                with open(meta_metadata_path, 'r') as f:
+                    metadata = json.load(f)
+
+                cached_regime = metadata.get('market_regime', 'Unknown')
+                current_regime = self.market_regime
+
+                if model_age_days <= cache_duration_days and cached_regime == current_regime:
+                    should_use_cache = True
+                    print(f"\n[3/4] Loading Cached Diverse Ensemble (Age: {model_age_days:.1f}d, Regime: {current_regime})...")
+                elif cached_regime != current_regime:
+                    print(f"\n[3/4] Regime Changed ({cached_regime} → {current_regime}), Retraining...")
+                else:
+                    print(f"\n[3/4] Ensemble Expired (Age: {model_age_days:.1f}d > {cache_duration_days}d), Retraining...")
+            except Exception as e:
+                print(f"\n[3/4] Cache validation failed ({e}), Retraining...")
+                should_use_cache = False
+
+        if should_use_cache:
+            try:
+                # Set up device for TCN loading
+                import torch
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+                # Load CatBoost (required)
+                catboost_cache = joblib.load(self.catboost_path)
+                self.catboost_model = catboost_cache['model']
+                self.imputer = catboost_cache['imputer']
+                self.scaler = catboost_cache['scaler']
+                self.features_list = catboost_cache['features_list']
+
+                # Load TabNet (optional)
+                if os.path.exists(self.tabnet_path):
+                    tabnet_cache = joblib.load(self.tabnet_path)
+                    self.tabnet_model = tabnet_cache['model']
+
+                # Load TCN (optional) - reconstruct model and load state dict with seq params
+                if os.path.exists(self.tcn_path):
+                    tcn_cache = torch.load(self.tcn_path, map_location=device, weights_only=False)
+                    self.tcn_n_features = tcn_cache.get('input_size', 6)
+                    self.tcn_seq_len = tcn_cache.get('seq_len', 10)
+                    self.tcn_model = TCN(input_size=self.tcn_n_features, num_channels=[32, 32, 16]).to(device)
+                    self.tcn_model.load_state_dict(tcn_cache['model_state'])
+                    self.tcn_model.eval()
+
+                # Load ElasticNet (optional)
+                if os.path.exists(self.elasticnet_path):
+                    elasticnet_cache = joblib.load(self.elasticnet_path)
+                    self.elasticnet_model = elasticnet_cache['model']
+
+                # Load meta-learner
+                meta_cache = joblib.load(self.meta_learner_path)
+                self.meta_learner = meta_cache['model']
+                self.model_trained = True
+
+                ensemble_auc = metadata.get('ensemble_auc', 'N/A')
+                print(f"  [ENSEMBLE] Loaded cached diverse ensemble (AUC: {ensemble_auc})")
+                print(f"  [ENSEMBLE] Models: {metadata.get('models_available', ['CB'])}")
+                return
+            except Exception as e:
+                print(f"  [!] Cache load failed ({e}), Training from scratch...")
+
+        # --- PREPARE DATA WITH TRIPLE-BARRIER LABELS ---
+        # GPU MEMORY SAFEGUARD (v11.5.1): Clear any residual GPU memory before ensemble training
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
+        print("\n[3/4] Training Diverse Ensemble (CatBoost + TabNet + TCN + ElasticNet)...")
+
+        # Phase 4: Triple-Barrier Labeling for realistic trade outcomes
+        use_triple_barrier = True
+        try:
+            price_df = self.history_mgr.db.get_price_df()
+            if not price_df.empty and 'ticker' in self.full_df.columns:
+                tickers = self.full_df['ticker'].unique().tolist()
+                print(f"  [LABELS] Generating Triple-Barrier labels for {len(tickers)} tickers...")
+
+                # Generate triple-barrier labels
+                tb_labels = triple_barrier_labels(
+                    price_df, tickers,
+                    holding_period=5,
+                    pt_multiplier=1.5,  # TP at 1.5x ATR
+                    sl_multiplier=1.0,  # SL at 1.0x ATR
+                    vol_lookback=20
+                )
+
+                if not tb_labels.empty:
+                    # Get latest label per ticker for current training
+                    latest_labels = tb_labels.sort_values('date').groupby('ticker').last().reset_index()
+                    # Convert -1 labels to 0 for binary classification
+                    latest_labels['target'] = (latest_labels['label'] == 1).astype(int)
+
+                    # Merge with full_df
+                    self.full_df = self.full_df.merge(
+                        latest_labels[['ticker', 'target']],
+                        on='ticker',
+                        how='left',
+                        suffixes=('_old', '')
+                    )
+                    self.full_df['target'] = self.full_df['target'].fillna(0).astype(int)
+
+                    # Stats
+                    tp_pct = (tb_labels['barrier_hit'] == 'TP').mean() * 100
+                    sl_pct = (tb_labels['barrier_hit'] == 'SL').mean() * 100
+                    time_pct = (tb_labels['barrier_hit'] == 'TIME').mean() * 100
+                    print(f"  [LABELS] Triple-Barrier stats: TP={tp_pct:.1f}% SL={sl_pct:.1f}% TIME={time_pct:.1f}%")
+                else:
+                    use_triple_barrier = False
+            else:
+                use_triple_barrier = False
+        except Exception as e:
+            print(f"  [!] Triple-Barrier labeling failed ({e}), using fallback")
+            use_triple_barrier = False
+
+        # Fallback to simple binary labels
+        if not use_triple_barrier:
+            print(f"  [LABELS] Using simple 5-day return labels (fallback)")
+            if 'lagged_return_5d' not in self.full_df.columns:
+                self.full_df['lagged_return_5d'] = 0.0
+            self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
+
+        if self.full_df['target'].nunique() < 2: return
+
+        tech_feats = ['rsi', 'trend_score', 'volatility', 'sma_alignment', 'divergence_score', 'dist_sma50']
+        flow_feats = ['dp_sentiment', 'net_flow', 'avg_iv', 'net_gamma', 'oi_change', 'dp_total']
+        temporal_feats = ['gamma_velocity', 'oi_accel']
+        neural_feats = ['nn_score']
+
+        all_possible = tech_feats + flow_feats + temporal_feats + neural_feats
+        self.features_list = [f for f in all_possible if f in self.full_df.columns]
+
+        X = self.full_df[self.features_list]
+        y = self.full_df['target']
+        X_clean = self.imputer.fit_transform(X)
+        X_scaled = self.scaler.fit_transform(X_clean)
+
+        # Configuration
+        n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 25)
+        max_iterations = PERFORMANCE_CONFIG.get('catboost_max_iterations', 500)
+        max_depth = PERFORMANCE_CONFIG.get('catboost_max_depth', 10)
+        cv_folds = PERFORMANCE_CONFIG.get('catboost_cv_folds', 5)
+
+        # Detect GPU availability
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+            gpu_count = torch.cuda.device_count() if has_gpu else 0
+            if has_gpu:
+                print(f"  [GPU] Detected {gpu_count} GPU(s): {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"  [GPU] No GPU detected, using CPU")
+        except:
+            has_gpu = False
+            print(f"  [GPU] GPU detection failed, using CPU")
+
+        # --- LEVEL 1: TRAIN BASE MODELS WITH GPU ---
+        print(f"  [LEVEL-1] Training 3 base models ({n_trials} trials each)...")
+
+        # 1. CatBoost with GPU
+        print(f"  [CATBOOST] Tuning with {'GPU' if has_gpu else 'CPU'}...")
+        def catboost_objective(trial):
+            param = {
+                'iterations': trial.suggest_int('iterations', 150, max_iterations),
+                'depth': trial.suggest_int('depth', 5, max_depth),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+                'border_count': trial.suggest_int('border_count', 32, 255),
+                'task_type': 'GPU' if has_gpu else 'CPU',
+                'devices': '0' if has_gpu else None,
+                'early_stopping_rounds': 50,
+                'logging_level': 'Silent'
+            }
+            if not has_gpu:
+                param['thread_count'] = -1
+            model = CatBoostClassifier(**param)
+            return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
+
+        try:
+            study_cb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+            study_cb.optimize(catboost_objective, n_trials=n_trials, show_progress_bar=False)
+
+            best_cb_params = study_cb.best_params.copy()
+            best_cb_params['task_type'] = 'GPU' if has_gpu else 'CPU'
+            if has_gpu:
+                best_cb_params['devices'] = '0'
+            else:
+                best_cb_params['thread_count'] = -1
+            best_cb_params['early_stopping_rounds'] = 50
+            best_cb_params['logging_level'] = 'Silent'
+
+            self.catboost_model = CatBoostClassifier(**best_cb_params)
+            self.catboost_model.fit(X_scaled, y, verbose=False)
+            catboost_auc = study_cb.best_value
+            print(f"  [CATBOOST] AUC: {catboost_auc:.4f} (iter={best_cb_params.get('iterations')}, depth={best_cb_params.get('depth')})")
+        except Exception as e:
+            print(f"  [!] CatBoost training failed: {e}")
+            self.model_trained = False
+            return
+
+        # 2. TabNet (Attention-based feature interactions) - replaces LightGBM
+        tabnet_auc = 0.0
+        if TABNET_AVAILABLE:
+            print(f"  [TABNET] Training attention-based model...")
+            try:
+                # TabNet hyperparameters (attention mechanism for feature selection)
+                self.tabnet_model = TabNetClassifier(
+                    n_d=16, n_a=16,  # Width of decision/attention layers
+                    n_steps=3,  # Number of sequential attention steps
+                    gamma=1.5,  # Coefficient for feature reuse in attention
+                    lambda_sparse=1e-4,  # Sparsity regularization
+                    optimizer_fn=torch.optim.Adam,
+                    optimizer_params=dict(lr=2e-2),
+                    scheduler_params={"step_size": 10, "gamma": 0.9},
+                    scheduler_fn=torch.optim.lr_scheduler.StepLR,
+                    mask_type='entmax',  # sparsemax or entmax for attention
+                    device_name='cuda' if has_gpu else 'cpu',
+                    verbose=0
+                )
+                # TabNet needs validation set for early stopping
+                X_train_tn, X_val_tn, y_train_tn, y_val_tn = train_test_split(
+                    X_scaled, y, test_size=0.2, random_state=43, stratify=y
+                )
+                self.tabnet_model.fit(
+                    X_train_tn, y_train_tn,
+                    eval_set=[(X_val_tn, y_val_tn)],
+                    eval_metric=['auc'],
+                    max_epochs=100,
+                    patience=15,
+                    batch_size=256
+                )
+                # Calculate AUC on validation set
+                tabnet_preds = self.tabnet_model.predict_proba(X_val_tn)[:, 1]
+                tabnet_auc = roc_auc_score(y_val_tn, tabnet_preds)
+                print(f"  [TABNET] AUC: {tabnet_auc:.4f} (attention-based feature interactions)")
+            except Exception as e:
+                print(f"  [!] TabNet training failed: {e}, using fallback")
+                self.tabnet_model = None
+        else:
+            print(f"  [TABNET] Not available, skipping (install: pip install pytorch-tabnet)")
+
+        # GPU MEMORY CLEANUP after TabNet (v11.5.1): Free memory before TCN
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
+
+        # 3. TCN (Temporal CNN for sequential patterns) - replaces XGBoost
+        # FIXED: Now uses REAL sequential data instead of fake repeated snapshots
+        tcn_auc = 0.0
+        self.tcn_seq_len = 10  # Store for inference
+        self.tcn_n_features = 6  # 6 temporal features
+        print(f"  [TCN] Training temporal convolutional network with REAL sequences...")
+        try:
+            device = torch.device('cuda' if has_gpu else 'cpu')
+
+            # Get price data for real sequence generation
+            price_df = self.history_mgr.db.get_price_df()
+            if price_df.empty:
+                raise ValueError("No price data available for TCN sequences")
+
+            # Get tickers from current data
+            tickers = self.full_df['ticker'].unique().tolist() if 'ticker' in self.full_df.columns else []
+            if not tickers:
+                raise ValueError("No tickers available for TCN sequences")
+
+            # v11.5 FIX: Sample tickers BEFORE sequence generation to prevent OOM
+            # Each ticker generates ~350 sequences on average, so for 50K limit we need ~140 tickers
+            max_tickers_for_tcn = 150  # ~52K sequences max
+            if len(tickers) > max_tickers_for_tcn:
+                import random
+                random.seed(42)  # Reproducibility
+                tickers = random.sample(tickers, max_tickers_for_tcn)
+                print(f"  [TCN] Sampled {max_tickers_for_tcn} tickers for memory efficiency")
+
+            # Generate REAL sequential data (not fake repeated snapshots)
+            print(f"  [TCN] Building temporal sequences for {len(tickers)} tickers...")
+            X_seq_np, y_seq_np, tcn_tickers = prepare_tcn_sequences(
+                price_df, self.full_df, tickers,
+                seq_len=self.tcn_seq_len
+            )
+
+            if X_seq_np is None or len(X_seq_np) < 100:
+                raise ValueError(f"Insufficient sequence data: {len(X_seq_np) if X_seq_np is not None else 0} samples")
+
+            print(f"  [TCN] Created {len(X_seq_np)} real sequences (shape: {X_seq_np.shape})")
+            self.tcn_n_features = X_seq_np.shape[2]
+
+            # Train/val split (on numpy arrays to save memory)
+            split_idx = int(len(X_seq_np) * 0.8)
+            X_train_np, X_val_np = X_seq_np[:split_idx], X_seq_np[split_idx:]
+            y_train_np, y_val_np = y_seq_np[:split_idx], y_seq_np[split_idx:]
+
+            # Create DataLoader for memory-efficient batch training
+            from torch.utils.data import TensorDataset, DataLoader
+            train_dataset = TensorDataset(
+                torch.FloatTensor(X_train_np),
+                torch.FloatTensor(y_train_np).unsqueeze(1)
+            )
+            train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
+
+            # Validation tensors (smaller, can fit in memory)
+            X_val_tcn = torch.FloatTensor(X_val_np)
+            y_val_tcn = torch.FloatTensor(y_val_np).unsqueeze(1)
+
+            # Initialize TCN model with correct feature size
+            self.tcn_model = TCN(
+                input_size=self.tcn_n_features,
+                num_channels=[32, 32, 16],
+                kernel_size=3,
+                dropout=0.2
+            ).to(device)
+            optimizer = torch.optim.Adam(self.tcn_model.parameters(), lr=0.001)
+            criterion = nn.BCELoss()
+
+            # Training loop with early stopping and batch training
+            best_val_loss, patience_counter = float('inf'), 0
+            for epoch in range(50):
+                self.tcn_model.train()
+                epoch_loss = 0.0
+                for batch_X, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = self.tcn_model(batch_X.to(device))
+                    loss = criterion(outputs, batch_y.to(device))
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
+
+                # Validation
+                self.tcn_model.eval()
+                with torch.no_grad():
+                    val_out = self.tcn_model(X_val_tcn.to(device))
+                    val_loss = criterion(val_out, y_val_tcn.to(device)).item()
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= 10: break
+
+            # Calculate AUC
+            self.tcn_model.eval()
+            with torch.no_grad():
+                tcn_preds = self.tcn_model(X_val_tcn.to(device)).cpu().numpy().flatten()
+            tcn_auc = roc_auc_score(y_val_tcn.numpy().flatten(), tcn_preds)
+            print(f"  [TCN] AUC: {tcn_auc:.4f} (real temporal pattern detection)")
+        except Exception as e:
+            print(f"  [!] TCN training failed: {e}, using fallback")
+            self.tcn_model = None
+
+        # GPU MEMORY CLEANUP after TCN (v11.5.1): Free memory before meta-learner
+        try:
+            torch.cuda.empty_cache()
+            gc.collect()
+        except:
+            pass
+
+        # 4. ElasticNet (Linear regularized baseline) - sanity check
+        elasticnet_auc = 0.0
+        print(f"  [ELASTICNET] Training linear baseline...")
+        try:
+            from sklearn.linear_model import LogisticRegression
+            # Use LogisticRegression with elasticnet penalty (L1+L2)
+            self.elasticnet_model = LogisticRegression(
+                penalty='elasticnet', solver='saga', l1_ratio=0.5,
+                max_iter=1000, random_state=44, n_jobs=-1
+            )
+            self.elasticnet_model.fit(X_scaled, y)
+            en_preds = cross_val_score(self.elasticnet_model, X_scaled, y, cv=cv_folds, scoring='roc_auc')
+            elasticnet_auc = en_preds.mean()
+            print(f"  [ELASTICNET] AUC: {elasticnet_auc:.4f} (linear regularized baseline)")
+        except Exception as e:
+            print(f"  [!] ElasticNet training failed: {e}")
+            self.elasticnet_model = None
+
+        # --- LEVEL 2: TRAIN META-LEARNER (4 Diverse Models) ---
+        print(f"  [LEVEL-2] Training meta-learner with diverse ensemble...")
+        from sklearn.model_selection import cross_val_predict
+
+        # CatBoost predictions (always available)
+        catboost_preds = cross_val_predict(self.catboost_model, X_scaled, y, cv=cv_folds, method='predict_proba')[:, 1]
+        model_names, preds_list = ['CB'], [catboost_preds]
+
+        # TabNet predictions (if available)
+        if self.tabnet_model is not None:
+            tabnet_preds = self.tabnet_model.predict_proba(X_scaled)[:, 1]
+            preds_list.append(tabnet_preds)
+            model_names.append('TN')
+
+        # TCN predictions - SKIP in meta-learner training
+        # TCN uses 6 temporal features from price history, not X_scaled's 15 features
+        # TCN is used during inference when we have real price history available
+        # Including it in meta-learner would require re-generating sequences for ALL tickers
+        # which is memory-intensive and defeats the purpose of the sampled training
+        if self.tcn_model is not None:
+            print(f"  [TCN] Skipping in meta-learner (uses separate temporal features during inference)")
+
+        # ElasticNet predictions (if available)
+        if self.elasticnet_model is not None:
+            elasticnet_preds = self.elasticnet_model.predict_proba(X_scaled)[:, 1]
+            preds_list.append(elasticnet_preds)
+            model_names.append('EN')
+
+        # Stack all available model predictions
+        X_meta = np.column_stack(preds_list)
+
+        # Train LogisticRegression meta-learner
+        self.meta_learner = LogisticRegression(max_iter=1000, random_state=42)
+        self.meta_learner.fit(X_meta, y)
+
+        # Calculate ensemble AUC
+        meta_preds = self.meta_learner.predict_proba(X_meta)[:, 1]
+        ensemble_auc = roc_auc_score(y, meta_preds)
+
+        # Display weights for available models
+        weights_str = ', '.join([f"{name}={self.meta_learner.coef_[0][i]:.3f}" for i, name in enumerate(model_names)])
+        print(f"  [META-LEARNER] Ensemble AUC: {ensemble_auc:.4f}")
+        print(f"  [META-LEARNER] Weights: {weights_str}")
+
+        self.model_trained = True
+
+        # --- SAVE ALL ENSEMBLE COMPONENTS ---
+        try:
+            # CatBoost cache
+            joblib.dump({
+                'model': self.catboost_model,
+                'imputer': self.imputer,
+                'scaler': self.scaler,
+                'features_list': self.features_list,
+                'auc': catboost_auc,
+                'params': best_cb_params
+            }, self.catboost_path)
+
+            # TabNet cache (if trained)
+            if self.tabnet_model is not None:
+                joblib.dump({'model': self.tabnet_model, 'auc': tabnet_auc}, self.tabnet_path)
+
+            # TCN cache (if trained) - save as PyTorch state dict with sequence params
+            if self.tcn_model is not None:
+                torch.save({
+                    'model_state': self.tcn_model.state_dict(),
+                    'auc': tcn_auc,
+                    'input_size': self.tcn_n_features,
+                    'seq_len': self.tcn_seq_len
+                }, self.tcn_path)
+
+            # ElasticNet cache (if trained)
+            if self.elasticnet_model is not None:
+                joblib.dump({'model': self.elasticnet_model, 'auc': elasticnet_auc}, self.elasticnet_path)
+
+            # Meta-learner cache (includes model names for prediction ordering)
+            joblib.dump({'model': self.meta_learner, 'model_names': model_names}, self.meta_learner_path)
+
+            # Metadata
+            metadata = {
+                'timestamp': time.time(),
+                'market_regime': self.market_regime,
+                'ensemble_auc': float(ensemble_auc),
+                'catboost_auc': float(catboost_auc),
+                'tabnet_auc': float(tabnet_auc),
+                'tcn_auc': float(tcn_auc),
+                'elasticnet_auc': float(elasticnet_auc),
+                'gpu_used': has_gpu,
+                'models_available': model_names
+            }
+            with open(meta_metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            print(f"  [ENSEMBLE] All models cached (expires in {cache_duration_days} days or on regime change)")
+        except Exception as e:
+            print(f"  [!] Ensemble caching failed: {e}")
+
+    def predict(self):
+        if self.full_df.empty: return None
+        print("\n[4/4] Generating Predictions with Pattern Intelligence...")
+        df = self.full_df.copy()
+
+        # --- BASE SCORE FROM ENSEMBLE STACK ---
+        if self.model_trained:
+            X = self.full_df[self.features_list]
+            X_clean = self.imputer.transform(X)
+            X_scaled = self.scaler.transform(X_clean)
+
+            # Get predictions from diverse ensemble (CatBoost + TabNet + TCN + ElasticNet)
+            preds_list = [self.catboost_model.predict_proba(X_scaled)[:, 1]]  # CatBoost always available
+
+            if self.tabnet_model is not None:
+                preds_list.append(self.tabnet_model.predict_proba(X_scaled)[:, 1])
+
+            # TCN is NOT included in meta-learner ensemble
+            # It uses different features (6 temporal vs 15 tabular) and was trained separately
+            # The meta-learner expects [CB, TN, EN] predictions only
+            # TCN could be used as a standalone signal boost in the future if needed
+
+            if self.elasticnet_model is not None:
+                preds_list.append(self.elasticnet_model.predict_proba(X_scaled)[:, 1])
+
+            # Stack predictions for meta-learner
+            X_meta = np.column_stack(preds_list)
+
+            # Get final ensemble prediction from meta-learner
+            probs = self.meta_learner.predict_proba(X_meta)[:, 1]
+            df['raw_score'] = probs
+        else:
+            df['raw_score'] = 0.5
+
+        # --- v11.0 DUAL-RANKING ARCHITECTURE ---
+        # Create separate scores for Alpha Momentum vs Phoenix Reversals
+        # These are NOT the same as the old trend/ambush scores - they use different formulas
+        print("  [v11.2] Initializing Dual-Ranking Architecture...")
+
+        # --- ALPHA MOMENTUM SCORE (for continuation/trending plays) ---
+        # Formula: Heavy weight on ML prediction + trend + volume momentum
+        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
+
+        # Base from ML ensemble (25% weight)
+        df['alpha_momentum_score'] = df['raw_score'] * 100 * alpha_config['weight_ml']
+
+        # Trend component (30% weight) - based on RSI and price action
+        if 'rsi' in df.columns:
+            # RSI 50-70 is optimal for momentum (not overbought, not oversold)
+            rsi_score = df['rsi'].apply(lambda x: 100 if 50 <= x <= 70 else max(0, 100 - abs(x - 60) * 2))
+            df['alpha_momentum_score'] += rsi_score * alpha_config['weight_trend']
+
+        # Neural network component (15% weight)
+        if 'nn_score' in df.columns:
+            df['alpha_momentum_score'] += df['nn_score'] * alpha_config['weight_neural']
+
+        # Volume momentum component (15% weight)
+        if 'gamma_velocity' in df.columns:
+            vol_momentum = df['gamma_velocity'].clip(0, 100)
+            df['alpha_momentum_score'] += vol_momentum * alpha_config['weight_volume']
+
+        # --- PHOENIX REVERSAL SCORE (for base breakout/reversal plays) ---
+        # Formula: Heavy weight on solidity + duration + institutional flow, LESS on ML
+        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal']
+
+        # Base from ML ensemble (12% weight - LOWER than alpha, ML is momentum-biased)
+        df['phoenix_reversal_score'] = df['raw_score'] * 100 * phoenix_config['weight_ml']
+
+        # Institutional flow component (20% weight)
+        if 'dp_total' in df.columns:
+            # Scale DP total to 0-100 (log scale for mega-prints)
+            import math
+            dp_score = df['dp_total'].apply(lambda x: min(100, math.log10(max(x, 1)) * 10) if x > 0 else 0)
+            df['phoenix_reversal_score'] += dp_score * phoenix_config['weight_flow']
+
+        # Net gamma contribution to institutional flow
+        if 'net_gamma' in df.columns:
+            gamma_contribution = df['net_gamma'].apply(lambda x: min(50, abs(x) / 10000))
+            df['phoenix_reversal_score'] += gamma_contribution * (phoenix_config['weight_flow'] / 2)
+
+        # Keep old trend/ambush scores for backwards compatibility
+        df['trend_score_val'] = df['raw_score'] * 85
+        df['ambush_score_val'] = df['raw_score'] * 80
+
+        # --- FLOW SUPPORT CHECK ---
+        flow_support = pd.Series(False, index=df.index)
+        if 'net_gamma' in df.columns:
+            flow_support |= (df['net_gamma'].abs() > 50)
+        if 'dp_total' in df.columns:
+            flow_support |= (df['dp_total'] > 1_000_000)
+        df.loc[~flow_support, 'trend_score_val'] -= 40
+        df.loc[~flow_support, 'ambush_score_val'] -= 40
+        # Phoenix doesn't penalize low flow as heavily (reversals start with low activity)
+        df.loc[~flow_support, 'phoenix_reversal_score'] -= 10
+
+        # --- NEURAL NETWORK BOOST ---
+        if 'nn_score' in df.columns:
+            boost = (df['nn_score'] - 50) * 0.5
+            df['trend_score_val'] += boost
+            df['ambush_score_val'] += boost
+
+        # --- GAMMA VELOCITY BOOST ---
+        if 'gamma_velocity' in df.columns:
+            df.loc[df['gamma_velocity'] > 50, 'trend_score_val'] += 5
+            df.loc[df['gamma_velocity'] > 50, 'alpha_momentum_score'] += 5
+
+        # --- MACRO ADJUSTMENT (Phase 9) ---
+        macro_adj = self.macro_data.get('adjustment', 0)
+        if macro_adj != 0:
+            print(f"  [MACRO] Applying {macro_adj:+.1f} point adjustment to all scores")
+            df['trend_score_val'] += macro_adj
+            df['ambush_score_val'] += macro_adj
+            df['alpha_momentum_score'] += macro_adj
+            df['phoenix_reversal_score'] += macro_adj
+
+        # --- TITAN EXECUTION LAYER (ATR STOP/PROFIT) ---
+        price_db = self.history_mgr.db.get_price_df()
+        price_lookup = price_db.set_index(['ticker', 'date'])['atr'].to_dict() if not price_db.empty else {}
+
+        # Fallback ATR if not in DB
+        if 'volatility' in df.columns and 'current_price' in df.columns:
+            df['atr'] = df['volatility'] * df['current_price'] * 2  # Crude approx
+        else:
+            df['atr'] = 0
+
+        if 'current_price' in df.columns:
+            df['stop_loss'] = df['current_price'] - (2.5 * df['atr'])
+            df['take_profit'] = df['current_price'] + (4.0 * df['atr'])
+        else:
+            df['stop_loss'] = 0
+            df['take_profit'] = 0
+
+        # --- INITIAL RANKING ---
+        df['max_score'] = df[['trend_score_val', 'ambush_score_val']].max(axis=1)
+        df = df.sort_values('max_score', ascending=False)
+        top_candidates = df.head(75).copy()
+
+        # --- v10.6 CRITICAL FIX: Force validation tickers into top candidates ---
+        # Without this, validation tickers with low ML scores (from zero features) never reach pattern analysis
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = (
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
+            )
+            forced_count = 0
+            for ticker in validation_tickers:
+                if ticker not in top_candidates['ticker'].values:
+                    # Find ticker in full df
+                    ticker_row = df[df['ticker'] == ticker]
+                    if not ticker_row.empty:
+                        top_candidates = pd.concat([top_candidates, ticker_row], ignore_index=True)
+                        forced_count += 1
+                        # Debug: Show LULU's actual ML score and rank
+                        if ticker == 'LULU':
+                            lulu_score = ticker_row.iloc[0].get('max_score', 0)
+                            lulu_rank = (df['max_score'] > lulu_score).sum() + 1
+                            print(f"  [VALIDATION] LULU ML score: {lulu_score:.2f}, rank: {lulu_rank}/{len(df)}")
+                    else:
+                        print(f"  [VALIDATION] ⚠️  {ticker} not in candidate pool (may be missing from data)")
+
+            if forced_count > 0:
+                print(f"  [VALIDATION] Force-added {forced_count} validation tickers to pattern analysis (bypassing top 75 filter)")
+        # --- END v10.6 FIX ---
+
+        print(f"  [INFO] Base scoring complete. Running pattern detection on {len(top_candidates)} candidates...")
+
+        # --- PHASE 9: PATTERN DETECTION & EXPLANATION GENERATION ---
+        pattern_results = {}
+        tickers_to_analyze = top_candidates['ticker'].tolist()
+
+
+        print(f"  [PATTERNS] Fetching 2-year price history for {len(tickers_to_analyze)} tickers via Alpaca...")
+
+        # 1. Fetch data using our helper (fast, no sleep needed)
+        start_date_pattern = datetime.now() - timedelta(days=730)
+        price_data = fetch_alpaca_batch(tickers_to_analyze, start_date=start_date_pattern)
+
+        # 2. Validation Debug Output
+        if ENABLE_VALIDATION_MODE:
+            validation_tickers = (
+                VALIDATION_SUITE['institutional_phoenix'] +
+                VALIDATION_SUITE['speculative_phoenix']
+            )
+            for vt in validation_tickers:
+                if vt in tickers_to_analyze:
+                    has_data = vt in price_data
+                    data_len = len(price_data[vt]) if has_data else 0
+                    print(f"  [VALIDATION] {vt} in analysis: data={'✓' if has_data else '✗'} ({data_len} rows)")
+
+
+        # Run pattern detection on each candidate
+        print(f"  [PATTERNS] Analyzing {len(tickers_to_analyze)} tickers for bull flags, GEX walls, and reversals...")
+
+        # GEX Debug: Show overlap between candidates and strike gamma data
+        gex_overlap = [t for t in tickers_to_analyze if t in self.strike_gamma_data]
+        print(f"  [GEX DEBUG] {len(gex_overlap)}/{len(tickers_to_analyze)} candidates have strike gamma data")
+        if gex_overlap and len(gex_overlap) <= 10:
+            for t in gex_overlap[:5]:
+                gamma_vals = list(self.strike_gamma_data[t].values())
+                max_gamma = max(gamma_vals) if gamma_vals else 0
+                print(f"    {t}: {len(gamma_vals)} strikes, max gamma {max_gamma/1000:.0f}K")
+        for idx, row in top_candidates.iterrows():
+            ticker = row['ticker']
+            current_price = row.get('current_price', 0)
+            eq_type = row.get('equity_type', 'Unknown')
+
+            # Get price history for this ticker
+            hist_df = price_data.get(ticker)
+
+            # Run pattern detection
+            patterns = {
+                'bull_flag': self.detect_bull_flag(ticker, hist_df),
+                'gex_wall': self.find_gex_walls(ticker, current_price),
+                'reversal': self.detect_downtrend_reversal(ticker, hist_df),
+                'phoenix': self.detect_phoenix_reversal(ticker, hist_df),
+                'cup_handle': self.detect_cup_and_handle(ticker, hist_df),
+                'double_bottom': self.detect_double_bottom(ticker, hist_df)
+            }
+            pattern_results[ticker] = patterns
+
+            # v10.6: Debug output for validation ticker phoenix results
+            if ENABLE_VALIDATION_MODE:
+                validation_tickers = VALIDATION_SUITE['institutional_phoenix'] + VALIDATION_SUITE['speculative_phoenix']
+                if ticker in validation_tickers:
+                    phoenix = patterns['phoenix']
+                    phoenix_score = phoenix.get('phoenix_score', 0)
+                    is_phoenix = phoenix.get('is_phoenix', False)
+                    explanation = phoenix.get('explanation', 'N/A')[:80]
+                    status = '✓ DETECTED' if is_phoenix else f'✗ Score={phoenix_score:.2f}/0.60'
+                    print(f"  [VALIDATION] {ticker} Phoenix: {status}")
+                    print(f"              → {explanation}")
+
+            # --- PATTERN-BASED SCORE ADJUSTMENTS ---
+            # v11.0: Now updates both legacy scores AND dual-ranking scores
+            # v11.2 FIX: Accumulate phoenix_reversal_score properly (bonuses were overwriting each other!)
+
+            # Initialize accumulators from base values
+            phoenix_accum = row.get('phoenix_reversal_score', 0)
+            alpha_accum = row.get('alpha_momentum_score', 0)
+            trend_accum = row.get('trend_score_val', 0)
+            ambush_accum = row.get('ambush_score_val', 0)
+
+            # Bull flag bonus (MOMENTUM pattern - boosts alpha_momentum_score)
+            flag_score = patterns['bull_flag'].get('flag_score', 0)
+            if flag_score > 0:
+                bonus = flag_score * 10  # Up to 10 point bonus
+                trend_accum += bonus
+                # v11.0: Bull flags are continuation patterns - boost alpha momentum
+                alpha_accum += bonus * 1.5
+
+            # GEX wall protection bonus (supports both strategies)
+            wall_score = patterns['gex_wall'].get('wall_protection_score', 0)
+            if wall_score > 0:
+                bonus = wall_score * 8  # Up to 8 point bonus
+                trend_accum += bonus
+                ambush_accum += bonus
+                alpha_accum += bonus
+                phoenix_accum += bonus * 0.5
+
+            # Reversal setup bonus (for ambush strategy)
+            reversal_score = patterns['reversal'].get('reversal_score', 0)
+            if reversal_score > 0:
+                bonus = reversal_score * 12  # Up to 12 point bonus for ambush
+                ambush_accum += bonus
+                # v11.0: Reversals boost phoenix score
+                phoenix_accum += bonus
+
+            # Phoenix reversal bonus (CRITICAL for v11.0 - major boost to phoenix_reversal_score)
+            phoenix_score = patterns['phoenix'].get('phoenix_score', 0)
+            solidity_score = patterns['phoenix'].get('solidity_score', 0)
+            if phoenix_score > 0:
+                bonus = phoenix_score * 25  # v11.2: Increased from 15 to 25 for legacy scores
+                trend_accum += bonus
+                ambush_accum += bonus * 0.8
+                # v11.0: MAJOR boost to phoenix_reversal_score - this is what fixes LULU ranking
+                phoenix_boost = phoenix_score * 40  # v11.2: Increased from 25 to 40 for proper scaling
+                phoenix_accum += phoenix_boost
+
+            # v11.0: Solidity score bonus (institutional accumulation)
+            if solidity_score > 0.3:
+                solidity_bonus = solidity_score * 20  # v11.2: Increased from 15 to 20 for proper weight
+                phoenix_accum += solidity_bonus
+            top_candidates.at[idx, 'solidity_score'] = solidity_score
+
+            # v11.2: Institutional Duration Bonus (12+ month bases)
+            phoenix_data = patterns.get('phoenix', {})
+            days_in_base = phoenix_data.get('days_in_base', 0)
+            if days_in_base >= 365:  # Institutional threshold (12+ months)
+                duration_bonus = min(20, (days_in_base / 365) * 10)  # Up to 20 pts for 730+ days
+                phoenix_accum += duration_bonus
+
+            # =========================================================================
+            # v11.2: SOLIDITY GATE - Critical fix for false positives (e.g., MU at #1)
+            # =========================================================================
+            # True phoenix reversals REQUIRE clear institutional accumulation.
+            # A stock with high dark pool activity but LOW solidity is likely a
+            # momentum play, not a reversal from consolidation.
+            #
+            # Without this gate: MU with 0.40 solidity scored 99.9 (false positive)
+            # With this gate: MU penalized, LULU with 0.70 solidity remains high
+            # =========================================================================
+            solidity_threshold = SOLIDITY_CONFIG.get('base_threshold', 0.55)
+            if phoenix_score > 0 and solidity_score < solidity_threshold:
+                # Apply 70% penalty - weak solidity = not a true phoenix reversal
+                # This ensures momentum plays don't hijack the phoenix leaderboard
+                penalty_factor = 0.30
+                phoenix_accum = phoenix_accum * penalty_factor
+                # Also reduce legacy scores to maintain consistency
+                trend_accum = trend_accum * 0.7
+                ambush_accum = ambush_accum * 0.7
+
+            # =========================================================================
+            # v11.5.2: MOMENTUM FILTER - Distinguish reversals from momentum plays
+            # =========================================================================
+            # True phoenix reversals emerge from extended consolidation BASES, not
+            # from stocks already trading near their 52-week highs.
+            #
+            # CRITICAL FIX (v11.5.2): High solidity BYPASSES momentum penalty
+            # - NVO (solidity 0.70) was incorrectly filtered despite valid accumulation
+            # - High solidity = institutional conviction validates the breakout thesis
+            # - Only penalize LOW solidity candidates near highs (e.g., MU at 0.40)
+            #
+            # Two-pronged check (with solidity gate):
+            # 1. Near 52w high (within 20%) + LOW solidity = likely momentum, penalize
+            # 2. Far from 52w low (>50% above) + LOW solidity = not a true reversal
+            # =========================================================================
+            pct_from_52w_high = phoenix_data.get('pct_from_52w_high', 0)
+            pct_from_52w_low = phoenix_data.get('pct_from_52w_low', 0)
+            solidity_threshold = 0.55  # Match SOLIDITY_CONFIG base_threshold
+
+            # Check 1: Near 52-week high (only penalize LOW solidity candidates)
+            # High solidity (>= 0.55) = institutional accumulation validates breakout
+            if phoenix_score > 0 and pct_from_52w_high < 0.20 and solidity_score < solidity_threshold:
+                # LOW solidity + near high = likely momentum play, not phoenix
+                # Apply graduated penalty: closer to high = stronger penalty
+                if pct_from_52w_high < 0.10:
+                    momentum_penalty = 0.40  # Very close to high - strong penalty
+                else:
+                    momentum_penalty = 0.60  # 10-20% from high - moderate penalty
+                phoenix_accum = phoenix_accum * momentum_penalty
+                # Boost alpha score instead - this is a momentum play
+                alpha_accum = alpha_accum * 1.2
+
+            # Check 2: Too far from 52-week low (only penalize LOW solidity candidates)
+            # High solidity + price recovery = working thesis, not false positive
+            if phoenix_score > 0 and pct_from_52w_low > 0.50 and solidity_score < solidity_threshold:
+                # LOW solidity + far from low = momentum dressed as phoenix
+                # Apply penalty
+                bottom_penalty = 0.70
+                phoenix_accum = phoenix_accum * bottom_penalty
+
+            # =========================================================================
+            # v11.5.4: SECTOR BETA FILTER - Stock vs Sector Relative Performance
+            # =========================================================================
+            # True phoenix = stock OUTPERFORMING its sector (individual alpha)
+            # Sector beta = stock just MATCHING sector (riding the wave)
+            #
+            # Example:
+            # - LULU/NVO: Up 30% while sector up 10% → 20% outperformance → TRUE PHOENIX
+            # - FCX/KGC: Up 25% while XLB up 25% → 0% outperformance → SECTOR BETA
+            #
+            # This is the correct filter because:
+            # - It doesn't penalize all stocks when sectors are strong
+            # - It specifically catches stocks just riding sector momentum
+            # - True reversals should show INDIVIDUAL strength, not sector correlation
+            # =========================================================================
+            if phoenix_score > 0 and hasattr(self, 'sector_6m_returns') and self.sector_6m_returns:
+                ticker_sector = self.sector_map_local.get(ticker, 'Unknown')
+                sector_etf = SECTOR_MAP.get(ticker_sector)
+
+                if sector_etf and sector_etf in self.sector_6m_returns:
+                    sector_return = self.sector_6m_returns[sector_etf]
+
+                    # Calculate stock's 6-month return from price history
+                    # Use the cached price history from pattern analysis
+                    stock_return = 0.0
+                    if ticker in self.price_history_cache:
+                        hist = self.price_history_cache[ticker]
+                        if len(hist) >= 126:  # ~6 months of trading days
+                            close_col = 'Close' if 'Close' in hist.columns else 'close'
+                            if close_col in hist.columns:
+                                start_price = hist[close_col].iloc[-126]
+                                current_price = hist[close_col].iloc[-1]
+                                stock_return = (current_price - start_price) / start_price if start_price > 0 else 0.0
+
+                    # Calculate relative performance (alpha over sector)
+                    relative_performance = stock_return - sector_return
+
+                    # If stock is UNDERPERFORMING or BARELY MATCHING sector, penalize
+                    # This catches FCX/KGC (matching XLB) but not LULU/NVO (outperforming)
+                    if relative_performance < 0.05:  # Less than 5% outperformance
+                        # Stock is just riding sector momentum - this is beta, not alpha
+                        if relative_performance < -0.05:
+                            # Stock underperforming sector - definitely not a leader
+                            sector_beta_penalty = 0.40  # Heavy penalty
+                        elif relative_performance < 0.0:
+                            # Stock matching sector - likely beta play
+                            sector_beta_penalty = 0.50
+                        else:
+                            # Stock barely outperforming (0-5%) - mild penalty
+                            sector_beta_penalty = 0.70
+                        phoenix_accum = phoenix_accum * sector_beta_penalty
+                        # Boost alpha score - this belongs on momentum leaderboard
+                        alpha_accum = alpha_accum * 1.2
+
+            # =========================================================================
+            # v11.5.5: REVERSAL RECENCY FILTER - Detect Early vs Late Stage Reversal
+            # =========================================================================
+            # Core insight: True phoenix = RECENT breakout from extended base
+            # False positive = Prolonged uptrend (been rallying for months/years)
+            #
+            # Detection method: Compare 3-month vs 6-month returns
+            # - "Flat then pop" pattern: 6mo ≈ 3mo returns (gains are RECENT) → TRUE PHOENIX
+            # - "Up and up" pattern: 6mo >> 3mo returns (gains spread out) → PROLONGED TREND
+            #
+            # Example:
+            # - LULU: 6mo=+40%, 3mo=+35% → 35/40=87.5% recency → early stage ✓
+            # - FCX:  6mo=+50%, 3mo=+15% → 15/50=30% recency → prolonged trend ✗
+            # =========================================================================
+            if phoenix_score > 0 and hist_df is not None and len(hist_df) >= 126:
+
+                # Handle both regular columns and MultiIndex columns (from yfinance)
+                close_col = None
+                if 'Close' in hist_df.columns:
+                    close_col = 'Close'
+                elif 'close' in hist_df.columns:
+                    close_col = 'close'
+                elif hasattr(hist_df.columns, 'get_level_values'):
+                    # MultiIndex columns - try to find Close
+                    level0 = hist_df.columns.get_level_values(0)
+                    if 'Close' in level0:
+                        close_col = 'Close'
+
+                if close_col:  # Already checked len >= 126 above
+                    # Get close prices, handling MultiIndex if needed
+                    try:
+                        if hasattr(hist_df.columns, 'nlevels') and hist_df.columns.nlevels > 1:
+                            close_series = hist_df[close_col].iloc[:, 0] if isinstance(hist_df[close_col], pd.DataFrame) else hist_df[close_col]
+                        else:
+                            close_series = hist_df[close_col]
+
+                        # Calculate 3-month return (last ~63 trading days)
+                        return_3m = 0.0
+                        if len(close_series) >= 63:
+                            price_3m_ago = float(close_series.iloc[-63])
+                            current_px = float(close_series.iloc[-1])
+                            return_3m = (current_px - price_3m_ago) / price_3m_ago if price_3m_ago > 0 else 0
+
+                        # Calculate 6-month return (last ~126 trading days)
+                        return_6m = 0.0
+                        if len(close_series) >= 126:
+                            price_6m_ago = float(close_series.iloc[-126])
+                            current_px = float(close_series.iloc[-1])
+                            return_6m = (current_px - price_6m_ago) / price_6m_ago if price_6m_ago > 0 else 0
+
+                        # Calculate "recency ratio" - what % of 6mo gains came in last 3mo?
+                        # High ratio (>60%) = gains are RECENT = early stage breakout
+                        # Low ratio (<40%) = gains spread over time = prolonged uptrend
+                        if return_6m > 0.15:  # Only check stocks with meaningful 6mo gains
+                            recency_ratio = return_3m / return_6m if return_6m > 0 else 0
+
+                            # If recency ratio is LOW, gains are spread = prolonged uptrend = NOT early phoenix
+                            if recency_ratio < 0.40:
+                                # Gains spread over 6 months - this is a MATURE trend, not early reversal
+                                # Strong penalty - this catches FCX/KGC (rallying for months/years)
+                                recency_penalty = 0.35  # Heavy penalty for prolonged uptrends
+                                phoenix_accum = phoenix_accum * recency_penalty
+                                alpha_accum = alpha_accum * 1.3  # Boost momentum score instead
+                            elif recency_ratio < 0.55:
+                                # Moderate spread - partial penalty
+                                recency_penalty = 0.60
+                                phoenix_accum = phoenix_accum * recency_penalty
+                                alpha_accum = alpha_accum * 1.15
+                    except Exception:
+                        pass  # Silently skip if price data is malformed
+
+            # Cup-and-Handle bonus (hybrid pattern - continuation from base)
+            cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
+            if cup_handle_score > 0:
+                bonus = cup_handle_score * 12  # Up to 12 point bonus
+                trend_accum += bonus
+                ambush_accum += bonus * 0.6
+                # v11.0: Cup-handle is a reversal continuation pattern
+                phoenix_accum += bonus
+
+            # Double Bottom bonus (REVERSAL pattern - boosts phoenix_reversal_score)
+            double_bottom_score = patterns['double_bottom'].get('double_bottom_score', 0)
+            if double_bottom_score > 0:
+                bonus = double_bottom_score * 10  # Up to 10 point bonus
+                ambush_accum += bonus
+                # v11.0: Double bottom is a reversal pattern - significant phoenix boost
+                phoenix_accum += bonus * 1.5
+
+            # --- PATTERN SYNERGY BONUSES (v10.4: LULU-inspired) ---
+            # When multiple patterns overlap, it's a MUCH stronger signal
+            # Phoenix + Double Bottom = Institutional accumulation with clear support
+            if phoenix_score > 0 and double_bottom_score > 0:
+                # LULU pattern: Extended base (phoenix) + double bottom support
+                synergy_bonus = 8  # Significant bonus for dual pattern confirmation
+                trend_accum += synergy_bonus
+                ambush_accum += synergy_bonus
+                # v11.0: This is THE LULU pattern - massive phoenix boost
+                phoenix_accum += synergy_bonus * 2
+
+            # Phoenix + Cup-Handle = Institutional accumulation with continuation setup
+            elif phoenix_score > 0 and cup_handle_score > 0:
+                synergy_bonus = 6
+                trend_accum += synergy_bonus
+                phoenix_accum += synergy_bonus * 1.5
+
+            # Bull Flag + GEX Wall = Momentum with support
+            elif flag_score > 0 and wall_score > 0.3:
+                synergy_bonus = 5
+                trend_accum += synergy_bonus
+                alpha_accum += synergy_bonus * 1.5
+
+            # v11.2 FIX: Write accumulated values back to DataFrame (single assignment, no overwrites)
+            top_candidates.at[idx, 'phoenix_reversal_score'] = phoenix_accum
+            top_candidates.at[idx, 'alpha_momentum_score'] = alpha_accum
+            top_candidates.at[idx, 'trend_score_val'] = trend_accum
+            top_candidates.at[idx, 'ambush_score_val'] = ambush_accum
+
+            # Store pattern flags
+            top_candidates.at[idx, 'has_bull_flag'] = patterns['bull_flag'].get('is_flag', False)
+            top_candidates.at[idx, 'has_gex_support'] = wall_score > 0.3
+            top_candidates.at[idx, 'is_reversal_setup'] = patterns['reversal'].get('is_reversal', False)
+            top_candidates.at[idx, 'is_phoenix'] = patterns['phoenix'].get('is_phoenix', False)
+            top_candidates.at[idx, 'is_cup_handle'] = patterns['cup_handle'].get('is_cup_handle', False)
+            top_candidates.at[idx, 'is_double_bottom'] = patterns['double_bottom'].get('is_double_bottom', False)
+
+            # Fundamental & Sector Analysis
+            ctx = self.analyze_fundamentals_and_sector(ticker, eq_type)
+            top_candidates.at[idx, 'quality'] = ctx['quality_label']
+            top_candidates.at[idx, 'sector_status'] = ctx['sector_status']
+
+            # DP Support Level
+            if ticker in self.dp_support_levels:
+                levels = [p for p in self.dp_support_levels[ticker] if p < current_price]
+                if levels:
+                    top_candidates.at[idx, 'dp_support'] = f"${max(levels):.2f}"
+                else:
+                    top_candidates.at[idx, 'dp_support'] = "None"
+            else:
+                top_candidates.at[idx, 'dp_support'] = "None"
+
+            # GEX Wall Levels
+            if patterns['gex_wall'].get('support_wall'):
+                top_candidates.at[idx, 'gex_support'] = f"${patterns['gex_wall']['support_wall']:.2f}"
+            else:
+                top_candidates.at[idx, 'gex_support'] = "None"
+
+        # --- GENERATE EXPLANATIONS ---
+        print(f"  [EXPLAIN] Generating human-readable explanations...")
+        for idx, row in top_candidates.iterrows():
+            ticker = row['ticker']
+            patterns = pattern_results.get(ticker, {})
+            explanation = self.generate_signal_explanation(row.to_dict(), patterns)
+            top_candidates.at[idx, 'explanation'] = explanation
+
+        # --- SPLIT ETF AND STOCKS ---
+        etf_candidates = top_candidates[top_candidates['quality'] == 'ETF'].sort_values('trend_score_val', ascending=False)
+        stock_candidates = top_candidates[top_candidates['quality'] != 'ETF'].copy()
+
+        # --- APPLY SECTOR CAPPING (Phase 9) ---
+        print(f"\n  [RISK] Applying sector capping (max {MAX_PICKS_PER_SECTOR} per sector)...")
+        stock_candidates = stock_candidates.sort_values('trend_score_val', ascending=False)
+        stock_candidates = self.apply_sector_capping(stock_candidates)
+
+        # --- FINAL SCORE FORMATTING ---
+        stock_candidates['trend_score'] = stock_candidates['trend_score_val'].clip(0, 99.9).round(1)
+        stock_candidates['ambush_score'] = stock_candidates['ambush_score_val'].clip(0, 99.9).round(1)
+
+        # v11.0: Format dual-ranking scores
+        if 'alpha_momentum_score' in stock_candidates.columns:
+            stock_candidates['alpha_score'] = stock_candidates['alpha_momentum_score'].clip(0, 99.9).round(1)
+        else:
+            stock_candidates['alpha_score'] = 0.0
+        if 'phoenix_reversal_score' in stock_candidates.columns:
+            stock_candidates['phoenix_score'] = stock_candidates['phoenix_reversal_score'].clip(0, 99.9).round(1)
+        else:
+            stock_candidates['phoenix_score'] = 0.0
+
+        if 'dist_sma50' in stock_candidates.columns:
+            stock_candidates['ext'] = (stock_candidates['dist_sma50'] * 100).round(1)
+        else:
+            stock_candidates['ext'] = 0.0
+
+        # Ensure all expected columns exist
+        for col in ['gamma_velocity', 'nn_score', 'stop_loss', 'take_profit', 'explanation', 'gex_support', 'solidity_score']:
+            if col not in stock_candidates.columns:
+                stock_candidates[col] = 0.0 if col != 'explanation' else 'Standard signal'
+            if col not in etf_candidates.columns:
+                etf_candidates[col] = 0.0 if col != 'explanation' else 'Standard signal'
+
+        # Pattern flags formatting
+        for col in ['has_bull_flag', 'has_gex_support', 'is_reversal_setup']:
+            if col not in stock_candidates.columns:
+                stock_candidates[col] = False
+            if col not in etf_candidates.columns:
+                etf_candidates[col] = False
+
+        # --- v11.0: CREATE DUAL LEADERBOARDS ---
+        print("\n  [v11.2] Creating Dual Leaderboards...")
+
+        # Alpha Momentum Leaderboard (top 25 by alpha_momentum_score)
+        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
+        alpha_leaderboard = stock_candidates.nlargest(alpha_config['top_n'], 'alpha_score')
+        alpha_qualified = alpha_leaderboard[alpha_leaderboard['alpha_score'] >= alpha_config['min_score']]
+
+        # Phoenix Reversal Leaderboard (top 25 by phoenix_reversal_score)
+        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal']
+        phoenix_leaderboard = stock_candidates.nlargest(phoenix_config['top_n'], 'phoenix_score')
+        phoenix_qualified = phoenix_leaderboard[phoenix_leaderboard['phoenix_score'] >= phoenix_config['min_score']]
+
+        # Store leaderboards for output
+        stock_candidates.attrs['alpha_leaderboard'] = alpha_qualified
+        stock_candidates.attrs['phoenix_leaderboard'] = phoenix_qualified
+
+        print(f"  [v11.2] Alpha Momentum: {len(alpha_qualified)} qualified (>= {alpha_config['min_score']})")
+        print(f"  [v11.2] Phoenix Reversal: {len(phoenix_qualified)} qualified (>= {phoenix_config['min_score']})")
+
+        # --- SUMMARY STATISTICS ---
+        bull_flags = stock_candidates['has_bull_flag'].sum() if 'has_bull_flag' in stock_candidates.columns else 0
+        gex_protected = stock_candidates['has_gex_support'].sum() if 'has_gex_support' in stock_candidates.columns else 0
+        reversal_setups = stock_candidates['is_reversal_setup'].sum() if 'is_reversal_setup' in stock_candidates.columns else 0
+        phoenix_reversals = stock_candidates['is_phoenix'].sum() if 'is_phoenix' in stock_candidates.columns else 0
+        cup_handles = stock_candidates['is_cup_handle'].sum() if 'is_cup_handle' in stock_candidates.columns else 0
+        double_bottoms = stock_candidates['is_double_bottom'].sum() if 'is_double_bottom' in stock_candidates.columns else 0
+
+        print(f"\n  [PATTERNS SUMMARY]")
+        print(f"    Bull Flags Detected: {bull_flags}")
+        print(f"    GEX Protected Positions: {gex_protected}")
+        print(f"    Reversal Setups: {reversal_setups}")
+        print(f"    Phoenix Reversals: {phoenix_reversals}")
+        print(f"    Cup-and-Handle Patterns: {cup_handles}")
+        print(f"    Double Bottom Patterns: {double_bottoms}")
+
+        return stock_candidates, etf_candidates
+
+if __name__ == "__main__":
+    start_time = time.time()
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- STARTING ENGINE RUN ---")
+
+    try:
+        from google.colab import drive
+        if not os.path.exists('/content/drive'):
+            print("  [INIT] Mounting Google Drive...")
+            drive.mount('/content/drive')
+    except ImportError: pass
+
+    script_dir = os.getcwd()
+    if '__file__' in globals(): script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_paths = ["/content/drive/My Drive/colab", script_dir, os.getcwd(), "/content/drive/MyDrive", "/content/drive/MyDrive/Colab Notebooks", "/content"]
+    def find_file(name):
+        for p in search_paths:
+            full = os.path.join(p, name)
+            if os.path.exists(full): return full
+        return None
+
+    # FIX: Pass Google Drive path as base_dir for database persistence
+    # Without this, DB defaults to /content/ which is ephemeral in Colab
+    data_dir = "/content/drive/My Drive/colab"
+    if not os.path.exists(data_dir): data_dir = os.getcwd()
+
+    engine = SwingTradingEngine(base_dir=data_dir)
+    engine.history_mgr.sync_history(engine, data_dir)
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    files = {
+        'dp': find_file(f"dp-eod-report-{today_str}.csv") or find_file("dp-eod-report.csv"),
+        'hot': find_file(f"hot-chains-{today_str}.csv") or find_file("hot-chains.csv"),
+        'oi': find_file(f"chain-oi-changes-{today_str}.csv") or find_file("chain-oi-changes.csv"),
+        'bot_lite': find_file(f"stock-screener-{today_str}.csv") or find_file("stock-screener.csv"),
+        'bot_big': find_file(f"bot-eod-report-{today_str}.csv") or find_file("bot-eod-report.csv")
+    }
+
+    if not files['bot_big']:
+        files['bot_big'] = find_file("bot-eod-report-2025-12-09.csv")
+        files['dp'] = find_file("dp-eod-report-2025-12-09.csv")
+        files['hot'] = find_file("hot-chains-2025-12-09.csv")
+        files['oi'] = find_file("chain-oi-changes-2025-12-09.csv")
+        files['bot_lite'] = find_file("stock-screener-2025-12-09.csv")
+
+    if not engine.process_flow_data(files).empty:
+        engine.enrich_market_data(engine.full_df)
+        engine.train_model()
+        results = engine.predict()
+        if results is not None:
+            stocks_df, etfs_df = results
+
+            # --- POSITION SIZING (Phase 10: Kelly Criterion) ---
+            print(f"\n  [SIZING] Calculating Kelly-based position sizes...")
+            portfolio_value = 100000  # Default portfolio size
+            for idx, row in stocks_df.iterrows():
+                sizing = engine.calculate_position_size(row.to_dict(), portfolio_value)
+                stocks_df.at[idx, 'position_pct'] = sizing['position_pct']
+                stocks_df.at[idx, 'position_size'] = sizing['position_size']
+                stocks_df.at[idx, 'shares'] = sizing['shares']
+                stocks_df.at[idx, 'risk_tier'] = sizing['risk_tier']
+
+            # NOTE: save_db() is called at the end of the main block, not here
+            # Calling it twice would close the connection prematurely
+
+            # --- MACRO CONTEXT HEADER ---
+            print("\n" + "="*80)
+            print(f"GRANDMASTER ENGINE v11.2 - {datetime.now().strftime('%Y-%m-%d')}")
+            print("="*80)
+            print(f"MACRO REGIME: {engine.market_regime}")
+            if hasattr(engine, 'macro_data') and engine.macro_data:
+                m = engine.macro_data
+                print(f"  VIX: {m.get('vix', 'N/A'):.2f} | TNX: {m.get('tnx', 'N/A'):.2f}% | DXY: {m.get('dxy', 'N/A'):.2f}")
+                print(f"  Score Adjustment: {m.get('adjustment', 0):+.1f} points")
+
+            # ========================================================================
+            # v11.0 DUAL-RANKING LEADERBOARDS (NEW - Fixes LULU ranking issue)
+            # ========================================================================
+
+            # --- LEADERBOARD 1: ALPHA MOMENTUM (Continuation Plays) ---
+            print("\n" + "="*80)
+            print("🚀 LEADERBOARD 1: ALPHA MOMENTUM (Continuation Plays)")
+            print("Logic: Trend + ML Ensemble + Neural Network + Volume Momentum")
+            print("Use for: Riding existing trends, momentum breakouts, bull flags")
+            print("="*80)
+
+            # v11.0 FIX: Regenerate leaderboards from stocks_df AFTER position sizing is applied
+            # (attrs were created before position_pct/risk_tier existed)
+            if 'alpha_score' in stocks_df.columns:
+                alpha_min = DUAL_RANKING_CONFIG['alpha_momentum']['min_score']
+                alpha_picks = stocks_df[stocks_df['alpha_score'] >= alpha_min].nlargest(25, 'alpha_score')
+            else:
+                alpha_picks = pd.DataFrame()
+
+            display_cols = ['ticker', 'alpha_score', 'quality', 'has_bull_flag', 'nn_score', 'position_pct', 'risk_tier']
+            display_cols = [c for c in display_cols if c in stocks_df.columns]
+
+            if not alpha_picks.empty and len(alpha_picks) > 0:
+                print(alpha_picks[display_cols].head(10).to_string(index=False))
+                print(f"\n  Total Alpha Momentum candidates: {len(alpha_picks)}")
+            else:
+                print("  [!] No candidates met Alpha Momentum criteria (>= 75)")
+
+            # --- LEADERBOARD 2: PHOENIX REVERSALS (Base Breakout Plays) ---
+            print("\n" + "="*80)
+            print("🔥 LEADERBOARD 2: PHOENIX REVERSALS (Base Breakout Plays)")
+            print("Logic: Solidity Score + Consolidation Duration + Institutional Flow")
+            print("Use for: LULU-style setups, deep value reversals, accumulation breakouts")
+            print("="*80)
+
+            # v11.0 FIX: Regenerate leaderboards from stocks_df AFTER position sizing is applied
+            if 'phoenix_score' in stocks_df.columns:
+                phoenix_min = DUAL_RANKING_CONFIG['phoenix_reversal']['min_score']
+                phoenix_picks = stocks_df[stocks_df['phoenix_score'] >= phoenix_min].nlargest(25, 'phoenix_score')
+            else:
+                phoenix_picks = pd.DataFrame()
+
+            display_cols_phoenix = ['ticker', 'phoenix_score', 'solidity_score', 'is_phoenix', 'quality', 'dp_support', 'position_pct']
+            display_cols_phoenix = [c for c in display_cols_phoenix if c in stocks_df.columns]
+
+            if not phoenix_picks.empty and len(phoenix_picks) > 0:
+                print(phoenix_picks[display_cols_phoenix].head(10).to_string(index=False))
+
+                # Show explanations for top phoenix picks
+                print("\n  --- PHOENIX SIGNAL EXPLANATIONS ---")
+                for _, row in phoenix_picks.head(5).iterrows():
+                    ticker = row.get('ticker', 'N/A')
+                    phoenix_s = row.get('phoenix_score', 0)
+                    solidity_s = row.get('solidity_score', 0)
+                    explanation = row.get('explanation', 'N/A')
+                    if len(str(explanation)) > 100:
+                        explanation = str(explanation)[:97] + "..."
+                    print(f"  {ticker} [P:{phoenix_s:.1f} S:{solidity_s:.2f}]: {explanation}")
+
+                print(f"\n  Total Phoenix Reversal candidates: {len(phoenix_picks)}")
+
+                # v11.0: LULU ranking validation
+                if ENABLE_VALIDATION_MODE and 'LULU' in phoenix_picks['ticker'].values:
+                    lulu_row = phoenix_picks[phoenix_picks['ticker'] == 'LULU'].iloc[0]
+                    lulu_rank = phoenix_picks.index.get_loc(phoenix_picks[phoenix_picks['ticker'] == 'LULU'].index[0]) + 1
+                    print(f"\n  [v11.0 VALIDATION] LULU Phoenix Rank: #{lulu_rank}/25")
+                    print(f"                    Phoenix Score: {lulu_row.get('phoenix_score', 0):.1f}")
+                    print(f"                    Solidity Score: {lulu_row.get('solidity_score', 0):.2f}")
+            else:
+                print("  [!] No candidates met Phoenix Reversal criteria (>= 60)")
+
+            # ========================================================================
+            # LEGACY STRATEGIES (Backwards Compatibility)
+            # ========================================================================
+
+            # --- STRATEGY 1: MOMENTUM LEADERS (Legacy) ---
+            trend_picks = stocks_df[stocks_df['trend_score'] > 80].sort_values('trend_score', ascending=False)
+            print("\n" + "="*80)
+            print(f"[LEGACY] STRATEGY 1: MOMENTUM LEADERS (Trend Following)")
+            print(f"Logic: CatBoost + Hive Mind + Bull Flag Detection + GEX Protection")
+            print("="*80)
+
+            # Display table with position sizing
+            display_cols = ['ticker', 'trend_score', 'quality', 'has_bull_flag', 'nn_score', 'position_pct', 'shares', 'risk_tier']
+            display_cols = [c for c in display_cols if c in stocks_df.columns]
+            if not trend_picks.empty:
+                print(trend_picks[display_cols].head(8).to_string(index=False))
+
+                # Show position sizing summary
+                print("\n  --- POSITION SIZING (Kelly) ---")
+                for _, row in trend_picks.head(5).iterrows():
+                    pct = row.get('position_pct', 0)
+                    shares = int(row.get('shares', 0))
+                    tier = row.get('risk_tier', 'N/A')
+                    price = row.get('current_price', 0)
+                    print(f"  {row['ticker']}: {pct:.1f}% (${pct*1000:.0f} → {shares} shares @ ${price:.2f}) | {tier}")
+
+                # Show explanations for top picks
+                print("\n  --- SIGNAL EXPLANATIONS ---")
+                for _, row in trend_picks.head(5).iterrows():
+                    explanation = row.get('explanation', 'N/A')
+                    # Truncate long explanations for display
+                    if len(str(explanation)) > 120:
+                        explanation = str(explanation)[:117] + "..."
+                    print(f"  {row['ticker']}: {explanation}")
+            else:
+                print("  [!] No candidates met strict criteria (>80).")
+
+            # --- STRATEGY 2: AMBUSH PREDATORS (Legacy) ---
+            # More lenient criteria for reversal plays
+            ambush_picks = stocks_df[
+                (stocks_df['ambush_score'] > 75) &
+                ((stocks_df['is_reversal_setup'] == True) | (stocks_df['sector_status'] == 'Lagging Sector'))
+            ].sort_values('ambush_score', ascending=False)
+
+            print("\n" + "="*80)
+            print(f"[LEGACY] STRATEGY 2: AMBUSH PREDATORS (Counter-Trend Reversals)")
+            print(f"Logic: Downtrend + DP Support + Divergence Detection")
+            print("="*80)
+
+            display_cols = ['ticker', 'ambush_score', 'quality', 'is_reversal_setup', 'dp_support', 'gex_support', 'position_pct', 'shares']
+            display_cols = [c for c in display_cols if c in stocks_df.columns]
+            if not ambush_picks.empty:
+                print(ambush_picks[display_cols].head(8).to_string(index=False))
+
+                # Show explanations for ambush picks
+                print("\n  --- SIGNAL EXPLANATIONS ---")
+                for _, row in ambush_picks.head(5).iterrows():
+                    explanation = row.get('explanation', 'N/A')
+                    if len(str(explanation)) > 120:
+                        explanation = str(explanation)[:117] + "..."
+                    print(f"  {row['ticker']}: {explanation}")
+            else:
+                print("  [!] No reversal candidates found.")
+
+            # --- STRATEGY 3: BULL FLAG SPECIAL ---
+            flag_picks = stocks_df[stocks_df['has_bull_flag'] == True].sort_values('trend_score', ascending=False)
+            if not flag_picks.empty:
+                print("\n" + "="*80)
+                print(f"STRATEGY 3: BULL FLAG BREAKOUTS")
+                print(f"Logic: Strong pole + Tight consolidation + Declining volume")
+                print("="*80)
+                display_cols = ['ticker', 'trend_score', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
+                display_cols = [c for c in display_cols if c in stocks_df.columns]
+                print(flag_picks[display_cols].head(5).to_string(index=False))
+
+                print("\n  --- SIGNAL EXPLANATIONS ---")
+                for _, row in flag_picks.head(3).iterrows():
+                    explanation = row.get('explanation', 'N/A')
+                    if len(str(explanation)) > 120:
+                        explanation = str(explanation)[:117] + "..."
+                    print(f"  {row['ticker']}: {explanation}")
+
+            # --- STRATEGY 4: ETF SWING ---
+            if not etfs_df.empty:
+                print("\n" + "="*80)
+                print(f"STRATEGY 4: ETF SWING")
+                print("="*80)
+                etf_display = ['ticker', 'trend_score_val', 'sector_status', 'net_gamma', 'nn_score', 'stop_loss', 'take_profit']
+                etf_display = [c for c in etf_display if c in etfs_df.columns]
+                print(etfs_df[etf_display].head(5).to_string(index=False))
+
+            # --- STRATEGY 5: PHOENIX REVERSAL ---
+            phoenix_df = stocks_df[stocks_df['is_phoenix'] == True].copy() if 'is_phoenix' in stocks_df.columns else pd.DataFrame()
+            if not phoenix_df.empty:
+                print("\n" + "="*80)
+                print(f"STRATEGY 5: PHOENIX REVERSAL (6-12 Month Base Breakouts)")
+                print("Logic: Extended consolidation + Volume surge + RSI 50-70 + Breakout")
+                print("="*80)
+                # v11.5 FIX: Sort by phoenix_score (not trend_score_val) for true reversal ranking
+                phoenix_display = ['ticker', 'phoenix_score', 'solidity_score', 'quality', 'nn_score', 'position_pct', 'shares', 'stop_loss', 'take_profit']
+                phoenix_display = [c for c in phoenix_display if c in phoenix_df.columns]
+                phoenix_sorted = phoenix_df.sort_values('phoenix_score', ascending=False).head(5)
+                print(phoenix_sorted[phoenix_display].to_string(index=False))
+
+                # Show explanations for phoenix candidates
+                print("\n  --- SIGNAL EXPLANATIONS ---")
+                for _, row in phoenix_sorted.iterrows():
+                    ticker = row['ticker']
+                    expl = row.get('explanation', 'No explanation available')
+                    print(f"  {ticker}: {expl[:150]}...")
+            else:
+                print("\n" + "="*80)
+                print(f"STRATEGY 5: PHOENIX REVERSAL (6-12 Month Base Breakouts)")
+                print("="*80)
+                print("  [!] No phoenix reversal candidates found.")
+
+            # --- SAVE OUTPUT ---
+            out_path = "/content/drive/My Drive/colab/swing_signals_v11_grandmaster.csv" if COLAB_ENV else os.path.join(engine.base_dir, "swing_signals_v11_grandmaster.csv")
+            try:
+                final_output = pd.concat([stocks_df, etfs_df])
+                final_output.to_csv(out_path, index=False)
+                print(f"\n[SUCCESS] Saved comprehensive report with dual leaderboards: {out_path}")
+            except Exception as e:
+                out_path = os.path.join(engine.base_dir, "swing_signals_v11_grandmaster.csv")
+                try:
+                    pd.concat([stocks_df, etfs_df]).to_csv(out_path, index=False)
+                    print(f"\n[FALLBACK] Saved locally to {out_path}")
+                except:
+                    print(f"\n[ERROR] Could not save output: {e}")
+
+            # --- SUMMARY ---
+            elapsed = time.time() - start_time
+            mins, secs = divmod(elapsed, 60)
+
+            print("\n" + "="*80)
+            print("RUN SUMMARY - v11.2 DUAL-RANKING ARCHITECTURE")
+            print("="*80)
+            print(f"  Duration: {int(mins)}m {int(secs)}s")
+            print(f"  Device: {device_name}")  # Uses global device_name from get_device()
+            print(f"  Total Candidates Analyzed: {len(stocks_df) + len(etfs_df)}")
+
+            # v11.0 Dual Leaderboard counts
+            alpha_count = len(alpha_picks) if not alpha_picks.empty else 0
+            phoenix_lb_count = len(phoenix_picks) if not phoenix_picks.empty else 0
+            print(f"\n  --- v11.0 DUAL LEADERBOARDS ---")
+            print(f"  Alpha Momentum Leaders: {alpha_count}")
+            print(f"  Phoenix Reversals: {phoenix_lb_count}")
+
+            # Legacy counts
+            print(f"\n  --- Legacy Strategies ---")
+            print(f"  Momentum Leaders (>80): {len(trend_picks)}")
+            print(f"  Ambush Setups: {len(ambush_picks)}")
+            print(f"  Bull Flags: {len(flag_picks) if not flag_picks.empty else 0}")
+            phoenix_count = len(phoenix_df) if not phoenix_df.empty else 0
+            print(f"  Phoenix Patterns: {phoenix_count}")
+
+            msg = f"v11.2 | Duration: {int(mins)}m {int(secs)}s | Device: {device_name} | Alpha: {alpha_count} | Phoenix: {phoenix_lb_count}"
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- {msg} ---")
+
+            # Log run history
+            try:
+                hist_path = "/content/drive/My Drive/colab/run_history.txt" if COLAB_ENV else os.path.join(engine.base_dir, "run_history.txt")
+                with open(hist_path, "a") as f:
+                    f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
+            except:
+                pass
+
+            # Persist DB to Google Drive
+            engine.history_mgr.save_db()
+    else:
+        print("[CRITICAL] Missing data files. Please ensure Unusual Whales data is in the expected location.")
+        # Still save DB even if data files missing (preserves any synced history)
+        engine.history_mgr.save_db()
