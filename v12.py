@@ -376,40 +376,364 @@ import requests
 from datetime import datetime, timedelta
 
 # =============================================================================
-# COLAB PATH SETUP (must be before engine imports)
+# COLAB BOOTSTRAP - Auto-creates engine/ module files if missing/corrupted
 # =============================================================================
 COLAB_ENV = False
+COLAB_BASE = None
 try:
     from google.colab import drive
     if not os.path.exists('/content/drive'):
         drive.mount('/content/drive')
     COLAB_ENV = True
-    # Add colab directory to Python path so 'engine' module can be found
     COLAB_BASE = '/content/drive/My Drive/colab'
+
+    # Bootstrap: Create engine/ folder with module files
+    engine_dir = os.path.join(COLAB_BASE, 'engine')
+    os.makedirs(engine_dir, exist_ok=True)
+
+    def _is_valid_py(filepath):
+        """Check if file exists and is valid Python (not corrupted notebook)."""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, 'r') as f:
+                first_line = f.readline()
+                return not first_line.startswith('{')  # Notebooks start with {
+        except:
+            return False
+
+    # Bootstrap engine/__init__.py
+    init_path = os.path.join(engine_dir, '__init__.py')
+    if not _is_valid_py(init_path):
+        with open(init_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+from .config import *
+from .neural import SwingTransformer, TemporalBlock, TCN
+from .utils import (get_device, configure_yfinance_session, YF_SESSION, is_weekend,
+    get_market_last_close_date, Logger, sanitize_ticker_for_alpaca, fetch_alpaca_batch,
+    install_requirements, ALPACA_AVAILABLE)
+from .data_loader import TitanDB, HistoryManager
+from .data_prep import triple_barrier_labels, prepare_tcn_sequences
+''')
+        print(f"  [BOOTSTRAP] Created {init_path}")
+
+    # Bootstrap engine/config.py
+    config_path = os.path.join(engine_dir, 'config.py')
+    if not _is_valid_py(config_path):
+        with open(config_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+SECTOR_MAP = {'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
+    'Consumer Cyclical': 'XLY', 'Industrials': 'XLI', 'Communication Services': 'XLC',
+    'Consumer Defensive': 'XLP', 'Energy': 'XLE', 'Basic Materials': 'XLB',
+    'Real Estate': 'XLRE', 'Utilities': 'XLU'}
+BULL_FLAG_CONFIG = {'pole_min_gain': 0.05, 'pole_days': 12, 'flag_max_range': 0.15,
+    'flag_days': 10, 'volume_decline_ratio': 0.95}
+GEX_WALL_CONFIG = {'min_support_gamma': 50000, 'min_resist_gamma': -50000, 'proximity_pct': 0.10}
+PHOENIX_CONFIG = {'min_base_days': 60, 'max_base_days': 730, 'institutional_threshold': 365,
+    'volume_surge_threshold': 1.5, 'rsi_min': 50, 'rsi_max': 70, 'max_drawdown_pct': 0.70,
+    'min_consolidation_pct': 0.15, 'breakout_threshold': 0.03}
+REVERSAL_CONFIG = {'lookback_days': 45, 'min_days_below_sma': 15, 'dp_proximity_pct': 0.10}
+GATEKEEPER_CONFIG = {'large_cap_threshold': 5000000, 'mid_cap_threshold': 2000000,
+    'small_cap_threshold': 1000000, 'large_cap_min': 10000000000, 'mid_cap_min': 2000000000,
+    'dp_bypass_threshold': 500000, 'max_spread_pct': 0.005, 'min_options_oi': 500}
+SOLIDITY_CONFIG = {'fib_retracement': 0.382, 'min_consolidation_days': 20,
+    'max_consolidation_range': 0.382, 'volume_decline_ratio': 0.70, 'volume_lookback_days': 50,
+    'min_dp_total': 10000000, 'signature_print_bonus': 0.10, 'weight_in_phoenix': 0.18, 'base_threshold': 0.55}
+DUAL_RANKING_CONFIG = {
+    'alpha_momentum': {'min_score': 75, 'top_n': 25, 'weight_trend': 0.30, 'weight_ml': 0.25,
+        'weight_neural': 0.15, 'weight_volume': 0.15, 'weight_pattern': 0.15},
+    'phoenix_reversal': {'min_score': 55, 'top_n': 25, 'weight_solidity': 0.20, 'weight_duration': 0.20,
+        'weight_flow': 0.15, 'weight_breakout': 0.15, 'weight_pattern': 0.15, 'weight_ml': 0.15}}
+MAX_PICKS_PER_SECTOR = 3
+PERFORMANCE_CONFIG = {'catboost_trials': 25, 'catboost_max_iterations': 500, 'catboost_max_depth': 10,
+    'catboost_cv_folds': 5, 'model_cache_days': 7, 'transformer_epochs': 30,
+    'max_tickers_to_fetch': 3000, 'price_cache_days': 7, 'batch_size': 75}
+ENABLE_VALIDATION_MODE = True
+VALIDATION_SUITE = {'institutional_phoenix': ['LULU', 'NVO'], 'speculative_phoenix': [],
+    'negative_cases': ['FCX', 'KGC']}
+MACRO_WEIGHTS = {'vix_z_threshold': 2.0, 'vix_penalty_per_sigma': 2.0, 'tnx_z_threshold': 2.0,
+    'tnx_penalty_per_sigma': 3.0, 'dxy_z_threshold': 2.0, 'dxy_penalty_per_sigma': 1.5}
+VIX_TERM_STRUCTURE_CONFIG = {'mild_contango_threshold': 1.10, 'extreme_contango_threshold': 1.20,
+    'backwardation_threshold': 0.95, 'mild_contango_bonus': 2.0, 'extreme_contango_penalty': 4.0,
+    'backwardation_penalty': 5.0, 'vvix_high_threshold': 110, 'vvix_low_threshold': 85,
+    'vvix_divergence_lookback': 5, 'vvix_divergence_penalty': 4.0, 'vvix_convergence_bonus': 2.0}
+POSITION_SIZING_CONFIG = {'kelly_fraction': 0.25, 'max_position_pct': 0.10,
+    'min_position_pct': 0.01, 'default_win_rate': 0.55, 'default_edge': 0.10}
+RISK_TIER_MATRIX = {'score_tiers': {(95, 100): {'<5%': 1.0, '5-6%': 0.75, '>6%': 0.50},
+    (85, 94): {'<5%': 0.75, '5-6%': 0.50, '>6%': 0.35}, (70, 84): {'<5%': 0.50, '5-6%': 0.35, '>6%': 0.20}},
+    'vol_thresholds': {'low': 0.05, 'medium': 0.06}}
+''')
+        print(f"  [BOOTSTRAP] Created {config_path}")
+
+    # Bootstrap engine/neural.py
+    neural_path = os.path.join(engine_dir, 'neural.py')
+    if not _is_valid_py(neural_path):
+        with open(neural_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+
+class SwingTransformer(nn.Module):
+    def __init__(self, input_size, d_model=128, nhead=4, num_layers=3, output_size=1, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Linear(input_size, d_model)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 10, d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc1, self.relu, self.fc2, self.sigmoid = nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, output_size), nn.Sigmoid()
+    def forward(self, x):
+        x = self.embedding(x)
+        if x.size(1) <= self.pos_encoder.size(1): x = x + self.pos_encoder[:, :x.size(1), :]
+        x = self.transformer_encoder(x).mean(dim=1)
+        return self.sigmoid(self.fc2(self.relu(self.fc1(x))))
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
+        self.dropout, self.relu = nn.Dropout(dropout), nn.ReLU()
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.conv1.weight.data.normal_(0, 0.01); self.conv2.weight.data.normal_(0, 0.01)
+    def forward(self, x):
+        out = self.relu(self.dropout(self.conv1(x)[:, :, :x.size(2)]))
+        out = self.relu(self.dropout(self.conv2(out)[:, :, :x.size(2)]))
+        return self.relu(out + (x if self.downsample is None else self.downsample(x)))
+
+class TCN(nn.Module):
+    def __init__(self, input_size, num_channels=[32, 32, 16], kernel_size=3, dropout=0.2):
+        super().__init__()
+        layers = [TemporalBlock(input_size if i == 0 else num_channels[i-1], num_channels[i], kernel_size, 2**i, dropout) for i in range(len(num_channels))]
+        self.network, self.fc, self.sigmoid = nn.Sequential(*layers), nn.Linear(num_channels[-1], 1), nn.Sigmoid()
+    def forward(self, x):
+        return self.sigmoid(self.fc(self.network(x.transpose(1, 2)).mean(dim=2)))
+''')
+        print(f"  [BOOTSTRAP] Created {neural_path}")
+
+    # Bootstrap engine/utils.py
+    utils_path = os.path.join(engine_dir, 'utils.py')
+    if not _is_valid_py(utils_path):
+        with open(utils_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+import os, sys, subprocess, requests, torch, pandas as pd
+from datetime import datetime, timedelta
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    ALPACA_KEY = os.environ.get('APCA_API_KEY_ID', 'PK3D25CFOYT2Z5F6DW54XKQXOO')
+    ALPACA_SECRET = os.environ.get('APCA_API_SECRET_KEY', 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK')
+    alpaca_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+    ALPACA_AVAILABLE = True
+except: ALPACA_AVAILABLE, alpaca_client = False, None
+
+def get_device():
+    try:
+        import torch_xla.core.xla_model as xm; return xm.xla_device(), 'TPU'
+    except: pass
+    if torch.cuda.is_available(): return torch.device('cuda'), f'GPU ({torch.cuda.get_device_name(0)})'
+    return torch.device('cpu'), 'CPU'
+
+def configure_yfinance_session():
+    s = requests.Session()
+    s.headers.update({'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0'})
+    return s
+YF_SESSION = configure_yfinance_session()
+def is_weekend(): return datetime.now().weekday() >= 5
+def get_market_last_close_date():
+    t = datetime.now().date()
+    return t - timedelta(days=1 if t.weekday() < 5 else (1 if t.weekday() == 5 else 2))
+
+class Logger:
+    def __init__(self, fn): self.terminal, self.log = sys.stdout, open(fn, 'a', encoding='utf-8')
+    def write(self, m): self.terminal.write(m); self.log.write(m); self.log.flush()
+    def flush(self): self.terminal.flush(); self.log.flush()
+
+def sanitize_ticker_for_alpaca(ticker):
+    t = str(ticker).upper().strip()
+    try: t.encode('ascii')
+    except: return None
+    if t.startswith('^') or '+' in t or (len(t) > 1 and t[-1].isdigit()) or not t or len(t) > 10: return None
+    if t == 'BRK-B': return 'BRK.B'
+    if t == 'BRK-A': return 'BRK.A'
+    return t.replace('-', '.') if '-' in t else t
+
+def fetch_alpaca_batch(tickers, start_date, end_date=None):
+    if not tickers or not ALPACA_AVAILABLE: return {}
+    valid_map, clean = {}, []
+    for t in tickers:
+        c = sanitize_ticker_for_alpaca(t)
+        if c: valid_map[c] = t; clean.append(c)
+    if not clean: return {}
+    all_data = {}
+    for i in range(0, len(clean), 200):
+        try:
+            bars = alpaca_client.get_stock_bars(StockBarsRequest(symbol_or_symbols=clean[i:i+200], timeframe=TimeFrame.Day, start=start_date, end=end_date, adjustment='raw'))
+            if not bars.data: continue
+            df = bars.df.reset_index()
+            for sym, g in df.groupby('symbol'):
+                d = g.rename(columns={'open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume','timestamp':'Date'})
+                d['Date'] = pd.to_datetime(d['Date']).dt.date
+                all_data[valid_map.get(sym, sym)] = d.set_index('Date')[['Open','High','Low','Close','Volume']]
+        except Exception as e: print(f"    [!] Alpaca error: {str(e)[:50]}...")
+    return all_data
+
+def install_requirements():
+    for p in ['optuna','catboost','pytorch-tabnet','scikit-learn','pandas','numpy','yfinance','torch','scipy','joblib','alpaca-py']:
+        try: __import__(p.replace('-','_') if p != 'alpaca-py' else 'alpaca')
+        except: subprocess.check_call([sys.executable, '-m', 'pip', 'install', p])
+''')
+        print(f"  [BOOTSTRAP] Created {utils_path}")
+
+    # Bootstrap engine/data_loader.py
+    loader_path = os.path.join(engine_dir, 'data_loader.py')
+    if not _is_valid_py(loader_path):
+        with open(loader_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+import os, glob, shutil, random, sqlite3, pandas as pd
+from datetime import datetime, timedelta
+from .utils import fetch_alpaca_batch, get_market_last_close_date, is_weekend
+
+class TitanDB:
+    def __init__(self, db_path):
+        self.db_path, self.conn = db_path, None; self.init_db()
+    def init_db(self):
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS flow_history (ticker TEXT, date TEXT, net_gamma REAL, authentic_gamma REAL, net_delta REAL, open_interest REAL, adj_iv REAL, equity_type TEXT, PRIMARY KEY (ticker, date))")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close REAL, atr REAL, PRIMARY KEY (ticker, date))")
+        self.conn.commit()
+    def upsert_flow(self, df):
+        if df.empty: return
+        df[['ticker','date','net_gamma','authentic_gamma','net_delta','open_interest','adj_iv','equity_type']].to_sql('temp_flow', self.conn, if_exists='replace', index=False)
+        self.conn.execute("INSERT OR REPLACE INTO flow_history SELECT * FROM temp_flow"); self.conn.execute("DROP TABLE temp_flow"); self.conn.commit()
+    def upsert_prices(self, df):
+        if df.empty: return
+        df[['ticker','date','close','atr']].to_sql('temp_price', self.conn, if_exists='replace', index=False)
+        self.conn.execute("INSERT OR REPLACE INTO price_history SELECT * FROM temp_price"); self.conn.execute("DROP TABLE temp_price"); self.conn.commit()
+    def get_history_df(self): return pd.read_sql("SELECT * FROM flow_history", self.conn)
+    def get_price_df(self): return pd.read_sql("SELECT * FROM price_history", self.conn)
+    def close(self):
+        if self.conn: self.conn.close()
+
+class HistoryManager:
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.local_db_path = os.path.abspath("titan.db")
+        self.drive_db_path = os.path.join(base_dir, "titan.db")
+        print(f"  [TITAN] Base dir: {base_dir}"); print(f"  [TITAN] Local DB: {self.local_db_path}"); print(f"  [TITAN] Drive DB: {self.drive_db_path}")
+        if os.path.exists(self.drive_db_path) and os.path.abspath(self.drive_db_path) != self.local_db_path:
+            shutil.copy(self.drive_db_path, self.local_db_path); print("  [TITAN] Loaded existing database from Drive.")
+        self.db = TitanDB(self.local_db_path)
+        self.log_file = os.path.join(base_dir, "processed_files_log.txt")
+        self.processed_files = set(open(self.log_file).read().splitlines()) if os.path.exists(self.log_file) else set()
+    def save_db(self):
+        self.db.close()
+        if os.path.abspath(self.drive_db_path) != self.local_db_path: shutil.copy(self.local_db_path, self.drive_db_path)
+    def sync_history(self, engine, data_folder):
+        existing = self.db.get_history_df()
+        if not existing.empty and (datetime.now() - pd.to_datetime(existing['date'].max())).days <= 1:
+            print(f"  [HISTORY] Flow DB current. Skipping scan."); self.sync_prices(); return
+        for fp, fn, ds in sorted([(f, os.path.basename(f), os.path.basename(f).replace('bot-eod-report-','').replace('.csv','')) for f in glob.glob(os.path.join(data_folder, 'bot-eod-report-*.csv')) if os.path.basename(f) not in self.processed_files], key=lambda x: x[2]):
+            df = engine.optimize_large_dataset(fp, date_stamp=ds)
+            if not df.empty: self.db.upsert_flow(df); self.processed_files.add(fn); open(self.log_file,'a').write(fn+'\\n')
+        self.sync_prices()
+    def sync_prices(self):
+        print("\\n[ORACLE] Syncing Price History via Alpaca...")
+        price_df = self.db.get_price_df()
+        if is_weekend() and not price_df.empty: print("  [ORACLE] Weekend - skipping."); return
+        hist_df = self.db.get_history_df()
+        if hist_df.empty: return
+        all_t = hist_df['ticker'].unique().tolist()
+        exist = set(price_df['ticker'].unique()) if not price_df.empty else set()
+        to_fetch = [t for t in all_t if t not in exist or (datetime.now().date() - pd.to_datetime(price_df[price_df['ticker']==t]['date'].max()).date()).days > 3]
+        to_fetch += random.sample(list(exist - set(to_fetch)), int(len(exist)*0.05)) if exist else []
+        if not to_fetch: print("  [ORACLE] Price DB up to date."); return
+        print(f"  [ORACLE] Fetching {len(to_fetch)} tickers...")
+        data = fetch_alpaca_batch(list(set(to_fetch)), datetime.now() - timedelta(days=730))
+        rows = []
+        for t, h in data.items():
+            tr = pd.concat([h['High']-h['Low'], abs(h['High']-h['Close'].shift(1)), abs(h['Low']-h['Close'].shift(1))], axis=1).max(axis=1)
+            atr = tr.rolling(14).mean().values
+            for i, (d, r) in enumerate(h.iterrows()): rows.append({'ticker': t, 'date': str(d), 'close': float(r['Close']), 'atr': float(atr[i]) if i < len(atr) and pd.notna(atr[i]) else 0})
+        if rows: self.db.upsert_prices(pd.DataFrame(rows)); print(f"  [ORACLE] Saved {len(rows)} rows.")
+''')
+        print(f"  [BOOTSTRAP] Created {loader_path}")
+
+    # Bootstrap engine/data_prep.py
+    prep_path = os.path.join(engine_dir, 'data_prep.py')
+    if not _is_valid_py(prep_path):
+        with open(prep_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+import numpy as np, pandas as pd
+
+def triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5, sl_multiplier=1.0, vol_lookback=20):
+    results = []; price_df = price_df.copy(); price_df['date'] = pd.to_datetime(price_df['date'])
+    for t in tickers:
+        d = price_df[price_df['ticker']==t].sort_values('date').reset_index(drop=True)
+        if len(d) < vol_lookback + holding_period + 1: continue
+        d['atr_use'] = d['atr'] if 'atr' in d.columns and d['atr'].notna().any() else d['close'].pct_change().abs().rolling(vol_lookback).mean() * d['close']
+        for i in range(vol_lookback, len(d) - holding_period):
+            entry, atr = d.loc[i, 'close'], d.loc[i, 'atr_use']
+            if pd.isna(atr) or atr <= 0: continue
+            tp, sl, fut = entry + atr*pt_multiplier, entry - atr*sl_multiplier, d.loc[i+1:i+holding_period]
+            tp_hit = sl_hit = None
+            for j, r in fut.iterrows():
+                if r['close'] >= tp and tp_hit is None: tp_hit = j - i
+                if r['close'] <= sl and sl_hit is None: sl_hit = j - i
+            if tp_hit and (sl_hit is None or tp_hit <= sl_hit): label, barrier = 1, 'TP'
+            elif sl_hit: label, barrier = -1, 'SL'
+            else:
+                ret = (fut['close'].iloc[-1] - entry) / entry if len(fut) > 0 else 0
+                label, barrier = (1 if ret > 0.01 else (-1 if ret < -0.01 else 0)), 'TIME'
+            results.append({'ticker': t, 'date': d.loc[i,'date'], 'label': label, 'barrier_hit': barrier, 'entry_price': entry, 'atr': atr})
+    return pd.DataFrame(results)
+
+def prepare_tcn_sequences(price_df, feature_df, tickers, seq_len=10, feature_cols=None, max_sequences=50000):
+    seqs, labels, tlist = [], [], []; price_df = price_df.copy(); price_df['date'] = pd.to_datetime(price_df['date'])
+    for t in tickers:
+        d = price_df[price_df['ticker']==t].sort_values('date').reset_index(drop=True)
+        if len(d) < seq_len + 6: continue
+        d['returns'], d['volatility'] = d['close'].pct_change(), d['close'].pct_change().rolling(10).std()
+        delta = d['close'].diff(); d['rsi'] = 100 - 100/(1 + delta.where(delta>0,0).rolling(14).mean() / ((-delta.where(delta<0,0)).rolling(14).mean() + 1e-10))
+        d['momentum_5d'], d['momentum_10d'] = d['close'].pct_change(5), d['close'].pct_change(10)
+        d['atr_norm'] = d['atr']/d['close'] if 'atr' in d.columns else d['volatility']*np.sqrt(10)
+        cols = ['returns','volatility','rsi','momentum_5d','momentum_10d','atr_norm']
+        for c in cols: d[c] = (d[c] - d[c].mean()) / (d[c].std() + 1e-10)
+        for i in range(20, len(d) - seq_len - 5):
+            s = d.loc[i:i+seq_len-1, cols].values
+            if s.shape[0] != seq_len or np.isnan(s).any(): continue
+            fp, cp = d.loc[i+seq_len+4,'close'] if i+seq_len+4 < len(d) else None, d.loc[i+seq_len-1,'close']
+            if fp is None or cp <= 0: continue
+            seqs.append(s); labels.append(1 if (fp-cp)/cp > 0.02 else 0); tlist.append(t)
+    if not seqs: return None, None, None
+    if len(seqs) > max_sequences:
+        idx = np.random.choice(len(seqs), max_sequences, replace=False)
+        seqs, labels, tlist = [seqs[i] for i in idx], [labels[i] for i in idx], [tlist[i] for i in idx]
+    return np.array(seqs), np.array(labels), tlist
+''')
+        print(f"  [BOOTSTRAP] Created {prep_path}")
+
+    # Add to path
     if COLAB_BASE not in sys.path:
         sys.path.insert(0, COLAB_BASE)
-    print(f"  [COLAB] Added {COLAB_BASE} to sys.path")
+    print(f"  [COLAB] Engine modules ready at {engine_dir}")
 except ImportError:
-    pass  # Running locally, no path modification needed
+    pass  # Running locally
 
 # =============================================================================
 # ENGINE MODULES (v12 Modular Architecture)
 # =============================================================================
-# All components imported from engine/ package
 from engine import (
-    # Config
     SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
     REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
     MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
     VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
     POSITION_SIZING_CONFIG, RISK_TIER_MATRIX,
-    # Neural
     SwingTransformer, TemporalBlock, TCN,
-    # Utils
     get_device, configure_yfinance_session, YF_SESSION,
     is_weekend, get_market_last_close_date, Logger,
     sanitize_ticker_for_alpaca, fetch_alpaca_batch,
-    # Data
     TitanDB, HistoryManager,
     triple_barrier_labels, prepare_tcn_sequences,
 )

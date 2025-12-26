@@ -162,6 +162,12 @@ def sanitize_ticker_for_alpaca(ticker):
     """Clean tickers for Alpaca (remove indices, zombies, warrants, fix BRK.B)."""
     t = str(ticker).upper().strip()
 
+    # Filter 0: Reject non-ASCII characters (causes latin-1 encoding errors)
+    try:
+        t.encode('ascii')
+    except UnicodeEncodeError:
+        return None
+
     # Filter 1: Exclude Indices and Warrants (containing +)
     if t.startswith('^'):
         return None
@@ -170,6 +176,10 @@ def sanitize_ticker_for_alpaca(ticker):
 
     # Filter 2: Yahoo "Zombie" Tickers (delisted stocks often get '1' suffix like FTV1)
     if len(t) > 1 and t[-1].isdigit():
+        return None
+
+    # Filter 3: Reject empty or too long tickers
+    if not t or len(t) > 10:
         return None
 
     # Map 1: Berkshire Hathaway (Yahoo: BRK-B -> Alpaca: BRK.B)
