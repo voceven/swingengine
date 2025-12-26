@@ -5067,15 +5067,7 @@ class SwingTradingEngine:
             # Example:
             # - LULU: 6mo=+40%, 3mo=+35% → 35/40=87.5% recency → early stage ✓
             # - FCX:  6mo=+50%, 3mo=+15% → 15/50=30% recency → prolonged trend ✗
-            #
-            # This filter addresses user feedback: "FCX and KGC are not remotely near
-            # the early stage of phoenix reversal - they have been going up for months/years"
             # =========================================================================
-            all_validation_tickers = (VALIDATION_SUITE.get('institutional_phoenix', []) +
-                                      VALIDATION_SUITE.get('negative_cases', []))
-            is_validation_ticker = ticker in all_validation_tickers
-
-            # Use hist_df (local variable from pattern analysis) instead of self.price_history_cache
             if phoenix_score > 0 and hist_df is not None and len(hist_df) >= 126:
 
                 # Handle both regular columns and MultiIndex columns (from yfinance)
@@ -5112,13 +5104,6 @@ class SwingTradingEngine:
                             current_px = float(close_series.iloc[-1])
                             return_6m = (current_px - price_6m_ago) / price_6m_ago if price_6m_ago > 0 else 0
 
-                        # Debug: Always show recency data for validation tickers
-                        is_validation_ticker = ticker in (VALIDATION_SUITE.get('institutional_phoenix', []) +
-                                                          VALIDATION_SUITE.get('negative_cases', []))
-                        if ENABLE_VALIDATION_MODE and is_validation_ticker:
-                            recency_ratio = return_3m / return_6m if return_6m > 0 else 0
-                            print(f"  [RECENCY DEBUG] {ticker}: 3mo={return_3m:.1%}, 6mo={return_6m:.1%}, recency={recency_ratio:.1%}")
-
                         # Calculate "recency ratio" - what % of 6mo gains came in last 3mo?
                         # High ratio (>60%) = gains are RECENT = early stage breakout
                         # Low ratio (<40%) = gains spread over time = prolonged uptrend
@@ -5137,9 +5122,8 @@ class SwingTradingEngine:
                                 recency_penalty = 0.60
                                 phoenix_accum = phoenix_accum * recency_penalty
                                 alpha_accum = alpha_accum * 1.15
-                    except Exception as e:
-                        if ENABLE_VALIDATION_MODE and ticker in VALIDATION_SUITE.get('negative_cases', []):
-                            print(f"  [RECENCY ERROR] {ticker}: {e}")
+                    except Exception:
+                        pass  # Silently skip if price data is malformed
 
             # Cup-and-Handle bonus (hybrid pattern - continuation from base)
             cup_handle_score = patterns['cup_handle'].get('cup_handle_score', 0)
