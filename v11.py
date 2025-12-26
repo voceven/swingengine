@@ -386,17 +386,163 @@ from datetime import datetime, timedelta
 # =============================================================================
 # ENGINE MODULES (v11.5 Modular Architecture)
 # =============================================================================
-# Import configuration from module - can be updated independently
-# Config changes only require updating engine/config.py (~250 lines)
-from engine.config import (
-    SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
-    REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
-    MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
-    VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
-    POSITION_SIZING_CONFIG, RISK_TIER_MATRIX
-)
-# Neural network architectures from module
-from engine.neural import SwingTransformer, TemporalBlock, TCN
+# Try to import from modules; fallback to inline definitions for Colab
+try:
+    from engine.config import (
+        SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
+        REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
+        MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
+        VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
+        POSITION_SIZING_CONFIG, RISK_TIER_MATRIX
+    )
+    from engine.neural import SwingTransformer, TemporalBlock, TCN
+    _ENGINE_MODULES_LOADED = True
+except ModuleNotFoundError:
+    _ENGINE_MODULES_LOADED = False
+    # Inline config definitions for standalone execution (Colab)
+    SECTOR_MAP = {
+        'Technology': 'XLK', 'Financial Services': 'XLF', 'Healthcare': 'XLV',
+        'Consumer Cyclical': 'XLY', 'Industrials': 'XLI', 'Communication Services': 'XLC',
+        'Consumer Defensive': 'XLP', 'Energy': 'XLE', 'Basic Materials': 'XLB',
+        'Real Estate': 'XLRE', 'Utilities': 'XLU'
+    }
+    BULL_FLAG_CONFIG = {
+        'pole_min_gain': 0.05, 'pole_days': 12, 'flag_max_range': 0.15,
+        'flag_days': 10, 'volume_decline_ratio': 0.95
+    }
+    GEX_WALL_CONFIG = {
+        'min_support_gamma': 50_000, 'min_resist_gamma': -50_000, 'proximity_pct': 0.10
+    }
+    PHOENIX_CONFIG = {
+        'min_base_days': 60, 'max_base_days': 730, 'institutional_threshold': 365,
+        'volume_surge_threshold': 1.5, 'rsi_min': 50, 'rsi_max': 70,
+        'max_drawdown_pct': 0.70, 'min_consolidation_pct': 0.15, 'breakout_threshold': 0.03
+    }
+    REVERSAL_CONFIG = {
+        'lookback_days': 45, 'min_days_below_sma': 15, 'dp_proximity_pct': 0.10
+    }
+    GATEKEEPER_CONFIG = {
+        'large_cap_threshold': 5_000_000, 'mid_cap_threshold': 2_000_000,
+        'small_cap_threshold': 1_000_000, 'large_cap_min': 10_000_000_000,
+        'mid_cap_min': 2_000_000_000, 'dp_bypass_threshold': 500_000,
+        'max_spread_pct': 0.005, 'min_options_oi': 500
+    }
+    SOLIDITY_CONFIG = {
+        'fib_retracement': 0.382, 'min_consolidation_days': 20,
+        'max_consolidation_range': 0.382, 'volume_decline_ratio': 0.70,
+        'volume_lookback_days': 50, 'min_dp_total': 10_000_000,
+        'signature_print_bonus': 0.10, 'weight_in_phoenix': 0.18, 'base_threshold': 0.55
+    }
+    DUAL_RANKING_CONFIG = {
+        'alpha_momentum': {
+            'min_score': 75, 'top_n': 25,
+            'weight_trend': 0.30, 'weight_ml': 0.25, 'weight_neural': 0.15,
+            'weight_volume': 0.15, 'weight_pattern': 0.15
+        },
+        'phoenix_reversal': {
+            'min_score': 55, 'top_n': 25,
+            'weight_solidity': 0.20, 'weight_duration': 0.20, 'weight_flow': 0.15,
+            'weight_breakout': 0.15, 'weight_pattern': 0.15, 'weight_ml': 0.15
+        }
+    }
+    MAX_PICKS_PER_SECTOR = 3
+    PERFORMANCE_CONFIG = {
+        'catboost_trials': 25, 'catboost_max_iterations': 500, 'catboost_max_depth': 10,
+        'catboost_cv_folds': 5, 'model_cache_days': 7, 'transformer_epochs': 30,
+        'max_tickers_to_fetch': 3000, 'price_cache_days': 7, 'batch_size': 75
+    }
+    ENABLE_VALIDATION_MODE = True
+    VALIDATION_SUITE = {
+        'institutional_phoenix': ['LULU', 'NVO'],
+        'speculative_phoenix': [],
+        'negative_cases': ['FCX', 'KGC']
+    }
+    MACRO_WEIGHTS = {
+        'vix_z_threshold': 2.0, 'vix_penalty_per_sigma': 2.0,
+        'tnx_z_threshold': 2.0, 'tnx_penalty_per_sigma': 3.0,
+        'dxy_z_threshold': 2.0, 'dxy_penalty_per_sigma': 1.5
+    }
+    VIX_TERM_STRUCTURE_CONFIG = {
+        'mild_contango_threshold': 1.10, 'extreme_contango_threshold': 1.20,
+        'backwardation_threshold': 0.95, 'mild_contango_bonus': 2.0,
+        'extreme_contango_penalty': 4.0, 'backwardation_penalty': 5.0,
+        'vvix_high_threshold': 110, 'vvix_low_threshold': 85,
+        'vvix_divergence_lookback': 5, 'vvix_divergence_penalty': 4.0,
+        'vvix_convergence_bonus': 2.0
+    }
+    POSITION_SIZING_CONFIG = {
+        'kelly_fraction': 0.25, 'max_position_pct': 0.10,
+        'min_position_pct': 0.01, 'default_win_rate': 0.55, 'default_edge': 0.10
+    }
+    RISK_TIER_MATRIX = {
+        'score_tiers': {
+            (95, 100): {'<5%': 1.0, '5-6%': 0.75, '>6%': 0.50},
+            (85, 94): {'<5%': 0.75, '5-6%': 0.50, '>6%': 0.35},
+            (70, 84): {'<5%': 0.50, '5-6%': 0.35, '>6%': 0.20}
+        },
+        'vol_thresholds': {'low': 0.05, 'medium': 0.06}
+    }
+
+    # Inline neural network definitions for standalone execution
+    class SwingTransformer(nn.Module):
+        def __init__(self, input_size, d_model=128, nhead=4, num_layers=3, output_size=1, dropout=0.1):
+            super(SwingTransformer, self).__init__()
+            self.embedding = nn.Linear(input_size, d_model)
+            self.pos_encoder = nn.Parameter(torch.zeros(1, 10, d_model))
+            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=512, dropout=dropout, batch_first=True)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.fc1 = nn.Linear(d_model, 64)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(64, output_size)
+            self.sigmoid = nn.Sigmoid()
+
+        def forward(self, x):
+            x = self.embedding(x)
+            if x.size(1) <= self.pos_encoder.size(1):
+                x = x + self.pos_encoder[:, :x.size(1), :]
+            x = self.transformer_encoder(x)
+            x = x.mean(dim=1)
+            x = self.fc1(x)
+            x = self.relu(x)
+            return self.sigmoid(self.fc2(x))
+
+    class TemporalBlock(nn.Module):
+        def __init__(self, n_inputs, n_outputs, kernel_size, dilation, dropout=0.2):
+            super(TemporalBlock, self).__init__()
+            padding = (kernel_size - 1) * dilation
+            self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
+            self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, padding=padding, dilation=dilation)
+            self.dropout = nn.Dropout(dropout)
+            self.relu = nn.ReLU()
+            self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+            self.conv1.weight.data.normal_(0, 0.01)
+            self.conv2.weight.data.normal_(0, 0.01)
+
+        def forward(self, x):
+            out = self.conv1(x)[:, :, :x.size(2)]
+            out = self.relu(self.dropout(out))
+            out = self.conv2(out)[:, :, :x.size(2)]
+            out = self.relu(self.dropout(out))
+            res = x if self.downsample is None else self.downsample(x)
+            return self.relu(out + res)
+
+    class TCN(nn.Module):
+        def __init__(self, input_size, num_channels=[32, 32, 16], kernel_size=3, dropout=0.2):
+            super(TCN, self).__init__()
+            layers = []
+            for i in range(len(num_channels)):
+                dilation = 2 ** i
+                in_ch = input_size if i == 0 else num_channels[i-1]
+                layers.append(TemporalBlock(in_ch, num_channels[i], kernel_size, dilation, dropout))
+            self.network = nn.Sequential(*layers)
+            self.fc = nn.Linear(num_channels[-1], 1)
+            self.sigmoid = nn.Sigmoid()
+
+        def forward(self, x):
+            x = x.transpose(1, 2)
+            out = self.network(x)
+            out = out.mean(dim=2)
+            return self.sigmoid(self.fc(out))
 
 ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
 ALPACA_SECRET_KEY = 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK'
