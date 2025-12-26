@@ -5075,33 +5075,28 @@ class SwingTradingEngine:
                                       VALIDATION_SUITE.get('negative_cases', []))
             is_validation_ticker = ticker in all_validation_tickers
 
-            # Debug: Confirm we reach this section for validation tickers
-            if ENABLE_VALIDATION_MODE and is_validation_ticker:
-                in_cache = ticker in self.price_history_cache
-                print(f"  [RECENCY CHECK] {ticker}: phoenix_score={phoenix_score:.2f}, in_cache={in_cache}")
-
-            if phoenix_score > 0 and ticker in self.price_history_cache:
-                hist = self.price_history_cache[ticker]
+            # Use hist_df (local variable from pattern analysis) instead of self.price_history_cache
+            if phoenix_score > 0 and hist_df is not None and len(hist_df) >= 126:
 
                 # Handle both regular columns and MultiIndex columns (from yfinance)
                 close_col = None
-                if 'Close' in hist.columns:
+                if 'Close' in hist_df.columns:
                     close_col = 'Close'
-                elif 'close' in hist.columns:
+                elif 'close' in hist_df.columns:
                     close_col = 'close'
-                elif hasattr(hist.columns, 'get_level_values'):
+                elif hasattr(hist_df.columns, 'get_level_values'):
                     # MultiIndex columns - try to find Close
-                    level0 = hist.columns.get_level_values(0)
+                    level0 = hist_df.columns.get_level_values(0)
                     if 'Close' in level0:
                         close_col = 'Close'
 
-                if close_col and len(hist) >= 126:  # Need 6+ months data
+                if close_col:  # Already checked len >= 126 above
                     # Get close prices, handling MultiIndex if needed
                     try:
-                        if hasattr(hist.columns, 'nlevels') and hist.columns.nlevels > 1:
-                            close_series = hist[close_col].iloc[:, 0] if isinstance(hist[close_col], pd.DataFrame) else hist[close_col]
+                        if hasattr(hist_df.columns, 'nlevels') and hist_df.columns.nlevels > 1:
+                            close_series = hist_df[close_col].iloc[:, 0] if isinstance(hist_df[close_col], pd.DataFrame) else hist_df[close_col]
                         else:
-                            close_series = hist[close_col]
+                            close_series = hist_df[close_col]
 
                         # Calculate 3-month return (last ~63 trading days)
                         return_3m = 0.0
