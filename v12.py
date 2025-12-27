@@ -1649,6 +1649,36 @@ class SwingTradingEngine:
         vwap_proxy = (close * volume).rolling(20).sum() / (volume.rolling(20).sum() + 1e-9)
         vwap_distance = (close.iloc[-1] - vwap_proxy.iloc[-1]) / (vwap_proxy.iloc[-1] + 1e-9)
 
+        # --- FRACTIONAL DIFFERENTIATION (v12) ---
+        # López de Prado's method: make series stationary while preserving memory
+        # d=0.3-0.5 balances stationarity with information retention
+        # Reference: "Advances in Financial Machine Learning" Ch. 5
+        def frac_diff_weights(d, threshold=1e-4, max_k=100):
+            """Generate fractional differentiation weights until threshold."""
+            weights = [1.0]
+            for k in range(1, max_k):
+                w = weights[-1] * (d - k + 1) / k
+                if abs(w) < threshold:
+                    break
+                weights.append(w)
+            return np.array(weights[::-1])  # Reverse for convolution
+
+        def apply_frac_diff(series, d=0.4):
+            """Apply fractional differentiation to a series."""
+            weights = frac_diff_weights(d)
+            width = len(weights)
+            if len(series) < width:
+                return np.nan
+            # Use log prices for fractional differentiation
+            log_series = np.log(series.replace(0, 1e-9))
+            # Convolve with weights (dot product of last 'width' values)
+            result = log_series.rolling(width).apply(lambda x: np.dot(x, weights), raw=True)
+            return result
+
+        # Fractionally differentiated log close (d=0.4 typical for stocks)
+        frac_diff = apply_frac_diff(close, d=0.4)
+        frac_diff_close = float(frac_diff.iloc[-1]) if not pd.isna(frac_diff.iloc[-1]) else 0.0
+
         return {
             'rsi': float(rsi.iloc[-1]),
             'trend_score': float(trend_score.iloc[-1]),
@@ -1664,6 +1694,8 @@ class SwingTradingEngine:
             'cmf_20': float(cmf_20.iloc[-1]),  # Chaikin Money Flow 20-day
             'obv_slope': float(obv_slope),  # OBV momentum
             'vwap_distance': float(vwap_distance),  # Distance from VWAP proxy
+            # Fractional Differentiation (v12)
+            'frac_diff_close': frac_diff_close,  # Stationary price with memory
         }
 
     def enrich_market_data(self, flow_df):
