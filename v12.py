@@ -1361,6 +1361,98 @@ def generate_full_report(stocks_df, etfs_df, engine, dual_ranking_config, enable
 ''')
         print(f"  [BOOTSTRAP] Created {report_path}")
 
+    # Bootstrap engine/transformer.py
+    transformer_path = os.path.join(engine_dir, 'transformer.py')
+    if not _is_valid_py(transformer_path):
+        with open(transformer_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+"""Transformer/Hive Mind Training for Swing Trading Engine v12"""
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.optim as optim, gc
+from datetime import timedelta
+from sklearn.preprocessing import StandardScaler
+from .neural import SwingTransformer
+from .config import PERFORMANCE_CONFIG
+
+def _prepare_inference_only(hist_df, valid_cols, nn_scaler, window_size):
+    df = hist_df[valid_cols].copy()
+    df['date'] = pd.to_datetime(df['date']); df = df.sort_values(['ticker', 'date'])
+    feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
+    df[feature_cols] = nn_scaler.fit_transform(df[feature_cols])
+    sequences, targets, tickers_list = [], [], []
+    for ticker, group in df.groupby('ticker'):
+        if len(group) >= window_size:
+            sequences.append(group[feature_cols].values[-window_size:]); targets.append(-1); tickers_list.append(ticker)
+    if not sequences: return None, None, None, None
+    return np.array(sequences), np.array(targets), tickers_list, feature_cols
+
+def prepare_supervised_data(history_mgr, nn_scaler, window_size=3, lookahead=1):
+    print(f"\\n[TRANSFORMER] Preparing Supervised Data (Window={window_size}, Lookahead={lookahead}d)...")
+    hist_df = history_mgr.db.get_history_df()
+    if hist_df.empty: return None, None, None, None
+    needed_cols = ['ticker', 'date', 'net_gamma', 'net_delta', 'open_interest', 'adj_iv']
+    valid_cols = [c for c in needed_cols if c in hist_df.columns]
+    if len(valid_cols) < 4: return None, None, None, None
+    price_df = history_mgr.db.get_price_df()
+    if price_df.empty: return _prepare_inference_only(hist_df, valid_cols, nn_scaler, window_size)
+    price_df['date'] = pd.to_datetime(price_df['date'], errors='coerce')
+    price_df = price_df.dropna(subset=['date'])
+    if price_df.empty: return _prepare_inference_only(hist_df, valid_cols, nn_scaler, window_size)
+    df = hist_df[valid_cols].copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce'); df = df.dropna(subset=['date']); df = df.sort_values(['ticker', 'date'])
+    feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
+    df[feature_cols] = nn_scaler.fit_transform(df[feature_cols])
+    sequences, targets, tickers_list = [], [], []
+    price_lookup = price_df.set_index(['ticker', 'date'])['close'].to_dict(); count_labeled = 0
+    print(f"  [TRANSFORMER] Building sequences from {len(df)} rows...")
+    for ticker, group in df.groupby('ticker'):
+        if len(group) >= window_size:
+            for i in range(len(group) - window_size):
+                seq_slice = group.iloc[i:i+window_size]; last_date = pd.to_datetime(seq_slice['date'].values[-1])
+                target_date = last_date + timedelta(days=lookahead); start_price = price_lookup.get((ticker, last_date)); end_price = None
+                for d in range(3):
+                    check_date = target_date + timedelta(days=d)
+                    if (ticker, check_date) in price_lookup: end_price = price_lookup[(ticker, check_date)]; break
+                if start_price and end_price and start_price > 0:
+                    label = 1 if (end_price - start_price) / start_price > 0.01 else 0
+                    sequences.append(seq_slice[feature_cols].values); targets.append(label); count_labeled += 1
+            sequences.append(group[feature_cols].values[-window_size:]); targets.append(-1); tickers_list.append(ticker)
+    if not sequences: return None, None, None, None
+    print(f"  [TRANSFORMER] Created {len(sequences)} sequences. Labeled Training Data: {count_labeled}.")
+    return np.array(sequences), np.array(targets), tickers_list, feature_cols
+
+def train_hive_mind(history_mgr, nn_scaler, device, num_models=5):
+    X_data, y_data, inference_tickers, feature_cols = prepare_supervised_data(history_mgr, nn_scaler, window_size=3, lookahead=1)
+    if X_data is None or np.sum(y_data != -1) == 0:
+        X_data, y_data, inference_tickers, feature_cols = prepare_supervised_data(history_mgr, nn_scaler, window_size=2, lookahead=1)
+    if X_data is None: return None
+    train_mask = y_data != -1; X_train, y_train = X_data[train_mask], y_data[train_mask]; X_infer = X_data[~train_mask]
+    input_size, ensemble_preds = len(feature_cols), []
+    if len(X_train) > 10:
+        print(f"  [HIVE MIND] Training {num_models} Independent Transformers (Bagging)...")
+        X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
+        y_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+        X_infer_tensor = torch.tensor(X_infer, dtype=torch.float32).to(device) if len(X_infer) > 0 else None
+        for i in range(num_models):
+            print(f"    ... Training Brain #{i+1} ...")
+            torch.manual_seed(42 + i); model = SwingTransformer(input_size=input_size, d_model=128, num_layers=3).to(device)
+            model.train(); optimizer = optim.Adam(model.parameters(), lr=0.0005); criterion = nn.BCELoss()
+            for _ in range(PERFORMANCE_CONFIG.get('transformer_epochs', 30)):
+                optimizer.zero_grad(); outputs = model(X_tensor); criterion(outputs, y_tensor).backward(); optimizer.step()
+            model.eval()
+            if X_infer_tensor is not None:
+                with torch.no_grad(): ensemble_preds.append(model(X_infer_tensor).cpu().numpy().flatten())
+        try: del X_tensor, y_tensor; torch.cuda.empty_cache(); gc.collect()
+        except: pass
+    else: return None
+    if ensemble_preds:
+        avg_preds = np.mean(ensemble_preds, axis=0); nn_df = pd.DataFrame({'ticker': inference_tickers, 'nn_score': avg_preds})
+        min_s, max_s = nn_df['nn_score'].min(), nn_df['nn_score'].max()
+        nn_df['nn_score'] = (nn_df['nn_score'] - min_s) / (max_s - min_s) * 100 if max_s - min_s > 0.0001 else nn_df['nn_score'] * 100
+        return nn_df
+    return None
+''')
+        print(f"  [BOOTSTRAP] Created {transformer_path}")
+
     # Add to path
     if COLAB_BASE not in sys.path:
         sys.path.insert(0, COLAB_BASE)
@@ -1397,6 +1489,8 @@ from engine import (
     train_ensemble as _train_ensemble,
     # Report generation (v12 modular)
     generate_full_report as _generate_full_report,
+    # Transformer/Hive Mind (v12 modular)
+    train_hive_mind as _train_hive_mind,
 )
 
 ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
@@ -2041,158 +2135,12 @@ class SwingTradingEngine:
             return updated_df
         except: return current_flow_df
 
-    # --- SUPERVISED LEARNING PIPELINE ---
-    def prepare_supervised_data(self, window_size=3, lookahead=1):
-        print(f"\n[TRANSFORMER] Preparing Supervised Data (Window={window_size}, Lookahead={lookahead}d)...")
-        hist_df = self.history_mgr.db.get_history_df()
-        if hist_df.empty: return None, None, None, None
-
-        needed_cols = ['ticker', 'date', 'net_gamma', 'net_delta', 'open_interest', 'adj_iv']
-        valid_cols = [c for c in needed_cols if c in hist_df.columns]
-        if len(valid_cols) < 4: return None, None, None, None
-
-        price_df = self.history_mgr.db.get_price_df()
-        if price_df.empty: return self.prepare_inference_data(window_size)
-
-        # v10.6.1: Robust date parsing - yfinance sometimes leaks header "Ticker" into data
-        price_df['date'] = pd.to_datetime(price_df['date'], errors='coerce')
-        price_df = price_df.dropna(subset=['date'])  # Remove corrupt rows with "Ticker" in date
-        if price_df.empty: return self.prepare_inference_data(window_size)
-
-        df = hist_df[valid_cols].copy()
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df = df.dropna(subset=['date'])  # Safety: remove any corrupt rows here too
-        df = df.sort_values(['ticker', 'date'])
-
-        feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
-        df[feature_cols] = self.nn_scaler.fit_transform(df[feature_cols])
-
-        sequences = []
-        targets = []
-        tickers_list = []
-
-        grouped = df.groupby('ticker')
-        price_lookup = price_df.set_index(['ticker', 'date'])['close'].to_dict()
-        count_labeled = 0
-
-        print(f"  [TRANSFORMER] Building sequences from {len(df)} rows...")
-
-        for ticker, group in grouped:
-            if len(group) >= window_size:
-                for i in range(len(group) - window_size):
-                    seq_slice = group.iloc[i : i+window_size]
-                    seq_dates = seq_slice['date'].values
-                    last_date = pd.to_datetime(seq_dates[-1])
-                    target_date = last_date + timedelta(days=lookahead)
-                    start_price = price_lookup.get((ticker, last_date))
-                    end_price = None
-                    for d in range(3):
-                        check_date = target_date + timedelta(days=d)
-                        if (ticker, check_date) in price_lookup:
-                            end_price = price_lookup[(ticker, check_date)]
-                            break
-                    if start_price and end_price and start_price > 0:
-                        ret = (end_price - start_price) / start_price
-                        label = 1 if ret > 0.01 else 0
-                        sequences.append(seq_slice[feature_cols].values)
-                        targets.append(label)
-                        count_labeled += 1
-
-                sequences.append(group[feature_cols].values[-window_size:])
-                targets.append(-1)
-                tickers_list.append(ticker)
-
-        if not sequences: return None, None, None, None
-        X = np.array(sequences)
-        y = np.array(targets)
-        print(f"  [TRANSFORMER] Created {len(X)} sequences. Labeled Training Data: {count_labeled}.")
-        return X, y, tickers_list, feature_cols
-
-    def prepare_inference_data(self, window_size):
-        hist_df = self.history_mgr.db.get_history_df()
-        if hist_df.empty: return None, None, None, None
-
-        needed_cols = ['ticker', 'date', 'net_gamma', 'net_delta', 'open_interest', 'adj_iv']
-        valid_cols = [c for c in needed_cols if c in hist_df.columns]
-        if len(valid_cols) < 4: return None, None, None, None
-        df = hist_df[valid_cols].copy()
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.sort_values(['ticker', 'date'])
-        feature_cols = [c for c in valid_cols if c not in ['ticker', 'date']]
-        df[feature_cols] = self.nn_scaler.fit_transform(df[feature_cols])
-        sequences, targets, tickers_list = [], [], []
-        for ticker, group in df.groupby('ticker'):
-            if len(group) >= window_size:
-                sequences.append(group[feature_cols].values[-window_size:])
-                targets.append(-1)
-                tickers_list.append(ticker)
-        if not sequences: return None, None, None, None
-        return np.array(sequences), np.array(targets), tickers_list, feature_cols
-
-    # --- HIVE MIND (ENSEMBLE) ---
+    # --- HIVE MIND (ENSEMBLE) - See engine/transformer.py for full implementation ---
     def train_run_transformer(self):
-        X_data, y_data, inference_tickers, feature_cols = self.prepare_supervised_data(window_size=3, lookahead=1)
-        if X_data is None or np.sum(y_data != -1) == 0:
-             X_data, y_data, inference_tickers, feature_cols = self.prepare_supervised_data(window_size=2, lookahead=1)
-
-        if X_data is None: return
-
-        train_mask = y_data != -1
-        X_train = X_data[train_mask]
-        y_train = y_data[train_mask]
-        X_infer = X_data[~train_mask]
-
-        input_size = len(feature_cols)
-        num_models = 5
-        ensemble_preds = []
-
-        if len(X_train) > 10:
-            print(f"  [HIVE MIND] Training {num_models} Independent Transformers (Bagging)...")
-            X_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-            y_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
-            X_infer_tensor = torch.tensor(X_infer, dtype=torch.float32).to(device) if len(X_infer) > 0 else None
-
-            for i in range(num_models):
-                print(f"    ... Training Brain #{i+1} ...")
-                torch.manual_seed(42 + i)
-                model = SwingTransformer(input_size=input_size, d_model=128, num_layers=3).to(device)
-                model.train()
-                optimizer = optim.Adam(model.parameters(), lr=0.0005)
-                criterion = nn.BCELoss()
-                epochs = PERFORMANCE_CONFIG.get('transformer_epochs', 30)
-                for epoch in range(epochs):
-                    optimizer.zero_grad()
-                    outputs = model(X_tensor)
-                    loss = criterion(outputs, y_tensor)
-                    loss.backward()
-                    optimizer.step()
-                model.eval()
-                if X_infer_tensor is not None:
-                    with torch.no_grad():
-                        preds = model(X_infer_tensor).cpu().numpy().flatten()
-                        ensemble_preds.append(preds)
-        else: return
-
-        if ensemble_preds:
-            avg_preds = np.mean(ensemble_preds, axis=0)
-            nn_df = pd.DataFrame({'ticker': inference_tickers, 'nn_score': avg_preds})
-            min_s, max_s = nn_df['nn_score'].min(), nn_df['nn_score'].max()
-            if max_s - min_s > 0.0001:
-                nn_df['nn_score'] = (nn_df['nn_score'] - min_s) / (max_s - min_s) * 100
-            else: nn_df['nn_score'] = nn_df['nn_score'] * 100
-            if not self.full_df.empty:
-                self.full_df = pd.merge(self.full_df, nn_df, on='ticker', how='left').fillna(0)
-
-        # --- GPU MEMORY CLEANUP (v11.5.1) ---
-        # Free GPU memory after Hive Mind training to prevent OOM during ensemble training
-        try:
-            del X_tensor, y_tensor
-            if X_infer_tensor is not None:
-                del X_infer_tensor
-            torch.cuda.empty_cache()
-            gc.collect()
-        except:
-            pass  # Variables may not exist if training was skipped
+        """Train ensemble of transformers (Hive Mind). See engine/transformer.py (~150 lines)."""
+        nn_df = _train_hive_mind(self.history_mgr, self.nn_scaler, device, num_models=5)
+        if nn_df is not None and not self.full_df.empty:
+            self.full_df = pd.merge(self.full_df, nn_df, on='ticker', how='left').fillna(0)
 
     # --- RESTORED SECTOR FETCH ---
     def fetch_sector_history(self):

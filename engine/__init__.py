@@ -41,3 +41,4 @@ from .patterns import (
 )
 from .ml import train_ensemble
 from .report import generate_full_report
+from .transformer import train_hive_mind
