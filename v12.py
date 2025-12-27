@@ -1679,6 +1679,32 @@ class SwingTradingEngine:
         frac_diff = apply_frac_diff(close, d=0.4)
         frac_diff_close = float(frac_diff.iloc[-1]) if not pd.isna(frac_diff.iloc[-1]) else 0.0
 
+        # --- VPIN FLOW TOXICITY (v12) ---
+        # Volume-synchronized Probability of Informed Trading
+        # Measures order flow imbalance to detect informed trading activity
+        # Reference: Easley, López de Prado, O'Hara (2012) "Flow Toxicity and Liquidity"
+        open_price = history_df['Open']
+        if isinstance(open_price, pd.DataFrame):
+            open_price = open_price.iloc[:, 0]
+
+        # Bulk Volume Classification: classify daily volume as buy/sell
+        # Using close-open direction (simplified tick rule for daily data)
+        price_direction = np.sign(close - open_price)  # +1 buy, -1 sell, 0 neutral
+        buy_volume = volume * ((price_direction + 1) / 2)  # Scale: 0 to 1
+        sell_volume = volume * ((1 - price_direction) / 2)  # Scale: 0 to 1
+
+        # Order Imbalance per period
+        order_imbalance = (buy_volume - sell_volume) / (volume + 1e-9)
+
+        # VPIN: Rolling average of absolute order imbalance (20-day window)
+        # Higher VPIN = more informed trading (potential volatility/moves)
+        vpin_20 = order_imbalance.abs().rolling(20).mean()
+        vpin = float(vpin_20.iloc[-1]) if not pd.isna(vpin_20.iloc[-1]) else 0.0
+
+        # VPIN velocity: rate of change in VPIN (rising VPIN = increasing informed activity)
+        vpin_prev = float(vpin_20.iloc[-5]) if len(vpin_20) > 5 and not pd.isna(vpin_20.iloc[-5]) else vpin
+        vpin_velocity = (vpin - vpin_prev) / (vpin_prev + 1e-9)
+
         return {
             'rsi': float(rsi.iloc[-1]),
             'trend_score': float(trend_score.iloc[-1]),
@@ -1696,6 +1722,9 @@ class SwingTradingEngine:
             'vwap_distance': float(vwap_distance),  # Distance from VWAP proxy
             # Fractional Differentiation (v12)
             'frac_diff_close': frac_diff_close,  # Stationary price with memory
+            # VPIN Flow Toxicity (v12)
+            'vpin': vpin,  # Volume-synchronized Prob of Informed Trading (0-1)
+            'vpin_velocity': vpin_velocity,  # Rate of change in VPIN
         }
 
     def enrich_market_data(self, flow_df):
