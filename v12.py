@@ -409,6 +409,7 @@ except ImportError:
 from engine import (
     SECTOR_MAP, BULL_FLAG_CONFIG, GEX_WALL_CONFIG, PHOENIX_CONFIG,
     REVERSAL_CONFIG, GATEKEEPER_CONFIG, SOLIDITY_CONFIG, DUAL_RANKING_CONFIG,
+    REGIME_WEIGHT_ADJUSTMENTS,  # v12: Regime-adaptive scoring
     MAX_PICKS_PER_SECTOR, PERFORMANCE_CONFIG, ENABLE_VALIDATION_MODE,
     VALIDATION_SUITE, MACRO_WEIGHTS, VIX_TERM_STRUCTURE_CONFIG,
     POSITION_SIZING_CONFIG, RISK_TIER_MATRIX,
@@ -1921,9 +1922,26 @@ class SwingTradingEngine:
         # These are NOT the same as the old trend/ambush scores - they use different formulas
         print("  [v11.2] Initializing Dual-Ranking Architecture...")
 
+        # --- v12: REGIME-ADAPTIVE WEIGHT ADJUSTMENTS ---
+        # Get regime-specific weight multipliers
+        regime_adjustments = REGIME_WEIGHT_ADJUSTMENTS.get(self.market_regime, REGIME_WEIGHT_ADJUSTMENTS['Neutral'])
+        alpha_regime_adj = regime_adjustments.get('alpha', {})
+        phoenix_regime_adj = regime_adjustments.get('phoenix', {})
+        regime_score_adj = regime_adjustments.get('score_adjustment', 0)
+        feature_boost = regime_adjustments.get('feature_boost', [])
+
+        if alpha_regime_adj or phoenix_regime_adj:
+            print(f"  [v12] Regime-Adaptive Mode: {self.market_regime}")
+            if feature_boost:
+                print(f"  [v12] Boosted features: {', '.join(feature_boost)}")
+
         # --- ALPHA MOMENTUM SCORE (for continuation/trending plays) ---
         # Formula: Heavy weight on ML prediction + trend + volume momentum
-        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum']
+        alpha_config = DUAL_RANKING_CONFIG['alpha_momentum'].copy()
+        # Apply regime adjustments to alpha weights
+        for key, multiplier in alpha_regime_adj.items():
+            if key in alpha_config:
+                alpha_config[key] = alpha_config[key] * multiplier
 
         # Base from ML ensemble (25% weight)
         df['alpha_momentum_score'] = df['raw_score'] * 100 * alpha_config['weight_ml']
@@ -1945,7 +1963,11 @@ class SwingTradingEngine:
 
         # --- PHOENIX REVERSAL SCORE (for base breakout/reversal plays) ---
         # Formula: Heavy weight on solidity + duration + institutional flow, LESS on ML
-        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal']
+        phoenix_config = DUAL_RANKING_CONFIG['phoenix_reversal'].copy()
+        # Apply regime adjustments to phoenix weights
+        for key, multiplier in phoenix_regime_adj.items():
+            if key in phoenix_config:
+                phoenix_config[key] = phoenix_config[key] * multiplier
 
         # Base from ML ensemble (12% weight - LOWER than alpha, ML is momentum-biased)
         df['phoenix_reversal_score'] = df['raw_score'] * 100 * phoenix_config['weight_ml']
@@ -1996,6 +2018,30 @@ class SwingTradingEngine:
             df['ambush_score_val'] += macro_adj
             df['alpha_momentum_score'] += macro_adj
             df['phoenix_reversal_score'] += macro_adj
+
+        # --- v12: REGIME FEATURE BOOST ---
+        # Apply bonus points for regime-relevant features
+        if feature_boost:
+            boost_bonus = 0.0
+            for feat in feature_boost:
+                if feat in df.columns:
+                    # Normalize feature to 0-10 points and add to scores
+                    feat_vals = df[feat].fillna(0)
+                    # For features in [-1, 1] range, scale to [0, 5]
+                    if feat in ['clv', 'cmf_20', 'smc_net']:
+                        feat_bonus = (feat_vals + 1) * 2.5
+                    # For features in [0, 1] range, scale to [0, 5]
+                    elif feat in ['vpin', 'smc_bullish', 'smc_bearish']:
+                        feat_bonus = feat_vals * 5
+                    # For velocity/trend features, use as-is capped
+                    else:
+                        feat_bonus = feat_vals.clip(-5, 5)
+                    df['alpha_momentum_score'] += feat_bonus
+                    df['phoenix_reversal_score'] += feat_bonus * 0.5  # Less for phoenix
+                    boost_bonus += feat_bonus.mean()
+
+            if boost_bonus > 0:
+                print(f"  [v12] Feature boost applied: +{boost_bonus:.1f} avg points")
 
         # --- TITAN EXECUTION LAYER (ATR STOP/PROFIT) ---
         price_db = self.history_mgr.db.get_price_df()

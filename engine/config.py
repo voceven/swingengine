@@ -137,6 +137,119 @@ DUAL_RANKING_CONFIG = {
     },
 }
 
+# =============================================================================
+# REGIME-ADAPTIVE WEIGHT ADJUSTMENTS (v12)
+# =============================================================================
+# Adjusts scoring weights based on current market regime
+# Multipliers applied to base weights (1.0 = no change, 1.2 = +20%, 0.8 = -20%)
+REGIME_WEIGHT_ADJUSTMENTS = {
+    # Crisis: Favor reversals, VPIN spikes, SMC patterns over momentum
+    'Crisis (Extreme Vol)': {
+        'alpha': {
+            'weight_trend': 0.6,      # Reduce trend following in crisis
+            'weight_ml': 0.8,         # ML may not adapt fast enough
+            'weight_neural': 0.7,     # Neural signals less reliable
+            'weight_volume': 1.3,     # Volume spikes matter more
+        },
+        'phoenix': {
+            'weight_solidity': 1.3,   # Institutional accumulation key
+            'weight_flow': 1.4,       # Watch for capitulation/accumulation
+            'weight_ml': 0.7,         # ML biased to normal conditions
+        },
+        'feature_boost': ['vpin', 'vpin_velocity', 'smc_bullish'],  # These features matter more
+        'score_adjustment': -10,      # General risk-off
+    },
+
+    # Fear with Backwardation: Potential bottoming, favor reversals
+    'Fear (Backwardation)': {
+        'alpha': {
+            'weight_trend': 0.7,
+            'weight_ml': 0.9,
+            'weight_volume': 1.2,
+        },
+        'phoenix': {
+            'weight_solidity': 1.2,
+            'weight_flow': 1.3,
+            'weight_breakout': 1.2,   # Breakouts from fear = strong
+        },
+        'feature_boost': ['smc_bullish', 'cmf_20', 'clv'],
+        'score_adjustment': -5,
+    },
+
+    # Complacency: Mean reversion setups, watch for regime change
+    'Complacency (Extreme Contango)': {
+        'alpha': {
+            'weight_trend': 1.1,      # Momentum works in complacency
+            'weight_ml': 1.0,
+            'weight_pattern': 1.2,    # Bull flags work well
+        },
+        'phoenix': {
+            'weight_solidity': 1.0,
+            'weight_duration': 1.1,
+            'weight_flow': 0.9,       # Flow less important when quiet
+        },
+        'feature_boost': ['obv_slope', 'frac_diff_close'],
+        'score_adjustment': -4,       # Slight caution for complacency
+    },
+
+    # Bull Trend: Full momentum mode
+    'Bull Trend': {
+        'alpha': {
+            'weight_trend': 1.3,      # Maximize trend following
+            'weight_ml': 1.1,
+            'weight_neural': 1.2,
+            'weight_volume': 1.1,
+            'weight_pattern': 1.2,
+        },
+        'phoenix': {
+            'weight_solidity': 0.9,
+            'weight_duration': 0.8,   # Don't need long bases in bull
+            'weight_breakout': 1.3,   # Breakouts are key
+        },
+        'feature_boost': ['trend_score', 'obv_slope', 'smc_net'],
+        'score_adjustment': +5,       # Risk-on bonus
+    },
+
+    # Rate Shock: Defensive, favor quality
+    'Rate Shock': {
+        'alpha': {
+            'weight_trend': 0.7,
+            'weight_ml': 0.8,
+            'weight_volume': 0.9,
+        },
+        'phoenix': {
+            'weight_solidity': 1.4,   # Quality matters most
+            'weight_flow': 1.2,
+            'weight_ml': 0.8,
+        },
+        'feature_boost': ['vpin', 'smc_bearish'],
+        'score_adjustment': -8,
+    },
+
+    # High Vol New Normal: Adapted to elevated baseline
+    'High Vol (New Normal)': {
+        'alpha': {
+            'weight_trend': 0.9,
+            'weight_ml': 1.0,
+            'weight_volume': 1.1,
+        },
+        'phoenix': {
+            'weight_solidity': 1.1,
+            'weight_flow': 1.1,
+        },
+        'feature_boost': ['vpin_velocity', 'cmf_20'],
+        'score_adjustment': -2,
+    },
+
+    # Neutral: Use base weights
+    'Neutral': {
+        'alpha': {},  # No adjustments
+        'phoenix': {},
+        'feature_boost': [],
+        'score_adjustment': 0,
+    },
+}
+
 # Sector Capping (Risk Management)
 MAX_PICKS_PER_SECTOR = 3
 
@@ -258,6 +371,7 @@ __all__ = [
     'GATEKEEPER_CONFIG',
     'SOLIDITY_CONFIG',
     'DUAL_RANKING_CONFIG',
+    'REGIME_WEIGHT_ADJUSTMENTS',  # v12: Regime-adaptive scoring
     'MAX_PICKS_PER_SECTOR',
     'PERFORMANCE_CONFIG',
     'ENABLE_VALIDATION_MODE',
