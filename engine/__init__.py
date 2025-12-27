@@ -40,3 +40,4 @@ from .patterns import (
     apply_smart_gatekeeper,
 )
 from .ml import train_ensemble
+from .report import generate_full_report
