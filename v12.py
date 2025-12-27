@@ -1603,7 +1603,14 @@ class SwingTradingEngine:
     def calculate_technicals(self, history_df):
         if len(history_df) < 50: return None
         close = history_df['Close']
+        high = history_df['High']
+        low = history_df['Low']
+        volume = history_df['Volume']
         if isinstance(close, pd.DataFrame): close = close.iloc[:, 0]
+        if isinstance(high, pd.DataFrame): high = high.iloc[:, 0]
+        if isinstance(low, pd.DataFrame): low = low.iloc[:, 0]
+        if isinstance(volume, pd.DataFrame): volume = volume.iloc[:, 0]
+
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -1620,6 +1627,28 @@ class SwingTradingEngine:
             y_r = rsi.iloc[-10:].values
             if y_p[-1] > y_p[0] and y_r[-1] < y_r[0]: div_score = 1.0
 
+        # --- ORDER FLOW IMBALANCE FEATURES (v12) ---
+        # Close Location Value: where price closed in day's range (-1 to +1)
+        # +1 = closed at high (buying pressure), -1 = closed at low (selling pressure)
+        hl_range = high - low
+        clv = ((close - low) - (high - close)) / (hl_range + 1e-9)
+        clv = clv.clip(-1, 1)  # Bound to [-1, 1]
+
+        # Money Flow Volume: CLV-weighted volume
+        mf_volume = clv * volume
+
+        # Chaikin Money Flow (20-day): normalized accumulation/distribution
+        cmf_20 = mf_volume.rolling(20).sum() / (volume.rolling(20).sum() + 1e-9)
+
+        # On-Balance Volume: cumulative volume based on price direction
+        obv = (volume * np.sign(delta)).fillna(0).cumsum()
+        # OBV slope (momentum of flow): 10-day rate of change normalized
+        obv_slope = (obv.iloc[-1] - obv.iloc[-10]) / (abs(obv.iloc[-10]) + 1e-9) if len(obv) > 10 else 0.0
+
+        # Volume-Weighted Average Price distance (intraday proxy)
+        vwap_proxy = (close * volume).rolling(20).sum() / (volume.rolling(20).sum() + 1e-9)
+        vwap_distance = (close.iloc[-1] - vwap_proxy.iloc[-1]) / (vwap_proxy.iloc[-1] + 1e-9)
+
         return {
             'rsi': float(rsi.iloc[-1]),
             'trend_score': float(trend_score.iloc[-1]),
@@ -1629,7 +1658,12 @@ class SwingTradingEngine:
             'sma_alignment': 1 if sma20.iloc[-1] > sma50.iloc[-1] else 0,
             'lagged_return_5d': float((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) if len(close) > 6 else 0.0,
             'current_price': float(close.iloc[-1]),
-            'dist_sma50': float(dist_sma50)
+            'dist_sma50': float(dist_sma50),
+            # Order Flow Imbalance features (v12)
+            'clv': float(clv.iloc[-1]),  # Close location value (-1 to +1)
+            'cmf_20': float(cmf_20.iloc[-1]),  # Chaikin Money Flow 20-day
+            'obv_slope': float(obv_slope),  # OBV momentum
+            'vwap_distance': float(vwap_distance),  # Distance from VWAP proxy
         }
 
     def enrich_market_data(self, flow_df):
