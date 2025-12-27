@@ -26,8 +26,9 @@ try:
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
 
-    ALPACA_KEY = os.environ.get('APCA_API_KEY_ID', 'PKZ3P3YMము9N1Y2E9CI')
-    ALPACA_SECRET = os.environ.get('APCA_API_SECRET_KEY', 'YucXpMaJIuxv4xKeJXPxLGXk21yZcFVPq3kEXkRi')
+    # Use environment variables or defaults (these are overridden by v12.py)
+    ALPACA_KEY = os.environ.get('APCA_API_KEY_ID', 'PK3D25CFOYT2Z5F6DW54XKQXOO')
+    ALPACA_SECRET = os.environ.get('APCA_API_SECRET_KEY', 'DczbobRsFCUPinP9QsByBzLf6sGLHdcf1T7P3SGfo7uK')
     alpaca_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
     ALPACA_AVAILABLE = True
 except ImportError:
