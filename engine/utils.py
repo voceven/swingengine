@@ -269,7 +269,34 @@ def fetch_alpaca_batch(tickers, start_date, end_date=None):
                 all_data[original_ticker] = df_formatted[cols]
 
         except Exception as e:
-            print(f"    [!] Alpaca batch error: {str(e)[:50]}...")
+            # Batch failed - try individual tickers as fallback
+            error_msg = str(e)
+            if 'codec' in error_msg.lower() or 'encode' in error_msg.lower():
+                # Encoding error - likely a bad ticker, try one by one
+                for single_ticker in chunk:
+                    try:
+                        single_request = StockBarsRequest(
+                            symbol_or_symbols=[single_ticker],
+                            timeframe=TimeFrame.Day,
+                            start=start_date,
+                            end=end_date,
+                            adjustment='raw'
+                        )
+                        single_bars = alpaca_client.get_stock_bars(single_request)
+                        if single_bars.data:
+                            df_single = single_bars.df.reset_index()
+                            original_ticker = valid_map.get(single_ticker, single_ticker)
+                            df_formatted = df_single.rename(columns={
+                                'open': 'Open', 'high': 'High', 'low': 'Low',
+                                'close': 'Close', 'volume': 'Volume', 'timestamp': 'Date'
+                            })
+                            df_formatted['Date'] = pd.to_datetime(df_formatted['Date']).dt.date
+                            df_formatted = df_formatted.set_index('Date')
+                            all_data[original_ticker] = df_formatted[['Open', 'High', 'Low', 'Close', 'Volume']]
+                    except:
+                        pass  # Skip problematic ticker
+            else:
+                print(f"    [!] Alpaca batch error: {str(e)[:50]}...")
 
     return all_data
 
