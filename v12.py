@@ -1017,6 +1017,176 @@ def apply_smart_gatekeeper(df, config=None):
 ''')
         print(f"  [BOOTSTRAP] Created {patterns_path}")
 
+    # Bootstrap engine/ml.py
+    ml_path = os.path.join(engine_dir, 'ml.py')
+    if not _is_valid_py(ml_path):
+        with open(ml_path, 'w') as f:
+            f.write('''# -*- coding: utf-8 -*-
+"""ML Training Functions for Swing Trading Engine v12"""
+import numpy as np, time, os, json, gc, torch, torch.nn as nn
+from sklearn.model_selection import cross_val_score, train_test_split, cross_val_predict
+from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression
+try:
+    from catboost import CatBoostClassifier
+    CATBOOST_AVAILABLE = True
+except: CATBOOST_AVAILABLE = False
+try:
+    from pytorch_tabnet.tab_model import TabNetClassifier
+    TABNET_AVAILABLE = True
+except: TABNET_AVAILABLE = False
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_AVAILABLE = True
+except: OPTUNA_AVAILABLE = False
+from .config import PERFORMANCE_CONFIG
+from .neural import TCN
+from .data_prep import triple_barrier_labels, prepare_tcn_sequences
+
+def train_ensemble(full_df, history_mgr, imputer, scaler, features_list, cache_paths, market_regime, force_retrain=False):
+    import joblib
+    if full_df.empty: return None
+    catboost_path, tabnet_path, tcn_path = cache_paths['catboost'], cache_paths['tabnet'], cache_paths['tcn']
+    elasticnet_path, meta_learner_path = cache_paths['elasticnet'], cache_paths['meta_learner']
+    meta_metadata_path = meta_learner_path.replace('.pkl', '_metadata.json')
+    cache_days = PERFORMANCE_CONFIG.get('model_cache_days', 7)
+    all_cached = all(os.path.exists(p) for p in [catboost_path, tabnet_path, tcn_path, elasticnet_path, meta_learner_path, meta_metadata_path])
+    if not force_retrain and all_cached:
+        try:
+            age = (time.time() - os.path.getmtime(meta_learner_path)) / 86400
+            with open(meta_metadata_path) as f: metadata = json.load(f)
+            if age <= cache_days and metadata.get('market_regime') == market_regime:
+                print(f"\\n[3/4] Loading Cached Diverse Ensemble (Age: {age:.1f}d, Regime: {market_regime})...")
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                cb_cache = joblib.load(catboost_path)
+                result = {'catboost_model': cb_cache['model'], 'imputer': cb_cache['imputer'], 'scaler': cb_cache['scaler'],
+                    'features_list': cb_cache['features_list'], 'tabnet_model': None, 'tcn_model': None,
+                    'tcn_n_features': 6, 'tcn_seq_len': 10, 'elasticnet_model': None, 'meta_learner': None, 'model_trained': True}
+                if os.path.exists(tabnet_path): result['tabnet_model'] = joblib.load(tabnet_path)['model']
+                if os.path.exists(tcn_path):
+                    tc = torch.load(tcn_path, map_location=device, weights_only=False)
+                    result['tcn_n_features'], result['tcn_seq_len'] = tc.get('input_size', 6), tc.get('seq_len', 10)
+                    tcn = TCN(input_size=result['tcn_n_features'], num_channels=[32, 32, 16]).to(device)
+                    tcn.load_state_dict(tc['model_state']); tcn.eval(); result['tcn_model'] = tcn
+                if os.path.exists(elasticnet_path): result['elasticnet_model'] = joblib.load(elasticnet_path)['model']
+                result['meta_learner'] = joblib.load(meta_learner_path)['model']
+                print(f"  [ENSEMBLE] Loaded cached diverse ensemble (AUC: {metadata.get('ensemble_auc', 'N/A')})")
+                return result
+        except Exception as e: print(f"\\n[3/4] Cache load failed ({e}), Retraining...")
+    try: torch.cuda.empty_cache(); gc.collect()
+    except: pass
+    print("\\n[3/4] Training Diverse Ensemble (CatBoost + TabNet + TCN + ElasticNet)...")
+    use_tb = True
+    try:
+        price_df = history_mgr.db.get_price_df()
+        if not price_df.empty and 'ticker' in full_df.columns:
+            tickers = full_df['ticker'].unique().tolist()
+            tb = triple_barrier_labels(price_df, tickers, holding_period=5, pt_multiplier=1.5, sl_multiplier=1.0, vol_lookback=20)
+            if not tb.empty:
+                latest = tb.sort_values('date').groupby('ticker').last().reset_index()
+                latest['target'] = (latest['label'] == 1).astype(int)
+                full_df = full_df.merge(latest[['ticker', 'target']], on='ticker', how='left', suffixes=('_old', ''))
+                full_df['target'] = full_df['target'].fillna(0).astype(int)
+            else: use_tb = False
+        else: use_tb = False
+    except: use_tb = False
+    if not use_tb:
+        if 'lagged_return_5d' not in full_df.columns: full_df['lagged_return_5d'] = 0.0
+        full_df['target'] = (full_df['lagged_return_5d'] > 0.02).astype(int)
+    if full_df['target'].nunique() < 2: return None
+    X, y = full_df[features_list], full_df['target']
+    X_clean, X_scaled = imputer.fit_transform(X), scaler.fit_transform(imputer.fit_transform(X))
+    has_gpu = torch.cuda.is_available()
+    n_trials, cv = PERFORMANCE_CONFIG.get('catboost_trials', 25), PERFORMANCE_CONFIG.get('catboost_cv_folds', 5)
+    # CatBoost
+    print(f"  [CATBOOST] Tuning with {'GPU' if has_gpu else 'CPU'}...")
+    def cb_obj(trial):
+        p = {'iterations': trial.suggest_int('iterations', 150, 500), 'depth': trial.suggest_int('depth', 5, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1), 'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
+            'task_type': 'GPU' if has_gpu else 'CPU', 'devices': '0' if has_gpu else None, 'logging_level': 'Silent'}
+        if not has_gpu: p['thread_count'] = -1
+        return cross_val_score(CatBoostClassifier(**p), X_scaled, y, cv=cv, scoring='roc_auc').mean()
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(cb_obj, n_trials=n_trials, show_progress_bar=False)
+    bp = study.best_params.copy(); bp.update({'task_type': 'GPU' if has_gpu else 'CPU', 'devices': '0' if has_gpu else None, 'logging_level': 'Silent'})
+    if not has_gpu: bp['thread_count'] = -1
+    cb = CatBoostClassifier(**bp); cb.fit(X_scaled, y, verbose=False)
+    cb_auc = study.best_value; print(f"  [CATBOOST] AUC: {cb_auc:.4f}")
+    # TabNet
+    tn, tn_auc = None, 0.0
+    if TABNET_AVAILABLE:
+        try:
+            tn = TabNetClassifier(n_d=16, n_a=16, n_steps=3, gamma=1.5, lambda_sparse=1e-4, device_name='cuda' if has_gpu else 'cpu', verbose=0)
+            Xt, Xv, yt, yv = train_test_split(X_scaled, y, test_size=0.2, random_state=43, stratify=y)
+            tn.fit(Xt, yt, eval_set=[(Xv, yv)], eval_metric=['auc'], max_epochs=100, patience=15, batch_size=256)
+            tn_auc = roc_auc_score(yv, tn.predict_proba(Xv)[:, 1]); print(f"  [TABNET] AUC: {tn_auc:.4f}")
+        except: tn = None
+    try: torch.cuda.empty_cache(); gc.collect()
+    except: pass
+    # TCN
+    tcn_m, tcn_n, tcn_s, tcn_auc = None, 6, 10, 0.0
+    try:
+        tickers = full_df['ticker'].unique().tolist()[:150]
+        Xs, ys, _ = prepare_tcn_sequences(price_df, full_df, tickers, seq_len=tcn_s)
+        if Xs is not None and len(Xs) >= 100:
+            tcn_n = Xs.shape[2]; si = int(len(Xs) * 0.8)
+            from torch.utils.data import TensorDataset, DataLoader
+            dl = DataLoader(TensorDataset(torch.FloatTensor(Xs[:si]), torch.FloatTensor(ys[:si]).unsqueeze(1)), batch_size=512, shuffle=True)
+            Xv, yv = torch.FloatTensor(Xs[si:]), torch.FloatTensor(ys[si:]).unsqueeze(1)
+            dev = torch.device('cuda' if has_gpu else 'cpu')
+            tcn_m = TCN(input_size=tcn_n, num_channels=[32,32,16]).to(dev)
+            opt, crit = torch.optim.Adam(tcn_m.parameters(), lr=0.001), nn.BCELoss()
+            bvl, pc = float('inf'), 0
+            for _ in range(50):
+                tcn_m.train()
+                for bx, by in dl: opt.zero_grad(); crit(tcn_m(bx.to(dev)), by.to(dev)).backward(); opt.step()
+                tcn_m.eval()
+                with torch.no_grad(): vl = crit(tcn_m(Xv.to(dev)), yv.to(dev)).item()
+                if vl < bvl: bvl, pc = vl, 0
+                else:
+                    pc += 1
+                    if pc >= 10: break
+            tcn_m.eval()
+            with torch.no_grad(): tcn_auc = roc_auc_score(yv.numpy().flatten(), tcn_m(Xv.to(dev)).cpu().numpy().flatten())
+            print(f"  [TCN] AUC: {tcn_auc:.4f}")
+    except Exception as e: print(f"  [!] TCN failed: {e}"); tcn_m = None
+    try: torch.cuda.empty_cache(); gc.collect()
+    except: pass
+    # ElasticNet
+    en, en_auc = None, 0.0
+    try:
+        en = LogisticRegression(penalty='elasticnet', solver='saga', l1_ratio=0.5, max_iter=1000, random_state=44, n_jobs=-1)
+        en.fit(X_scaled, y); en_auc = cross_val_score(en, X_scaled, y, cv=cv, scoring='roc_auc').mean()
+        print(f"  [ELASTICNET] AUC: {en_auc:.4f}")
+    except: en = None
+    # Meta-learner
+    print(f"  [LEVEL-2] Training meta-learner...")
+    preds, names = [cross_val_predict(cb, X_scaled, y, cv=cv, method='predict_proba')[:, 1]], ['CB']
+    if tn: preds.append(tn.predict_proba(X_scaled)[:, 1]); names.append('TN')
+    if en: preds.append(en.predict_proba(X_scaled)[:, 1]); names.append('EN')
+    Xm = np.column_stack(preds)
+    ml = LogisticRegression(max_iter=1000, random_state=42); ml.fit(Xm, y)
+    ens_auc = roc_auc_score(y, ml.predict_proba(Xm)[:, 1])
+    print(f"  [META-LEARNER] Ensemble AUC: {ens_auc:.4f}")
+    # Save
+    try:
+        joblib.dump({'model': cb, 'imputer': imputer, 'scaler': scaler, 'features_list': features_list, 'auc': cb_auc, 'params': bp}, catboost_path)
+        if tn: joblib.dump({'model': tn, 'auc': tn_auc}, tabnet_path)
+        if tcn_m: torch.save({'model_state': tcn_m.state_dict(), 'auc': tcn_auc, 'input_size': tcn_n, 'seq_len': tcn_s}, tcn_path)
+        if en: joblib.dump({'model': en, 'auc': en_auc}, elasticnet_path)
+        joblib.dump({'model': ml, 'model_names': names}, meta_learner_path)
+        with open(meta_metadata_path, 'w') as f:
+            json.dump({'timestamp': time.time(), 'market_regime': market_regime, 'ensemble_auc': float(ens_auc),
+                'catboost_auc': float(cb_auc), 'tabnet_auc': float(tn_auc), 'tcn_auc': float(tcn_auc),
+                'elasticnet_auc': float(en_auc), 'gpu_used': has_gpu, 'models_available': names}, f)
+        print(f"  [ENSEMBLE] All models cached")
+    except Exception as e: print(f"  [!] Cache failed: {e}")
+    return {'catboost_model': cb, 'tabnet_model': tn, 'tcn_model': tcn_m, 'tcn_n_features': tcn_n, 'tcn_seq_len': tcn_s,
+        'elasticnet_model': en, 'meta_learner': ml, 'imputer': imputer, 'scaler': scaler, 'features_list': features_list, 'model_trained': True}
+''')
+        print(f"  [BOOTSTRAP] Created {ml_path}")
+
     # Add to path
     if COLAB_BASE not in sys.path:
         sys.path.insert(0, COLAB_BASE)
@@ -1049,6 +1219,8 @@ from engine import (
     detect_cup_and_handle as _detect_cup_and_handle,
     detect_double_bottom as _detect_double_bottom,
     apply_smart_gatekeeper as _apply_smart_gatekeeper,
+    # ML training functions (v12 modular)
+    train_ensemble as _train_ensemble,
 )
 
 ALPACA_API_KEY = 'PK3D25CFOYT2Z5F6DW54XKQXOO'
@@ -2496,508 +2668,44 @@ class SwingTradingEngine:
         return self.full_df
 
     def train_model(self, force_retrain=False):
-        """
-        Phase 3: Diverse Ensemble with Architectural Diversity
-        CatBoost (trees) + TabNet (attention) + TCN (temporal) + ElasticNet (linear)
-        Target: 0.945-0.955 AUC through cognitive diversity, not quantity
-        """
-        if self.full_df.empty: return
-
-        import joblib
-        import json
-
-        # --- ENSEMBLE CACHE CHECK ---
-        cache_duration_days = PERFORMANCE_CONFIG.get('model_cache_days', 7)
-        meta_metadata_path = self.meta_learner_path.replace('.pkl', '_metadata.json')
-
-        # Check if ALL ensemble components are cached (Phase 3: new model paths)
-        all_cached = all([
-            os.path.exists(self.catboost_path),
-            os.path.exists(self.tabnet_path),
-            os.path.exists(self.tcn_path),
-            os.path.exists(self.elasticnet_path),
-            os.path.exists(self.meta_learner_path),
-            os.path.exists(meta_metadata_path)
-        ])
-
-        should_use_cache = False
-        if not force_retrain and all_cached:
-            try:
-                model_age_seconds = time.time() - os.path.getmtime(self.meta_learner_path)
-                model_age_days = model_age_seconds / (24 * 3600)
-
-                with open(meta_metadata_path, 'r') as f:
-                    metadata = json.load(f)
-
-                cached_regime = metadata.get('market_regime', 'Unknown')
-                current_regime = self.market_regime
-
-                if model_age_days <= cache_duration_days and cached_regime == current_regime:
-                    should_use_cache = True
-                    print(f"\n[3/4] Loading Cached Diverse Ensemble (Age: {model_age_days:.1f}d, Regime: {current_regime})...")
-                elif cached_regime != current_regime:
-                    print(f"\n[3/4] Regime Changed ({cached_regime} → {current_regime}), Retraining...")
-                else:
-                    print(f"\n[3/4] Ensemble Expired (Age: {model_age_days:.1f}d > {cache_duration_days}d), Retraining...")
-            except Exception as e:
-                print(f"\n[3/4] Cache validation failed ({e}), Retraining...")
-                should_use_cache = False
-
-        if should_use_cache:
-            try:
-                # Set up device for TCN loading
-                import torch
-                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-                # Load CatBoost (required)
-                catboost_cache = joblib.load(self.catboost_path)
-                self.catboost_model = catboost_cache['model']
-                self.imputer = catboost_cache['imputer']
-                self.scaler = catboost_cache['scaler']
-                self.features_list = catboost_cache['features_list']
-
-                # Load TabNet (optional)
-                if os.path.exists(self.tabnet_path):
-                    tabnet_cache = joblib.load(self.tabnet_path)
-                    self.tabnet_model = tabnet_cache['model']
-
-                # Load TCN (optional) - reconstruct model and load state dict with seq params
-                if os.path.exists(self.tcn_path):
-                    tcn_cache = torch.load(self.tcn_path, map_location=device, weights_only=False)
-                    self.tcn_n_features = tcn_cache.get('input_size', 6)
-                    self.tcn_seq_len = tcn_cache.get('seq_len', 10)
-                    self.tcn_model = TCN(input_size=self.tcn_n_features, num_channels=[32, 32, 16]).to(device)
-                    self.tcn_model.load_state_dict(tcn_cache['model_state'])
-                    self.tcn_model.eval()
-
-                # Load ElasticNet (optional)
-                if os.path.exists(self.elasticnet_path):
-                    elasticnet_cache = joblib.load(self.elasticnet_path)
-                    self.elasticnet_model = elasticnet_cache['model']
-
-                # Load meta-learner
-                meta_cache = joblib.load(self.meta_learner_path)
-                self.meta_learner = meta_cache['model']
-                self.model_trained = True
-
-                ensemble_auc = metadata.get('ensemble_auc', 'N/A')
-                print(f"  [ENSEMBLE] Loaded cached diverse ensemble (AUC: {ensemble_auc})")
-                print(f"  [ENSEMBLE] Models: {metadata.get('models_available', ['CB'])}")
-                return
-            except Exception as e:
-                print(f"  [!] Cache load failed ({e}), Training from scratch...")
-
-        # --- PREPARE DATA WITH TRIPLE-BARRIER LABELS ---
-        # GPU MEMORY SAFEGUARD (v11.5.1): Clear any residual GPU memory before ensemble training
-        try:
-            torch.cuda.empty_cache()
-            gc.collect()
-        except:
-            pass
-        print("\n[3/4] Training Diverse Ensemble (CatBoost + TabNet + TCN + ElasticNet)...")
-
-        # Phase 4: Triple-Barrier Labeling for realistic trade outcomes
-        use_triple_barrier = True
-        try:
-            price_df = self.history_mgr.db.get_price_df()
-            if not price_df.empty and 'ticker' in self.full_df.columns:
-                tickers = self.full_df['ticker'].unique().tolist()
-                print(f"  [LABELS] Generating Triple-Barrier labels for {len(tickers)} tickers...")
-
-                # Generate triple-barrier labels
-                tb_labels = triple_barrier_labels(
-                    price_df, tickers,
-                    holding_period=5,
-                    pt_multiplier=1.5,  # TP at 1.5x ATR
-                    sl_multiplier=1.0,  # SL at 1.0x ATR
-                    vol_lookback=20
-                )
-
-                if not tb_labels.empty:
-                    # Get latest label per ticker for current training
-                    latest_labels = tb_labels.sort_values('date').groupby('ticker').last().reset_index()
-                    # Convert -1 labels to 0 for binary classification
-                    latest_labels['target'] = (latest_labels['label'] == 1).astype(int)
-
-                    # Merge with full_df
-                    self.full_df = self.full_df.merge(
-                        latest_labels[['ticker', 'target']],
-                        on='ticker',
-                        how='left',
-                        suffixes=('_old', '')
-                    )
-                    self.full_df['target'] = self.full_df['target'].fillna(0).astype(int)
-
-                    # Stats
-                    tp_pct = (tb_labels['barrier_hit'] == 'TP').mean() * 100
-                    sl_pct = (tb_labels['barrier_hit'] == 'SL').mean() * 100
-                    time_pct = (tb_labels['barrier_hit'] == 'TIME').mean() * 100
-                    print(f"  [LABELS] Triple-Barrier stats: TP={tp_pct:.1f}% SL={sl_pct:.1f}% TIME={time_pct:.1f}%")
-                else:
-                    use_triple_barrier = False
-            else:
-                use_triple_barrier = False
-        except Exception as e:
-            print(f"  [!] Triple-Barrier labeling failed ({e}), using fallback")
-            use_triple_barrier = False
-
-        # Fallback to simple binary labels
-        if not use_triple_barrier:
-            print(f"  [LABELS] Using simple 5-day return labels (fallback)")
-            if 'lagged_return_5d' not in self.full_df.columns:
-                self.full_df['lagged_return_5d'] = 0.0
-            self.full_df['target'] = (self.full_df['lagged_return_5d'] > 0.02).astype(int)
-
-        if self.full_df['target'].nunique() < 2: return
-
-        tech_feats = ['rsi', 'trend_score', 'volatility', 'sma_alignment', 'divergence_score', 'dist_sma50']
-        flow_feats = ['dp_sentiment', 'net_flow', 'avg_iv', 'net_gamma', 'oi_change', 'dp_total']
-        temporal_feats = ['gamma_velocity', 'oi_accel']
-        neural_feats = ['nn_score']
-
-        all_possible = tech_feats + flow_feats + temporal_feats + neural_feats
-        self.features_list = [f for f in all_possible if f in self.full_df.columns]
-
-        X = self.full_df[self.features_list]
-        y = self.full_df['target']
-        X_clean = self.imputer.fit_transform(X)
-        X_scaled = self.scaler.fit_transform(X_clean)
-
-        # Configuration
-        n_trials = PERFORMANCE_CONFIG.get('catboost_trials', 25)
-        max_iterations = PERFORMANCE_CONFIG.get('catboost_max_iterations', 500)
-        max_depth = PERFORMANCE_CONFIG.get('catboost_max_depth', 10)
-        cv_folds = PERFORMANCE_CONFIG.get('catboost_cv_folds', 5)
-
-        # Detect GPU availability
-        try:
-            import torch
-            has_gpu = torch.cuda.is_available()
-            gpu_count = torch.cuda.device_count() if has_gpu else 0
-            if has_gpu:
-                print(f"  [GPU] Detected {gpu_count} GPU(s): {torch.cuda.get_device_name(0)}")
-            else:
-                print(f"  [GPU] No GPU detected, using CPU")
-        except:
-            has_gpu = False
-            print(f"  [GPU] GPU detection failed, using CPU")
-
-        # --- LEVEL 1: TRAIN BASE MODELS WITH GPU ---
-        print(f"  [LEVEL-1] Training 3 base models ({n_trials} trials each)...")
-
-        # 1. CatBoost with GPU
-        print(f"  [CATBOOST] Tuning with {'GPU' if has_gpu else 'CPU'}...")
-        def catboost_objective(trial):
-            param = {
-                'iterations': trial.suggest_int('iterations', 150, max_iterations),
-                'depth': trial.suggest_int('depth', 5, max_depth),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 10),
-                'border_count': trial.suggest_int('border_count', 32, 255),
-                'task_type': 'GPU' if has_gpu else 'CPU',
-                'devices': '0' if has_gpu else None,
-                'early_stopping_rounds': 50,
-                'logging_level': 'Silent'
-            }
-            if not has_gpu:
-                param['thread_count'] = -1
-            model = CatBoostClassifier(**param)
-            return cross_val_score(model, X_scaled, y, cv=cv_folds, scoring='roc_auc').mean()
-
-        try:
-            study_cb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-            study_cb.optimize(catboost_objective, n_trials=n_trials, show_progress_bar=False)
-
-            best_cb_params = study_cb.best_params.copy()
-            best_cb_params['task_type'] = 'GPU' if has_gpu else 'CPU'
-            if has_gpu:
-                best_cb_params['devices'] = '0'
-            else:
-                best_cb_params['thread_count'] = -1
-            best_cb_params['early_stopping_rounds'] = 50
-            best_cb_params['logging_level'] = 'Silent'
-
-            self.catboost_model = CatBoostClassifier(**best_cb_params)
-            self.catboost_model.fit(X_scaled, y, verbose=False)
-            catboost_auc = study_cb.best_value
-            print(f"  [CATBOOST] AUC: {catboost_auc:.4f} (iter={best_cb_params.get('iterations')}, depth={best_cb_params.get('depth')})")
-        except Exception as e:
-            print(f"  [!] CatBoost training failed: {e}")
-            self.model_trained = False
+        """Train diverse ensemble. See engine/ml.py for full implementation (~500 lines)."""
+        if self.full_df.empty:
             return
 
-        # 2. TabNet (Attention-based feature interactions) - replaces LightGBM
-        tabnet_auc = 0.0
-        if TABNET_AVAILABLE:
-            print(f"  [TABNET] Training attention-based model...")
-            try:
-                # TabNet hyperparameters (attention mechanism for feature selection)
-                self.tabnet_model = TabNetClassifier(
-                    n_d=16, n_a=16,  # Width of decision/attention layers
-                    n_steps=3,  # Number of sequential attention steps
-                    gamma=1.5,  # Coefficient for feature reuse in attention
-                    lambda_sparse=1e-4,  # Sparsity regularization
-                    optimizer_fn=torch.optim.Adam,
-                    optimizer_params=dict(lr=2e-2),
-                    scheduler_params={"step_size": 10, "gamma": 0.9},
-                    scheduler_fn=torch.optim.lr_scheduler.StepLR,
-                    mask_type='entmax',  # sparsemax or entmax for attention
-                    device_name='cuda' if has_gpu else 'cpu',
-                    verbose=0
-                )
-                # TabNet needs validation set for early stopping
-                X_train_tn, X_val_tn, y_train_tn, y_val_tn = train_test_split(
-                    X_scaled, y, test_size=0.2, random_state=43, stratify=y
-                )
-                self.tabnet_model.fit(
-                    X_train_tn, y_train_tn,
-                    eval_set=[(X_val_tn, y_val_tn)],
-                    eval_metric=['auc'],
-                    max_epochs=100,
-                    patience=15,
-                    batch_size=256
-                )
-                # Calculate AUC on validation set
-                tabnet_preds = self.tabnet_model.predict_proba(X_val_tn)[:, 1]
-                tabnet_auc = roc_auc_score(y_val_tn, tabnet_preds)
-                print(f"  [TABNET] AUC: {tabnet_auc:.4f} (attention-based feature interactions)")
-            except Exception as e:
-                print(f"  [!] TabNet training failed: {e}, using fallback")
-                self.tabnet_model = None
-        else:
-            print(f"  [TABNET] Not available, skipping (install: pip install pytorch-tabnet)")
+        # Build cache paths dict for module function
+        cache_paths = {
+            'catboost': self.catboost_path,
+            'tabnet': self.tabnet_path,
+            'tcn': self.tcn_path,
+            'elasticnet': self.elasticnet_path,
+            'meta_learner': self.meta_learner_path
+        }
 
-        # GPU MEMORY CLEANUP after TabNet (v11.5.1): Free memory before TCN
-        try:
-            torch.cuda.empty_cache()
-            gc.collect()
-        except:
-            pass
+        # Call extracted training function
+        result = _train_ensemble(
+            full_df=self.full_df,
+            history_mgr=self.history_mgr,
+            imputer=self.imputer,
+            scaler=self.scaler,
+            features_list=self.features_list,
+            cache_paths=cache_paths,
+            market_regime=self.market_regime,
+            force_retrain=force_retrain
+        )
 
-        # 3. TCN (Temporal CNN for sequential patterns) - replaces XGBoost
-        # FIXED: Now uses REAL sequential data instead of fake repeated snapshots
-        tcn_auc = 0.0
-        self.tcn_seq_len = 10  # Store for inference
-        self.tcn_n_features = 6  # 6 temporal features
-        print(f"  [TCN] Training temporal convolutional network with REAL sequences...")
-        try:
-            device = torch.device('cuda' if has_gpu else 'cpu')
-
-            # Get price data for real sequence generation
-            price_df = self.history_mgr.db.get_price_df()
-            if price_df.empty:
-                raise ValueError("No price data available for TCN sequences")
-
-            # Get tickers from current data
-            tickers = self.full_df['ticker'].unique().tolist() if 'ticker' in self.full_df.columns else []
-            if not tickers:
-                raise ValueError("No tickers available for TCN sequences")
-
-            # v11.5 FIX: Sample tickers BEFORE sequence generation to prevent OOM
-            # Each ticker generates ~350 sequences on average, so for 50K limit we need ~140 tickers
-            max_tickers_for_tcn = 150  # ~52K sequences max
-            if len(tickers) > max_tickers_for_tcn:
-                import random
-                random.seed(42)  # Reproducibility
-                tickers = random.sample(tickers, max_tickers_for_tcn)
-                print(f"  [TCN] Sampled {max_tickers_for_tcn} tickers for memory efficiency")
-
-            # Generate REAL sequential data (not fake repeated snapshots)
-            print(f"  [TCN] Building temporal sequences for {len(tickers)} tickers...")
-            X_seq_np, y_seq_np, tcn_tickers = prepare_tcn_sequences(
-                price_df, self.full_df, tickers,
-                seq_len=self.tcn_seq_len
-            )
-
-            if X_seq_np is None or len(X_seq_np) < 100:
-                raise ValueError(f"Insufficient sequence data: {len(X_seq_np) if X_seq_np is not None else 0} samples")
-
-            print(f"  [TCN] Created {len(X_seq_np)} real sequences (shape: {X_seq_np.shape})")
-            self.tcn_n_features = X_seq_np.shape[2]
-
-            # Train/val split (on numpy arrays to save memory)
-            split_idx = int(len(X_seq_np) * 0.8)
-            X_train_np, X_val_np = X_seq_np[:split_idx], X_seq_np[split_idx:]
-            y_train_np, y_val_np = y_seq_np[:split_idx], y_seq_np[split_idx:]
-
-            # Create DataLoader for memory-efficient batch training
-            from torch.utils.data import TensorDataset, DataLoader
-            train_dataset = TensorDataset(
-                torch.FloatTensor(X_train_np),
-                torch.FloatTensor(y_train_np).unsqueeze(1)
-            )
-            train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
-
-            # Validation tensors (smaller, can fit in memory)
-            X_val_tcn = torch.FloatTensor(X_val_np)
-            y_val_tcn = torch.FloatTensor(y_val_np).unsqueeze(1)
-
-            # Initialize TCN model with correct feature size
-            self.tcn_model = TCN(
-                input_size=self.tcn_n_features,
-                num_channels=[32, 32, 16],
-                kernel_size=3,
-                dropout=0.2
-            ).to(device)
-            optimizer = torch.optim.Adam(self.tcn_model.parameters(), lr=0.001)
-            criterion = nn.BCELoss()
-
-            # Training loop with early stopping and batch training
-            best_val_loss, patience_counter = float('inf'), 0
-            for epoch in range(50):
-                self.tcn_model.train()
-                epoch_loss = 0.0
-                for batch_X, batch_y in train_loader:
-                    optimizer.zero_grad()
-                    outputs = self.tcn_model(batch_X.to(device))
-                    loss = criterion(outputs, batch_y.to(device))
-                    loss.backward()
-                    optimizer.step()
-                    epoch_loss += loss.item()
-
-                # Validation
-                self.tcn_model.eval()
-                with torch.no_grad():
-                    val_out = self.tcn_model(X_val_tcn.to(device))
-                    val_loss = criterion(val_out, y_val_tcn.to(device)).item()
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= 10: break
-
-            # Calculate AUC
-            self.tcn_model.eval()
-            with torch.no_grad():
-                tcn_preds = self.tcn_model(X_val_tcn.to(device)).cpu().numpy().flatten()
-            tcn_auc = roc_auc_score(y_val_tcn.numpy().flatten(), tcn_preds)
-            print(f"  [TCN] AUC: {tcn_auc:.4f} (real temporal pattern detection)")
-        except Exception as e:
-            print(f"  [!] TCN training failed: {e}, using fallback")
-            self.tcn_model = None
-
-        # GPU MEMORY CLEANUP after TCN (v11.5.1): Free memory before meta-learner
-        try:
-            torch.cuda.empty_cache()
-            gc.collect()
-        except:
-            pass
-
-        # 4. ElasticNet (Linear regularized baseline) - sanity check
-        elasticnet_auc = 0.0
-        print(f"  [ELASTICNET] Training linear baseline...")
-        try:
-            from sklearn.linear_model import LogisticRegression
-            # Use LogisticRegression with elasticnet penalty (L1+L2)
-            self.elasticnet_model = LogisticRegression(
-                penalty='elasticnet', solver='saga', l1_ratio=0.5,
-                max_iter=1000, random_state=44, n_jobs=-1
-            )
-            self.elasticnet_model.fit(X_scaled, y)
-            en_preds = cross_val_score(self.elasticnet_model, X_scaled, y, cv=cv_folds, scoring='roc_auc')
-            elasticnet_auc = en_preds.mean()
-            print(f"  [ELASTICNET] AUC: {elasticnet_auc:.4f} (linear regularized baseline)")
-        except Exception as e:
-            print(f"  [!] ElasticNet training failed: {e}")
-            self.elasticnet_model = None
-
-        # --- LEVEL 2: TRAIN META-LEARNER (4 Diverse Models) ---
-        print(f"  [LEVEL-2] Training meta-learner with diverse ensemble...")
-        from sklearn.model_selection import cross_val_predict
-
-        # CatBoost predictions (always available)
-        catboost_preds = cross_val_predict(self.catboost_model, X_scaled, y, cv=cv_folds, method='predict_proba')[:, 1]
-        model_names, preds_list = ['CB'], [catboost_preds]
-
-        # TabNet predictions (if available)
-        if self.tabnet_model is not None:
-            tabnet_preds = self.tabnet_model.predict_proba(X_scaled)[:, 1]
-            preds_list.append(tabnet_preds)
-            model_names.append('TN')
-
-        # TCN predictions - SKIP in meta-learner training
-        # TCN uses 6 temporal features from price history, not X_scaled's 15 features
-        # TCN is used during inference when we have real price history available
-        # Including it in meta-learner would require re-generating sequences for ALL tickers
-        # which is memory-intensive and defeats the purpose of the sampled training
-        if self.tcn_model is not None:
-            print(f"  [TCN] Skipping in meta-learner (uses separate temporal features during inference)")
-
-        # ElasticNet predictions (if available)
-        if self.elasticnet_model is not None:
-            elasticnet_preds = self.elasticnet_model.predict_proba(X_scaled)[:, 1]
-            preds_list.append(elasticnet_preds)
-            model_names.append('EN')
-
-        # Stack all available model predictions
-        X_meta = np.column_stack(preds_list)
-
-        # Train LogisticRegression meta-learner
-        self.meta_learner = LogisticRegression(max_iter=1000, random_state=42)
-        self.meta_learner.fit(X_meta, y)
-
-        # Calculate ensemble AUC
-        meta_preds = self.meta_learner.predict_proba(X_meta)[:, 1]
-        ensemble_auc = roc_auc_score(y, meta_preds)
-
-        # Display weights for available models
-        weights_str = ', '.join([f"{name}={self.meta_learner.coef_[0][i]:.3f}" for i, name in enumerate(model_names)])
-        print(f"  [META-LEARNER] Ensemble AUC: {ensemble_auc:.4f}")
-        print(f"  [META-LEARNER] Weights: {weights_str}")
-
-        self.model_trained = True
-
-        # --- SAVE ALL ENSEMBLE COMPONENTS ---
-        try:
-            # CatBoost cache
-            joblib.dump({
-                'model': self.catboost_model,
-                'imputer': self.imputer,
-                'scaler': self.scaler,
-                'features_list': self.features_list,
-                'auc': catboost_auc,
-                'params': best_cb_params
-            }, self.catboost_path)
-
-            # TabNet cache (if trained)
-            if self.tabnet_model is not None:
-                joblib.dump({'model': self.tabnet_model, 'auc': tabnet_auc}, self.tabnet_path)
-
-            # TCN cache (if trained) - save as PyTorch state dict with sequence params
-            if self.tcn_model is not None:
-                torch.save({
-                    'model_state': self.tcn_model.state_dict(),
-                    'auc': tcn_auc,
-                    'input_size': self.tcn_n_features,
-                    'seq_len': self.tcn_seq_len
-                }, self.tcn_path)
-
-            # ElasticNet cache (if trained)
-            if self.elasticnet_model is not None:
-                joblib.dump({'model': self.elasticnet_model, 'auc': elasticnet_auc}, self.elasticnet_path)
-
-            # Meta-learner cache (includes model names for prediction ordering)
-            joblib.dump({'model': self.meta_learner, 'model_names': model_names}, self.meta_learner_path)
-
-            # Metadata
-            metadata = {
-                'timestamp': time.time(),
-                'market_regime': self.market_regime,
-                'ensemble_auc': float(ensemble_auc),
-                'catboost_auc': float(catboost_auc),
-                'tabnet_auc': float(tabnet_auc),
-                'tcn_auc': float(tcn_auc),
-                'elasticnet_auc': float(elasticnet_auc),
-                'gpu_used': has_gpu,
-                'models_available': model_names
-            }
-            with open(meta_metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-
-            print(f"  [ENSEMBLE] All models cached (expires in {cache_duration_days} days or on regime change)")
-        except Exception as e:
-            print(f"  [!] Ensemble caching failed: {e}")
+        # Update instance state with trained models
+        if result:
+            self.catboost_model = result['catboost_model']
+            self.tabnet_model = result['tabnet_model']
+            self.tcn_model = result['tcn_model']
+            self.tcn_n_features = result['tcn_n_features']
+            self.tcn_seq_len = result['tcn_seq_len']
+            self.elasticnet_model = result['elasticnet_model']
+            self.meta_learner = result['meta_learner']
+            self.imputer = result['imputer']
+            self.scaler = result['scaler']
+            self.features_list = result['features_list']
+            self.model_trained = result['model_trained']
 
     def predict(self):
         if self.full_df.empty: return None

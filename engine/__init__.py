@@ -9,6 +9,7 @@ Modules:
 - data_prep.py: Triple-barrier labeling, TCN sequences
 - neural.py: SwingTransformer, TCN architectures
 - patterns.py: Pattern detection functions (bull flag, phoenix, etc.)
+- ml.py: ML training functions (ensemble, CatBoost, TabNet, TCN)
 """
 
 from .config import *
@@ -38,3 +39,4 @@ from .patterns import (
     detect_double_bottom,
     apply_smart_gatekeeper,
 )
+from .ml import train_ensemble
