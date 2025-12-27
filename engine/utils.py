@@ -222,6 +222,7 @@ def fetch_alpaca_batch(tickers, start_date, end_date=None):
             clean_batch.append(clean_t)
 
     if not clean_batch:
+        print(f"    [!] No valid tickers after sanitization")
         return {}
 
     # 2. Fetch in chunks
@@ -245,6 +246,7 @@ def fetch_alpaca_batch(tickers, start_date, end_date=None):
 
             # Process Data
             if not bars.data:
+                print(f"    [!] Alpaca returned empty for chunk {i//chunk_size + 1}/{(len(clean_batch)-1)//chunk_size + 1}")
                 continue
 
             # The .df property returns a multi-index dataframe (symbol, timestamp)
@@ -269,10 +271,13 @@ def fetch_alpaca_batch(tickers, start_date, end_date=None):
                 all_data[original_ticker] = df_formatted[cols]
 
         except Exception as e:
-            # Batch failed - try individual tickers as fallback
+            # Batch failed - log and try fallback
             error_msg = str(e)
+            print(f"    [!] Alpaca error: {error_msg[:80]}...")
+
+            # For encoding errors, try individual tickers
             if 'codec' in error_msg.lower() or 'encode' in error_msg.lower():
-                # Encoding error - likely a bad ticker, try one by one
+                recovered = 0
                 for single_ticker in chunk:
                     try:
                         single_request = StockBarsRequest(
@@ -293,10 +298,11 @@ def fetch_alpaca_batch(tickers, start_date, end_date=None):
                             df_formatted['Date'] = pd.to_datetime(df_formatted['Date']).dt.date
                             df_formatted = df_formatted.set_index('Date')
                             all_data[original_ticker] = df_formatted[['Open', 'High', 'Low', 'Close', 'Volume']]
+                            recovered += 1
                     except:
-                        pass  # Skip problematic ticker
-            else:
-                print(f"    [!] Alpaca batch error: {str(e)[:50]}...")
+                        pass
+                if recovered > 0:
+                    print(f"    [FALLBACK] Recovered {recovered}/{len(chunk)} tickers individually")
 
     return all_data
 
