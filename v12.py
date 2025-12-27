@@ -351,7 +351,7 @@ Changelog v11.5.4 (Sector Beta Filter - Relative Performance):
 - EXPECTED: True individual reversals (LULU, NVO) pass; sector beta (FCX, KGC) filtered
 """
 
-!pip uninstall -y alpaca-trade-api
+!pip uninstall -y alpaca-trade-api torch_xla 2>/dev/null
 !pip install alpaca-py yfinance "websockets>=13.0" --upgrade
 # !pip install "websockets<11"
 import pandas as pd
@@ -532,9 +532,7 @@ try:
 except: ALPACA_AVAILABLE, alpaca_client = False, None
 
 def get_device():
-    try:
-        import torch_xla.core.xla_model as xm; return xm.xla_device(), 'TPU'
-    except: pass
+    # Note: torch_xla removed at startup to avoid CUDA conflicts in Colab
     if torch.cuda.is_available(): return torch.device('cuda'), f'GPU ({torch.cuda.get_device_name(0)})'
     return torch.device('cpu'), 'CPU'
 
