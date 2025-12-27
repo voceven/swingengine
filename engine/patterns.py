@@ -1192,3 +1192,333 @@ def apply_smart_gatekeeper(df, config=None):
         print(f"  [GATEKEEPER] Sample rejected: {', '.join(rejected[:5])}... (+{rejected_count-5} more)")
 
     return filtered_df
+
+
+# =============================================================================
+# SMART MONEY CONCEPTS (v12) - ICT-style patterns for institutional order flow
+# =============================================================================
+
+def detect_choch(history_df, lookback=20):
+    """
+    Detect Change of Character (CHoCH) - market structure shift.
+
+    CHoCH occurs when:
+    - Bullish CHoCH: Price breaks above the last lower high in a downtrend
+    - Bearish CHoCH: Price breaks below the last higher low in an uptrend
+
+    Args:
+        history_df: DataFrame with OHLCV data
+        lookback: Number of bars to analyze for structure
+
+    Returns:
+        dict with choch_bullish, choch_bearish, structure_break_level
+    """
+    result = {
+        'choch_bullish': False,
+        'choch_bearish': False,
+        'structure_break_level': 0.0,
+        'choch_score': 0.0
+    }
+
+    if history_df is None or len(history_df) < lookback:
+        return result
+
+    try:
+        close = history_df['Close'].values
+        high = history_df['High'].values
+        low = history_df['Low'].values
+
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0].values
+            high = high.iloc[:, 0].values
+            low = low.iloc[:, 0].values
+
+        # Find swing points in lookback window
+        window = min(lookback, len(close) - 1)
+        recent_close = close[-window:]
+        recent_high = high[-window:]
+        recent_low = low[-window:]
+
+        # Identify swing highs and lows (simple 3-bar swing detection)
+        swing_highs = []
+        swing_lows = []
+
+        for i in range(1, len(recent_high) - 1):
+            if recent_high[i] > recent_high[i-1] and recent_high[i] > recent_high[i+1]:
+                swing_highs.append((i, recent_high[i]))
+            if recent_low[i] < recent_low[i-1] and recent_low[i] < recent_low[i+1]:
+                swing_lows.append((i, recent_low[i]))
+
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return result
+
+        # Check for downtrend (lower highs) then break above last lower high
+        last_high_val = swing_highs[-1][1]
+        prev_high_val = swing_highs[-2][1]
+        current_close = close[-1]
+
+        if prev_high_val > last_high_val:  # Was in downtrend (lower highs)
+            if current_close > last_high_val:  # Broke above last lower high
+                result['choch_bullish'] = True
+                result['structure_break_level'] = float(last_high_val)
+                result['choch_score'] = min(1.0, (current_close - last_high_val) / (last_high_val * 0.02))
+
+        # Check for uptrend (higher lows) then break below last higher low
+        last_low_val = swing_lows[-1][1]
+        prev_low_val = swing_lows[-2][1]
+
+        if prev_low_val < last_low_val:  # Was in uptrend (higher lows)
+            if current_close < last_low_val:  # Broke below last higher low
+                result['choch_bearish'] = True
+                result['structure_break_level'] = float(last_low_val)
+                result['choch_score'] = min(1.0, (last_low_val - current_close) / (last_low_val * 0.02))
+
+    except Exception:
+        pass
+
+    return result
+
+
+def detect_order_blocks(history_df, lookback=30, min_move_pct=0.03):
+    """
+    Detect Order Blocks - institutional supply/demand zones.
+
+    Bullish OB: Last down candle before a significant up move
+    Bearish OB: Last up candle before a significant down move
+
+    Args:
+        history_df: DataFrame with OHLCV data
+        lookback: Number of bars to search
+        min_move_pct: Minimum % move to qualify as significant
+
+    Returns:
+        dict with bullish_ob_zone, bearish_ob_zone, ob_score
+    """
+    result = {
+        'bullish_ob_zone': None,  # (low, high) of the order block
+        'bearish_ob_zone': None,
+        'near_bullish_ob': False,  # Price is near a bullish OB
+        'near_bearish_ob': False,
+        'ob_score': 0.0  # Strength score
+    }
+
+    if history_df is None or len(history_df) < lookback:
+        return result
+
+    try:
+        close = history_df['Close']
+        open_p = history_df['Open']
+        high = history_df['High']
+        low = history_df['Low']
+
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+            open_p = open_p.iloc[:, 0]
+            high = high.iloc[:, 0]
+            low = low.iloc[:, 0]
+
+        close_arr = close.values
+        open_arr = open_p.values
+        high_arr = high.values
+        low_arr = low.values
+
+        current_price = close_arr[-1]
+
+        # Find bullish order blocks (last red candle before big green move)
+        for i in range(len(close_arr) - lookback, len(close_arr) - 3):
+            if i < 0:
+                continue
+
+            # Check if this is a down candle
+            is_down = close_arr[i] < open_arr[i]
+            if not is_down:
+                continue
+
+            # Check for significant upward move after
+            future_high = max(high_arr[i+1:min(i+10, len(high_arr))])
+            move_pct = (future_high - close_arr[i]) / close_arr[i]
+
+            if move_pct >= min_move_pct:
+                ob_low = low_arr[i]
+                ob_high = high_arr[i]
+
+                # Check if price is near this OB
+                if ob_low <= current_price <= ob_high * 1.02:
+                    result['bullish_ob_zone'] = (float(ob_low), float(ob_high))
+                    result['near_bullish_ob'] = True
+                    result['ob_score'] = min(1.0, move_pct / 0.05)
+                    break
+
+        # Find bearish order blocks (last green candle before big red move)
+        for i in range(len(close_arr) - lookback, len(close_arr) - 3):
+            if i < 0:
+                continue
+
+            is_up = close_arr[i] > open_arr[i]
+            if not is_up:
+                continue
+
+            future_low = min(low_arr[i+1:min(i+10, len(low_arr))])
+            move_pct = (close_arr[i] - future_low) / close_arr[i]
+
+            if move_pct >= min_move_pct:
+                ob_low = low_arr[i]
+                ob_high = high_arr[i]
+
+                if ob_low * 0.98 <= current_price <= ob_high:
+                    result['bearish_ob_zone'] = (float(ob_low), float(ob_high))
+                    result['near_bearish_ob'] = True
+                    result['ob_score'] = min(1.0, move_pct / 0.05)
+                    break
+
+    except Exception:
+        pass
+
+    return result
+
+
+def detect_fvg(history_df, lookback=20, min_gap_pct=0.005):
+    """
+    Detect Fair Value Gaps (FVG) - price inefficiencies.
+
+    Bullish FVG: Gap between candle 1's high and candle 3's low
+    Bearish FVG: Gap between candle 1's low and candle 3's high
+
+    Args:
+        history_df: DataFrame with OHLCV data
+        lookback: Number of bars to search
+        min_gap_pct: Minimum gap size as % of price
+
+    Returns:
+        dict with bullish_fvg_zone, bearish_fvg_zone, fvg_score
+    """
+    result = {
+        'bullish_fvg_zone': None,  # (gap_low, gap_high)
+        'bearish_fvg_zone': None,
+        'in_bullish_fvg': False,  # Price is inside a bullish FVG
+        'in_bearish_fvg': False,
+        'fvg_score': 0.0
+    }
+
+    if history_df is None or len(history_df) < lookback + 3:
+        return result
+
+    try:
+        close = history_df['Close']
+        high = history_df['High']
+        low = history_df['Low']
+
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+            high = high.iloc[:, 0]
+            low = low.iloc[:, 0]
+
+        high_arr = high.values
+        low_arr = low.values
+        current_price = close.values[-1]
+
+        # Find bullish FVG (gap up - candle 3's low > candle 1's high)
+        for i in range(len(close) - lookback, len(close) - 2):
+            if i < 0:
+                continue
+
+            candle1_high = high_arr[i]
+            candle3_low = low_arr[i + 2]
+
+            if candle3_low > candle1_high:
+                gap_size = candle3_low - candle1_high
+                gap_pct = gap_size / candle1_high
+
+                if gap_pct >= min_gap_pct:
+                    result['bullish_fvg_zone'] = (float(candle1_high), float(candle3_low))
+
+                    # Check if price is in or near this FVG
+                    if candle1_high * 0.99 <= current_price <= candle3_low * 1.01:
+                        result['in_bullish_fvg'] = True
+                        result['fvg_score'] = min(1.0, gap_pct / 0.02)
+
+        # Find bearish FVG (gap down - candle 3's high < candle 1's low)
+        for i in range(len(close) - lookback, len(close) - 2):
+            if i < 0:
+                continue
+
+            candle1_low = low_arr[i]
+            candle3_high = high_arr[i + 2]
+
+            if candle3_high < candle1_low:
+                gap_size = candle1_low - candle3_high
+                gap_pct = gap_size / candle1_low
+
+                if gap_pct >= min_gap_pct:
+                    result['bearish_fvg_zone'] = (float(candle3_high), float(candle1_low))
+
+                    if candle3_high * 0.99 <= current_price <= candle1_low * 1.01:
+                        result['in_bearish_fvg'] = True
+                        result['fvg_score'] = min(1.0, gap_pct / 0.02)
+
+    except Exception:
+        pass
+
+    return result
+
+
+def detect_smc_patterns(history_df, lookback=30):
+    """
+    Combined Smart Money Concepts pattern detection.
+
+    Returns aggregated SMC signals for use in scoring.
+
+    Args:
+        history_df: DataFrame with OHLCV data
+        lookback: Number of bars to analyze
+
+    Returns:
+        dict with smc_bullish_score, smc_bearish_score, and individual pattern flags
+    """
+    result = {
+        'smc_bullish_score': 0.0,
+        'smc_bearish_score': 0.0,
+        'choch_bullish': False,
+        'choch_bearish': False,
+        'near_bullish_ob': False,
+        'near_bearish_ob': False,
+        'in_bullish_fvg': False,
+        'in_bearish_fvg': False
+    }
+
+    if history_df is None or len(history_df) < lookback:
+        return result
+
+    # Detect individual patterns
+    choch = detect_choch(history_df, lookback=lookback)
+    ob = detect_order_blocks(history_df, lookback=lookback)
+    fvg = detect_fvg(history_df, lookback=lookback)
+
+    # Aggregate bullish signals
+    bullish_score = 0.0
+    if choch['choch_bullish']:
+        bullish_score += 0.4 * choch['choch_score']
+        result['choch_bullish'] = True
+    if ob['near_bullish_ob']:
+        bullish_score += 0.35 * ob['ob_score']
+        result['near_bullish_ob'] = True
+    if fvg['in_bullish_fvg']:
+        bullish_score += 0.25 * fvg['fvg_score']
+        result['in_bullish_fvg'] = True
+
+    # Aggregate bearish signals
+    bearish_score = 0.0
+    if choch['choch_bearish']:
+        bearish_score += 0.4 * choch['choch_score']
+        result['choch_bearish'] = True
+    if ob['near_bearish_ob']:
+        bearish_score += 0.35 * ob['ob_score']
+        result['near_bearish_ob'] = True
+    if fvg['in_bearish_fvg']:
+        bearish_score += 0.25 * fvg['fvg_score']
+        result['in_bearish_fvg'] = True
+
+    result['smc_bullish_score'] = min(1.0, bullish_score)
+    result['smc_bearish_score'] = min(1.0, bearish_score)
+
+    return result

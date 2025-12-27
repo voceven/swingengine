@@ -38,6 +38,11 @@ from .patterns import (
     detect_cup_and_handle,
     detect_double_bottom,
     apply_smart_gatekeeper,
+    # Smart Money Concepts (v12)
+    detect_choch,
+    detect_order_blocks,
+    detect_fvg,
+    detect_smc_patterns,
 )
 from .ml import train_ensemble
 from .report import generate_full_report

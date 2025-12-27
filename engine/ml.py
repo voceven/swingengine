@@ -524,6 +524,8 @@ def train_ensemble(full_df, history_mgr, imputer, scaler, features_list,
         frac_diff_feats = ['frac_diff_close']
         # VPIN Flow Toxicity features (v12) - informed trading detection
         vpin_feats = ['vpin', 'vpin_velocity']
+        # Smart Money Concepts features (v12) - ICT-style institutional patterns
+        smc_feats = ['smc_bullish', 'smc_bearish', 'smc_net']
         # Options flow features
         flow_feats = ['dp_sentiment', 'net_flow', 'avg_iv', 'net_gamma', 'oi_change', 'dp_total']
         # Temporal momentum features
@@ -531,7 +533,7 @@ def train_ensemble(full_df, history_mgr, imputer, scaler, features_list,
         # Neural network score
         neural_feats = ['nn_score']
 
-        all_possible = tech_feats + flow_imbalance_feats + frac_diff_feats + vpin_feats + flow_feats + temporal_feats + neural_feats
+        all_possible = tech_feats + flow_imbalance_feats + frac_diff_feats + vpin_feats + smc_feats + flow_feats + temporal_feats + neural_feats
         features_list = [f for f in all_possible if f in full_df.columns]
         print(f"  [FEATURES] Auto-detected {len(features_list)} features: {features_list}")
 

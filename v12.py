@@ -1705,6 +1705,15 @@ class SwingTradingEngine:
         vpin_prev = float(vpin_20.iloc[-5]) if len(vpin_20) > 5 and not pd.isna(vpin_20.iloc[-5]) else vpin
         vpin_velocity = (vpin - vpin_prev) / (vpin_prev + 1e-9)
 
+        # --- SMART MONEY CONCEPTS (v12) ---
+        # ICT-style patterns for institutional order flow detection
+        from engine.patterns import detect_smc_patterns
+        smc = detect_smc_patterns(history_df, lookback=30)
+        smc_bullish = smc['smc_bullish_score']
+        smc_bearish = smc['smc_bearish_score']
+        # Net SMC signal: positive = bullish structure, negative = bearish structure
+        smc_net = smc_bullish - smc_bearish
+
         return {
             'rsi': float(rsi.iloc[-1]),
             'trend_score': float(trend_score.iloc[-1]),
@@ -1725,6 +1734,10 @@ class SwingTradingEngine:
             # VPIN Flow Toxicity (v12)
             'vpin': vpin,  # Volume-synchronized Prob of Informed Trading (0-1)
             'vpin_velocity': vpin_velocity,  # Rate of change in VPIN
+            # Smart Money Concepts (v12)
+            'smc_bullish': smc_bullish,  # CHoCH + Order Blocks + FVG bullish score
+            'smc_bearish': smc_bearish,  # CHoCH + Order Blocks + FVG bearish score
+            'smc_net': smc_net,  # Net SMC signal (-1 to +1)
         }
 
     def enrich_market_data(self, flow_df):
