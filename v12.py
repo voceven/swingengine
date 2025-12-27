@@ -352,8 +352,8 @@ Changelog v11.5.4 (Sector Beta Filter - Relative Performance):
 """
 
 !pip uninstall -y alpaca-trade-api torch_xla 2>/dev/null
-!pip install alpaca-py yfinance "websockets>=13.0" --upgrade
-# !pip install "websockets<11"
+!pip install alpaca-py yfinance "websockets>=13.0" --upgrade --quiet
+!pip install pytorch-tabnet optuna catboost --quiet
 import pandas as pd
 import numpy as np
 import yfinance as yf
