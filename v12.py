@@ -1890,30 +1890,43 @@ class SwingTradingEngine:
 
         # --- BASE SCORE FROM ENSEMBLE STACK ---
         if self.model_trained:
-            X = self.full_df[self.features_list]
-            X_clean = self.imputer.transform(X)
-            X_scaled = self.scaler.transform(X_clean)
+            # v12: Filter features_list to only include columns that exist in full_df
+            # This handles cases where cached model was trained with different features
+            available_features = [f for f in self.features_list if f in self.full_df.columns]
+            missing_features = [f for f in self.features_list if f not in self.full_df.columns]
+            if missing_features:
+                print(f"  [WARN] Missing {len(missing_features)} features from cached model: {missing_features[:5]}{'...' if len(missing_features) > 5 else ''}")
+                print(f"  [WARN] Using {len(available_features)}/{len(self.features_list)} available features. Consider force_retrain=True")
 
-            # Get predictions from diverse ensemble (CatBoost + TabNet + TCN + ElasticNet)
-            preds_list = [self.catboost_model.predict_proba(X_scaled)[:, 1]]  # CatBoost always available
+            if not available_features:
+                print("  [ERROR] No features available for prediction, using raw_score = 0.5")
+                df['raw_score'] = 0.5
+                self.full_df = df
+            else:
+                X = self.full_df[available_features]
+                X_clean = self.imputer.transform(X)
+                X_scaled = self.scaler.transform(X_clean)
 
-            if self.tabnet_model is not None:
-                preds_list.append(self.tabnet_model.predict_proba(X_scaled)[:, 1])
+                # Get predictions from diverse ensemble (CatBoost + TabNet + TCN + ElasticNet)
+                preds_list = [self.catboost_model.predict_proba(X_scaled)[:, 1]]  # CatBoost always available
 
-            # TCN is NOT included in meta-learner ensemble
-            # It uses different features (6 temporal vs 15 tabular) and was trained separately
-            # The meta-learner expects [CB, TN, EN] predictions only
-            # TCN could be used as a standalone signal boost in the future if needed
+                if self.tabnet_model is not None:
+                    preds_list.append(self.tabnet_model.predict_proba(X_scaled)[:, 1])
 
-            if self.elasticnet_model is not None:
-                preds_list.append(self.elasticnet_model.predict_proba(X_scaled)[:, 1])
+                # TCN is NOT included in meta-learner ensemble
+                # It uses different features (6 temporal vs 15 tabular) and was trained separately
+                # The meta-learner expects [CB, TN, EN] predictions only
+                # TCN could be used as a standalone signal boost in the future if needed
 
-            # Stack predictions for meta-learner
-            X_meta = np.column_stack(preds_list)
+                if self.elasticnet_model is not None:
+                    preds_list.append(self.elasticnet_model.predict_proba(X_scaled)[:, 1])
 
-            # Get final ensemble prediction from meta-learner
-            probs = self.meta_learner.predict_proba(X_meta)[:, 1]
-            df['raw_score'] = probs
+                # Stack predictions for meta-learner
+                X_meta = np.column_stack(preds_list)
+
+                # Get final ensemble prediction from meta-learner
+                probs = self.meta_learner.predict_proba(X_meta)[:, 1]
+                df['raw_score'] = probs
         else:
             df['raw_score'] = 0.5
 
